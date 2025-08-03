@@ -1,0 +1,16 @@
+# Core PyQt6 dependencies for the Stock Price Projection System
+PyQt6>=6.6.0
+PyQt6-Qt6>=6.6.0
+
+# Multimedia support for video playback
+PyQt6-multimedia>=6.6.0
+
+# Additional dependencies for data processing (for future components)
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Optional: for advanced chart functionality (when implementing stock fetcher)
+pyqtgraph>=0.13.0
+
+# Development dependencies
+pytest>=7.4.0
