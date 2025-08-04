@@ -1,16 +1,37 @@
-# Core PyQt6 dependencies for the Stock Price Projection System
+# Stock Price Projection System - Requirements
+# Python 3.8+
+
+# Core PyQt6 dependencies
 PyQt6>=6.6.0
 PyQt6-Qt6>=6.6.0
+PyQt6-multimedia>=6.6.0  # For video playback in landing page
 
-# Multimedia support for video playback
-PyQt6-multimedia>=6.6.0
+# Database
+psycopg2-binary>=2.9.0  # PostgreSQL adapter
 
-# Additional dependencies for data processing (for future components)
+# Data processing and analysis
 pandas>=2.0.0
 numpy>=1.24.0
 
-# Optional: for advanced chart functionality (when implementing stock fetcher)
-pyqtgraph>=0.13.0
+# API and networking
+requests>=2.31.0        # Synchronous HTTP requests
+aiohttp>=3.8.0         # Asynchronous HTTP requests
 
-# Development dependencies
-pytest>=7.4.0
+# Configuration and environment
+python-dotenv>=1.0.0   # Environment variable management
+
+# Timezone handling (NEW - Required for EST conversion)
+pytz>=2023.3          # Timezone definitions for EST conversion
+
+# Visualization (optional - for future charting features)
+pyqtgraph>=0.13.0      # High-performance plotting for PyQt
+
+# Development and testing
+pytest>=7.4.0          # Testing framework
+black>=23.3.0          # Code formatting
+flake8>=6.0.0          # Code linting
+
+# Optional dependencies for extended features
+# matplotlib>=3.7.0    # Additional plotting capabilities
+# plotly>=5.14.0       # Interactive charts
+# scipy>=1.10.0        # Scientific computing

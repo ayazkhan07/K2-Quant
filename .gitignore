@@ -95,3 +95,15 @@ test_report_*.json
 backups/
 *.backup
 *.bak
+
+# Environment variables and API keys (SECURITY CRITICAL)
+.env
+.env.local
+.env.production
+.env.staging
+*.env
+config/secrets.json
+api_keys.json
+
+# Centralized Python cache
+.cache/

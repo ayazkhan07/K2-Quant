@@ -3,10 +3,13 @@ import os
 from pathlib import Path
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QPushButton, QGraphicsOpacityEffect)
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QPropertyAnimation, QEasingCurve
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QPropertyAnimation, QEasingCurve, QUrl
 from PyQt6.QtGui import QFont, QPalette, QColor, QPixmap, QPainter, QBrush, QLinearGradient
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
+
+# Import logger without emojis for Windows compatibility
+from utils.logger import k2_logger
 
 
 class LandingPageWidget(QMainWindow):
@@ -27,7 +30,7 @@ class LandingPageWidget(QMainWindow):
         
     def init_ui(self):
         """Initialize the landing page user interface"""
-        self.setWindowTitle("Stock Price Projection System")
+        self.setWindowTitle("K2 Quant - Stock Price Projection System")
         self.setWindowState(Qt.WindowState.WindowMaximized)
         
         # Set black background
@@ -100,26 +103,44 @@ class LandingPageWidget(QMainWindow):
         fallback_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.fallback_widget.setLayout(fallback_layout)
         
-        # Fallback title
-        fallback_title = QLabel("Stock Price Projection System")
-        fallback_title.setFont(QFont("Arial", 32, QFont.Weight.Bold))
-        fallback_title.setStyleSheet("""
+        # K2 Quant branding
+        k2_label = QLabel("K2 QUANT")
+        k2_label.setFont(QFont("Arial", 48, QFont.Weight.Bold))
+        k2_label.setStyleSheet("""
             QLabel {
                 color: #ffffff;
                 background: transparent;
-                margin: 20px;
+                margin: 10px;
+                text-align: center;
+                letter-spacing: 8px;
+            }
+        """)
+        k2_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        fallback_layout.addWidget(k2_label)
+        
+        # Fallback title
+        fallback_title = QLabel("Stock Price Projection System")
+        fallback_title.setFont(QFont("Arial", 24))
+        fallback_title.setStyleSheet("""
+            QLabel {
+                color: #cccccc;
+                background: transparent;
+                margin: 10px;
                 text-align: center;
             }
         """)
         fallback_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         fallback_layout.addWidget(fallback_title)
         
+        # Add spacing
+        fallback_layout.addSpacing(50)
+        
         # Click to continue message
         continue_label = QLabel("Click anywhere to continue")
-        continue_label.setFont(QFont("Arial", 18))
+        continue_label.setFont(QFont("Arial", 16))
         continue_label.setStyleSheet("""
             QLabel {
-                color: #cccccc;
+                color: #999999;
                 background: transparent;
                 margin: 10px;
                 text-align: center;
@@ -147,7 +168,7 @@ class LandingPageWidget(QMainWindow):
         """Create a subtle pulsing effect"""
         # This is a simple implementation - could be enhanced with opacity animation
         original_style = widget.styleSheet()
-        widget.setStyleSheet(original_style.replace("color: #cccccc", "color: #ffffff"))
+        widget.setStyleSheet(original_style.replace("color: #999999", "color: #ffffff"))
         
         QTimer.singleShot(200, lambda: widget.setStyleSheet(original_style))
         
@@ -174,29 +195,68 @@ class LandingPageWidget(QMainWindow):
         """Load the k2_logo.mp4 video file from assets directory"""
         # Look specifically for k2_logo.mp4
         assets_path = Path("assets")
-        k2_logo_path = assets_path / "k2_logo.mp4"
+        k2_logo_path = assets_path / "videos" / "k2_logo.mp4"
+        
+        k2_logger.ui_operation("Loading video", f"Path: {k2_logo_path.absolute()}")
         
         if k2_logo_path.exists():
-            self.media_player.setSource(k2_logo_path.as_uri())
-            self.video_loaded = True
+            try:
+                # Convert to QUrl using fromLocalFile for proper handling
+                video_url = QUrl.fromLocalFile(str(k2_logo_path.absolute()))
+                k2_logger.ui_operation("Video URL created", f"URL: {video_url.toString()}")
+                
+                # Set the source using QUrl
+                self.media_player.setSource(video_url)
+                self.video_loaded = True
+                k2_logger.info("Video loaded successfully", "LANDING")
+            except Exception as e:
+                k2_logger.error(f"Failed to load video: {str(e)}", "LANDING")
+                self.show_fallback_ui()
         else:
             # k2_logo.mp4 not found, show fallback
+            k2_logger.warning("Video file not found - showing fallback UI", "LANDING")
             self.show_fallback_ui()
             
     def handle_media_status(self, status):
         """Handle media player status changes"""
+        status_messages = {
+            QMediaPlayer.MediaStatus.NoMedia: "No media loaded",
+            QMediaPlayer.MediaStatus.LoadingMedia: "Loading media...",
+            QMediaPlayer.MediaStatus.LoadedMedia: "Media loaded successfully",
+            QMediaPlayer.MediaStatus.StalledMedia: "Media stalled",
+            QMediaPlayer.MediaStatus.BufferingMedia: "Buffering media...",
+            QMediaPlayer.MediaStatus.BufferedMedia: "Media buffered",
+            QMediaPlayer.MediaStatus.EndOfMedia: "End of media reached",
+            QMediaPlayer.MediaStatus.InvalidMedia: "Invalid media"
+        }
+        status_msg = status_messages.get(status, f"Unknown status: {status}")
+        k2_logger.ui_operation("Media status", status_msg)
+        
         if status == QMediaPlayer.MediaStatus.LoadedMedia:
             # Video loaded successfully, start playback
+            k2_logger.info("Starting video playback", "LANDING")
             self.media_player.play()
             self.resize_video_widget()
         elif status == QMediaPlayer.MediaStatus.EndOfMedia:
             # Loop the video
+            k2_logger.info("Looping video", "LANDING")
             self.media_player.setPosition(0)
             self.media_player.play()
+        elif status == QMediaPlayer.MediaStatus.InvalidMedia:
+            k2_logger.error("Invalid media - showing fallback", "LANDING")
+            self.show_fallback_ui()
             
     def handle_media_error(self, error):
         """Handle media player errors"""
-        print(f"Video playback error: {error}")
+        error_messages = {
+            QMediaPlayer.Error.NoError: "No error",
+            QMediaPlayer.Error.ResourceError: "Resource error - file not found or inaccessible",
+            QMediaPlayer.Error.FormatError: "Format error - unsupported file format",
+            QMediaPlayer.Error.NetworkError: "Network error",
+            QMediaPlayer.Error.AccessDeniedError: "Access denied error"
+        }
+        error_msg = error_messages.get(error, f"Unknown error: {error}")
+        k2_logger.error(f"Video playback error: {error_msg}", "LANDING")
         self.show_fallback_ui()
         
     def show_fallback_ui(self):
@@ -250,12 +310,14 @@ class LandingPageWidget(QMainWindow):
     def handle_click(self, event):
         """Handle click events anywhere on the screen"""
         if event.button() == Qt.MouseButton.LeftButton:
+            k2_logger.ui_operation("User clicked", "Starting transition")
             self.start_transition()
             event.accept()
             
     def mousePressEvent(self, event):
         """Handle mouse press events on the main window"""
         if event.button() == Qt.MouseButton.LeftButton:
+            k2_logger.ui_operation("User clicked window", "Starting transition")
             self.start_transition()
             event.accept()
         else:
@@ -272,6 +334,7 @@ class LandingPageWidget(QMainWindow):
         
     def emit_continue_signal(self):
         """Emit the continue signal after fade completes"""
+        k2_logger.info("Transitioning to stock fetcher", "LANDING")
         self.continue_requested.emit()
         
     def cleanup(self):
@@ -299,7 +362,7 @@ class LandingPageApplication(QApplication):
         
     def handle_continue(self):
         """Handle continue request from landing page"""
-        print("User clicked to continue - transitioning to stock fetcher page")
+        k2_logger.info("User clicked to continue - transitioning to stock fetcher page", "LANDING")
         # Here you would transition to the next page
         # For now, we'll just close the application
         self.landing_page.cleanup()
