@@ -5,33 +5,66 @@
 PyQt6>=6.6.0
 PyQt6-Qt6>=6.6.0
 PyQt6-multimedia>=6.6.0  # For video playback in landing page
+PyQt6-Charts>=6.6.0      # For advanced charting capabilities
 
 # Database
-psycopg2-binary>=2.9.0  # PostgreSQL adapter
+psycopg2-binary>=2.9.0   # PostgreSQL adapter
 
 # Data processing and analysis
 pandas>=2.0.0
 numpy>=1.24.0
+pandas-ta>=0.3.14b0      # Technical analysis indicators
 
 # API and networking
-requests>=2.31.0        # Synchronous HTTP requests
-aiohttp>=3.8.0         # Asynchronous HTTP requests
+requests>=2.31.0         # Synchronous HTTP requests
+aiohttp>=3.8.0          # Asynchronous HTTP requests
+websocket-client>=1.6.0  # WebSocket connections for real-time data
+
+# AI/ML Integration
+openai>=1.0.0           # OpenAI GPT integration for chat
+tiktoken>=0.5.0         # Token counting for OpenAI
+
+# Machine Learning (for agent system)
+yfinance>=0.2.0         # Yahoo Finance data (used by agents)
+scikit-learn>=1.3.0     # ML utilities
+statsmodels>=0.14.0     # Statistical models (ARIMA)
 
 # Configuration and environment
-python-dotenv>=1.0.0   # Environment variable management
+python-dotenv>=1.0.0    # Environment variable management
 
-# Timezone handling (NEW - Required for EST conversion)
-pytz>=2023.3          # Timezone definitions for EST conversion
+# Timezone handling
+pytz>=2023.3            # Timezone definitions for EST conversion
 
-# Visualization (optional - for future charting features)
-pyqtgraph>=0.13.0      # High-performance plotting for PyQt
+# Visualization
+pyqtgraph>=0.13.0       # High-performance plotting for PyQt
+matplotlib>=3.7.0       # Additional plotting capabilities
+plotly>=5.14.0          # Interactive charts (optional)
 
-# Development and testing
-pytest>=7.4.0          # Testing framework
-black>=23.3.0          # Code formatting
-flake8>=6.0.0          # Code linting
+# Code execution and security
+RestrictedPython>=6.0   # Safe Python code execution for AI-generated code
+
+# Testing and QA (for agent system)
+pytest>=7.4.0           # Testing framework
+pytest-asyncio>=0.21.0  # Async test support
+selenium>=4.15.0        # Web automation testing (for Mussadiq)
+
+# Development tools
+black>=23.3.0           # Code formatting
+flake8>=6.0.0           # Code linting
+mypy>=1.5.0             # Type checking
+
+# Scheduling and background tasks
+schedule>=1.2.0         # Task scheduling (for agents)
+APScheduler>=3.10.0     # Advanced scheduling (optional)
+
+# Additional utilities
+python-dateutil>=2.8.2  # Date parsing utilities
+json5>=0.9.0            # JSON with comments support
+pyyaml>=6.0              # YAML support for configs
 
 # Optional dependencies for extended features
-# matplotlib>=3.7.0    # Additional plotting capabilities
-# plotly>=5.14.0       # Interactive charts
-# scipy>=1.10.0        # Scientific computing
+# scipy>=1.10.0         # Scientific computing
+# prophet>=1.1          # Facebook Prophet for time series
+# xgboost>=2.0.0        # XGBoost models
+# tensorflow>=2.14.0    # Deep learning (LSTM)
+# torch>=2.0.0          # Alternative deep learning framework

@@ -1,0 +1,8 @@
+{
+  "symbol": "GOOG",
+  "range": "20Y",
+  "frequency": "D",
+  "table_name": "stock_goog_day_20y",
+  "market_hours_filter": false,
+  "created_at": "2025-08-09T23:26:34.984210"
+}

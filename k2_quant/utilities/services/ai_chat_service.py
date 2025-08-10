@@ -1,0 +1,229 @@
+"""
+Stock Data Service Layer
+
+Orchestrates data fetching from Polygon API and storage in database.
+Supports range parameter in table naming, CSV export, and market hours filter.
+"""
+
+from datetime import datetime, timedelta
+from typing import Dict, List, Tuple, Optional, Generator
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests
+
+from k2_quant.utilities.services.polygon_client import polygon_client
+from k2_quant.utilities.data.db_manager import db_manager
+from k2_quant.utilities.logger import k2_logger, log_performance
+from k2_quant.utilities.config.api_config import api_config
+
+
+class StockService:
+    """Service layer for stock data operations"""
+
+    MAX_WORKERS = 50
+    CHUNK_SIZE_DAYS = {
+        'minute': 7,
+        'hour': 90,
+        'day': 365,
+        'week': 1825,
+        'month': 7300,
+    }
+
+    EXPORT_BATCH_SIZE = 100000
+
+    def __init__(self):
+        self.polygon = polygon_client
+        self.db = db_manager
+        self.api_key = api_config.polygon_api_key
+
+    def convert_ui_parameters(self, time_range: str, frequency: str) -> Tuple[str, str, str, int]:
+        end_date = datetime.now()
+        range_days = {
+            '1D': 1, '1W': 7, '1M': 30, '3M': 90,
+            '6M': 180, '1Y': 365, '2Y': 730, '5Y': 1825,
+            '10Y': 3650, '20Y': 7300,
+        }
+        days = range_days.get(time_range, 30)
+        start_date = end_date - timedelta(days=days)
+        freq_map = {
+            '1min': 'minute', '5min': 'minute', '15min': 'minute',
+            '30min': 'minute', '1H': 'hour', 'D': 'day',
+            'W': 'week', 'M': 'month',
+        }
+        timespan = freq_map.get(frequency, 'day')
+        multiplier = 1
+        if frequency in ['5min', '15min', '30min']:
+            multiplier = int(frequency.replace('min', ''))
+        return timespan, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'), multiplier
+
+    def validate_symbol(self, symbol: str) -> bool:
+        return self.polygon.validate_symbol(symbol)
+
+    @log_performance
+    def fetch_and_store_stock_data(self, symbol: str, time_range: str, frequency: str) -> Dict:
+        start_time = datetime.now()
+        k2_logger.step(1, 6, "Converting parameters")
+        timespan, start_date, end_date, multiplier = self.convert_ui_parameters(time_range, frequency)
+        k2_logger.step(2, 6, f"Validating symbol {symbol}")
+        if not self.validate_symbol(symbol):
+            raise ValueError(f"Invalid symbol: {symbol}")
+        k2_logger.step(3, 6, "Fetching data from Polygon API")
+        all_results = self._parallel_fetch_data(symbol, timespan, start_date, end_date, multiplier)
+        if not all_results:
+            raise ValueError(f"No data available for {symbol}")
+        k2_logger.step(4, 6, "Storing data in database")
+        table_name = self.db.store_stock_data(symbol, timespan, time_range.lower(), all_results)
+        execution_time = (datetime.now() - start_time).total_seconds()
+        records_per_sec = int(len(all_results) / execution_time) if execution_time > 0 else 0
+        k2_logger.step(5, 6, "Calculating metrics")
+        k2_logger.performance_metric("Total execution time", execution_time, "seconds")
+        k2_logger.performance_metric("Records processed", len(all_results), "records")
+        k2_logger.performance_metric("Processing speed", records_per_sec, "records/second")
+        result = {
+            'symbol': symbol,
+            'range': time_range,
+            'frequency': frequency,
+            'table_name': table_name,
+            'total_records': len(all_results),
+            'execution_time': execution_time,
+            'records_per_second': records_per_sec,
+        }
+        k2_logger.step(6, 6, "Process complete")
+        return result
+
+    def _parallel_fetch_data(self, symbol: str, timespan: str, start_date: str, end_date: str, multiplier: int) -> List[Dict]:
+        chunks = self._generate_date_chunks(timespan, start_date, end_date)
+        k2_logger.api_operation("Parallel fetch plan", f"{len(chunks)} chunks with {self.MAX_WORKERS} workers")
+        all_results: List[Dict] = []
+        failed_chunks = []
+        completed_chunks = 0
+        with ThreadPoolExecutor(max_workers=self.MAX_WORKERS) as executor:
+            future_to_chunk = {
+                executor.submit(self._fetch_chunk, symbol, timespan, multiplier, chunk[0], chunk[1]): chunk
+                for chunk in chunks
+            }
+            for future in as_completed(future_to_chunk):
+                chunk = future_to_chunk[future]
+                completed_chunks += 1
+                try:
+                    results = future.result()
+                    if results:
+                        all_results.extend(results)
+                        k2_logger.api_operation("Chunk completed", f"{chunk[0]} to {chunk[1]}: {len(results)} records ({completed_chunks}/{len(chunks)})")
+                except Exception as e:
+                    failed_chunks.append(chunk)
+                    k2_logger.error(f"Chunk failed {chunk[0]} to {chunk[1]}: {str(e)}", "API")
+        all_results.sort(key=lambda x: x['t'])
+        return all_results
+
+    def _generate_date_chunks(self, timespan: str, start_date: str, end_date: str) -> List[Tuple[str, str]]:
+        chunk_days = self.CHUNK_SIZE_DAYS.get(timespan, 30)
+        chunks = []
+        current_start = datetime.strptime(start_date, '%Y-%m-%d')
+        end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+        while current_start < end_dt:
+            chunk_end = min(current_start + timedelta(days=chunk_days), end_dt)
+            chunks.append((current_start.strftime('%Y-%m-%d'), chunk_end.strftime('%Y-%m-%d')))
+            current_start = chunk_end + timedelta(days=1)
+        return chunks
+
+    def _fetch_chunk(self, symbol: str, timespan: str, multiplier: int, start: str, end: str) -> List[Dict]:
+        try:
+            base_url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range"
+            url = f"{base_url}/{multiplier}/{timespan}/{start}/{end}"
+            params = {
+                'apiKey': self.polygon.api_key,
+                'adjusted': 'true',
+                'sort': 'asc',
+                'limit': 50000,
+            }
+            response = requests.get(url, params=params, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            if data.get('status') == 'OK' and 'results' in data:
+                return data['results']
+            return []
+        except Exception as e:
+            k2_logger.error(f"Chunk fetch failed: {str(e)}", "API")
+            return []
+
+    def get_display_data(self, table_name: str, limit: int = 1000, market_hours_only: bool = False) -> Tuple[List[Tuple], int]:
+        return self.db.fetch_display_data(table_name, limit, market_hours_only)
+
+    def get_export_data(self, table_name: str, offset: int, limit: int, market_hours_only: bool = False) -> List[Tuple]:
+        try:
+            k2_logger.database_operation(
+                f"Fetching export data from {table_name}",
+                f"Offset: {offset}, Limit: {limit}, Market hours filter: {market_hours_only}")
+            rows = self.db.fetch_export_data(table_name, offset, limit, market_hours_only)
+            k2_logger.database_operation("Export data fetched", f"Retrieved {len(rows)} records")
+            return rows
+        except Exception as e:
+            k2_logger.error(f"Failed to fetch export data: {str(e)}", "EXPORT")
+            raise
+
+    def get_export_data_streaming(self, table_name: str, batch_size: int = None, market_hours_only: bool = False) -> Generator[List[Tuple], None, None]:
+        if batch_size is None:
+            batch_size = self.EXPORT_BATCH_SIZE
+        try:
+            _, total_count = self.get_display_data(table_name, limit=1, market_hours_only=market_hours_only)
+            offset = 0
+            while offset < total_count:
+                batch = self.get_export_data(table_name, offset, batch_size, market_hours_only)
+                if not batch:
+                    break
+                yield batch
+                offset += len(batch)
+                progress_pct = (offset / total_count) * 100
+                k2_logger.database_operation("Export progress", f"{offset:,}/{total_count:,} records ({progress_pct:.1f}%)")
+        except Exception as e:
+            k2_logger.error(f"Streaming export failed: {str(e)}", "EXPORT")
+            raise
+
+    def get_table_info(self, table_name: str) -> Dict:
+        try:
+            _, total_records = self.get_display_data(table_name, limit=1)
+            parts = table_name.split('_')
+            symbol = parts[1] if len(parts) > 1 else 'UNKNOWN'
+            timespan = parts[2] if len(parts) > 2 else 'unknown'
+            range_val = parts[3] if len(parts) > 3 else 'unknown'
+            date_range = self.db.get_date_range(table_name)
+            return {
+                'table_name': table_name,
+                'symbol': symbol.upper(),
+                'timespan': timespan,
+                'range': range_val,
+                'total_records': total_records,
+                'date_range': date_range,
+                'version': parts[-1] if len(parts) > 4 and parts[-1].isdigit() else '1',
+            }
+        except Exception as e:
+            k2_logger.error(f"Failed to get table info: {str(e)}", "INFO")
+            return {}
+
+    def validate_export_size(self, table_name: str, max_size_gb: float = 10.0) -> Tuple[bool, str]:
+        try:
+            _, total_records = self.get_display_data(table_name, limit=1)
+            estimated_bytes = total_records * 100
+            estimated_gb = estimated_bytes / (1024 ** 3)
+            if estimated_gb > max_size_gb:
+                return False, f"Export size (~{estimated_gb:.1f} GB) exceeds limit of {max_size_gb} GB"
+            return True, f"Export size approximately {estimated_gb:.2f} GB"
+        except Exception as e:
+            return False, f"Failed to validate export size: {str(e)}"
+
+    def get_all_stock_tables(self) -> List[Tuple[str, str]]:
+        return self.db.get_stock_tables()
+
+    def delete_table(self, table_name: str):
+        self.db.drop_table(table_name)
+
+    def delete_all_tables(self) -> int:
+        return self.db.drop_all_stock_tables()
+
+    def get_tables_for_ticker(self, symbol: str, timespan: str = None, range_val: str = None) -> List[str]:
+        return self.db.get_tables_for_ticker(symbol, timespan, range_val)
+
+
+stock_service = StockService()
+
+
