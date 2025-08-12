@@ -61,6 +61,13 @@ class MainWindow(QMainWindow):
         # Create Stock Fetcher page
         self.stock_fetcher = StockFetcherWidget()
         self.stock_fetcher.stock_data_fetched.connect(self.handle_stock_data)
+        # Connect the new model_saved signal
+        self.stock_fetcher.model_saved.connect(self.on_model_saved)
+        # Connect database cleared broadcast
+        try:
+            self.stock_fetcher.database_cleared.connect(self.handle_database_cleared)
+        except Exception:
+            pass
         self.stacked_widget.addWidget(self.stock_fetcher)
         
         # Create default Analysis page (tab_id=0)
@@ -70,6 +77,23 @@ class MainWindow(QMainWindow):
         
         # Show Stock Fetcher by default
         self.stacked_widget.setCurrentWidget(self.stock_fetcher)
+    
+    def on_model_saved(self, table_name: str):
+        """Handle model saved signal from Stock Fetcher"""
+        k2_logger.info(f"Model saved signal received: {table_name}", "MAIN")
+        
+        # Refresh all Analysis tabs
+        for tab_id, widget in self.analysis_tabs.items():
+            try:
+                # Call refresh method if it exists
+                if hasattr(widget, 'refresh_models'):
+                    widget.refresh_models()
+                elif hasattr(widget, 'load_saved_models'):
+                    widget.load_saved_models()
+                    
+                k2_logger.info(f"Refreshed Analysis tab {tab_id}", "MAIN")
+            except Exception as e:
+                k2_logger.error(f"Failed to refresh Analysis tab {tab_id}: {str(e)}", "MAIN")
     
     def on_tab_changed(self, page_type: str, tab_id: int):
         """Handle tab selection change"""
@@ -120,6 +144,42 @@ class MainWindow(QMainWindow):
             widget.deleteLater()
             
             k2_logger.ui_operation(f"Analysis tab closed", f"Tab ID: {tab_id}")
+
+    def handle_database_cleared(self):
+        """Reset analysis views and caches after database deletion."""
+        k2_logger.info("Handling database cleared broadcast", "MAIN")
+        # Reset default analysis tab (ID 0)
+        if 0 in self.analysis_tabs:
+            widget = self.analysis_tabs[0]
+            if hasattr(widget, 'reset_after_database_cleared'):
+                try:
+                    widget.reset_after_database_cleared()
+                except Exception as e:
+                    k2_logger.error(f"Failed to reset default analysis tab: {str(e)}", "MAIN")
+        # Close all other analysis tabs
+        to_close = [tid for tid in self.analysis_tabs.keys() if tid != 0]
+        for tid in to_close:
+            try:
+                widget = self.analysis_tabs[tid]
+                widget.cleanup()
+                self.stacked_widget.removeWidget(widget)
+                widget.deleteLater()
+                del self.analysis_tabs[tid]
+                k2_logger.ui_operation("Closed analysis tab after DB clear", f"Tab ID: {tid}")
+            except Exception as e:
+                k2_logger.error(f"Failed closing analysis tab {tid}: {str(e)}", "MAIN")
+        # Ask tab bar to drop extra analysis tabs
+        try:
+            if hasattr(self.tab_bar, 'close_all_analysis_tabs_except_default'):
+                self.tab_bar.close_all_analysis_tabs_except_default()
+        except Exception:
+            pass
+        # Clear any model caches
+        try:
+            from k2_quant.utilities.services.model_loader_service import model_loader_service
+            model_loader_service.clear_cache()
+        except Exception as e:
+            k2_logger.warning(f"Model cache clear failed: {str(e)}", "MAIN")
     
     def handle_stock_data(self, data):
         """Handle stock data when fetched"""

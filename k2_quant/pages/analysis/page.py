@@ -18,6 +18,16 @@ from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from PyQt6.QtGui import QFont
 
 from k2_quant.utilities.logger import k2_logger
+from k2_quant.utilities.services.technical_analysis_service import ta_service
+from k2_quant.utilities.services.stock_data_service import stock_service
+from k2_quant.utilities.data.saved_models_manager import saved_models_manager
+from k2_quant.pages.analysis.widgets.indicator_widget import IndicatorWidget
+from k2_quant.pages.analysis.widgets.chart_widget import ChartWidget
+from k2_quant.utilities.services.strategy_service import strategy_service
+from k2_quant.utilities.services.dynamic_python_engine import dpe_service
+from k2_quant.utilities.services.stock_data_service import stock_service
+from k2_quant.utilities.data.saved_models_manager import saved_models_manager
+from k2_quant.pages.analysis.widgets.strategy_widget import StrategyWidget
 
 
 class AnalysisPageWidget(QWidget):
@@ -116,20 +126,30 @@ class AnalysisPageWidget(QWidget):
         self.model_list.itemClicked.connect(self.load_model)
         layout.addWidget(self.model_list)
         
+        # Strategies Section
+        strategies_label = QLabel("STRATEGIES")
+        strategies_label.setObjectName("sectionTitle")
+        layout.addWidget(strategies_label)
+
+        self.strategy_widget = StrategyWidget()
+        try:
+            self.strategy_widget.populate_strategies(strategy_service.get_all_strategies())
+        except Exception:
+            self.strategy_widget.populate_strategies([])
+        self.strategy_widget.strategy_toggled.connect(self.on_strategy_toggled)
+        layout.addWidget(self.strategy_widget)
+
         # Technical Indicators Section
         indicators_label = QLabel("TECHNICAL INDICATORS")
         indicators_label.setObjectName("sectionTitle")
         layout.addWidget(indicators_label)
-        
-        # Create indicator checkboxes
-        self.indicator_checks = {}
-        indicators = ["SMA", "EMA", "RSI", "MACD", "Bollinger Bands", "Volume"]
-        
-        for indicator in indicators:
-            checkbox = QCheckBox(indicator)
-            checkbox.stateChanged.connect(lambda state, ind=indicator: self.toggle_indicator(ind, state))
-            self.indicator_checks[indicator] = checkbox
-            layout.addWidget(checkbox)
+
+        # Replace legacy checkboxes with parameterized widget
+        self.indicator_widget = IndicatorWidget()
+        self.indicator_widget.indicator_applied.connect(self.on_indicator_applied)
+        self.indicator_widget.indicator_removed.connect(self.on_indicator_removed)
+        self.indicator_widget.indicator_params_changed.connect(self.on_indicator_params_changed)
+        layout.addWidget(self.indicator_widget)
         
         layout.addStretch()
         
@@ -177,26 +197,14 @@ class AnalysisPageWidget(QWidget):
         
         layout.addWidget(controls)
         
-        # Data display area (placeholder for chart/table)
-        self.data_display = QFrame()
-        self.data_display.setObjectName("dataDisplay")
-        self.data_display.setStyleSheet("""
-            #dataDisplay {
-                background-color: #0a0a0a;
-                border: 1px solid #1a1a1a;
-            }
-        """)
-        
-        display_layout = QVBoxLayout()
-        self.data_display.setLayout(display_layout)
-        
-        # Data table
+        # Chart (top) + Data table (bottom)
+        self.chart = ChartWidget()
+        layout.addWidget(self.chart, stretch=4)
+
         self.data_table = QTableWidget()
         self.data_table.setAlternatingRowColors(True)
         self.data_table.horizontalHeader().setStretchLastSection(True)
-        display_layout.addWidget(self.data_table)
-        
-        layout.addWidget(self.data_display)
+        layout.addWidget(self.data_table, stretch=1)
         
         return frame
     
@@ -282,33 +290,62 @@ class AnalysisPageWidget(QWidget):
         return widget
     
     def load_saved_models(self):
-        """Load list of saved models"""
+        """Load Saved Models catalog (authoritative)."""
         try:
-            # Get stock tables from database
+            from k2_quant.utilities.data.saved_models_manager import saved_models_manager
+            models = saved_models_manager.get_saved_models()
+            self.model_list.clear()
+            if not models:
+                self.model_list.addItem("No saved models")
+                k2_logger.info("No saved models found", "ANALYSIS")
+                return
+            for model in models:
+                label = model.get('display_name') or f"{model['symbol']} - {model['range']}"
+                self.model_list.addItem(label)
+                last_item = self.model_list.item(self.model_list.count() - 1)
+                last_item.setData(Qt.ItemDataRole.UserRole, model['table_name'])
+            k2_logger.info(f"Loaded {len(models)} saved models", "ANALYSIS")
+        except Exception as e:
+            k2_logger.error(f"Failed to load saved models: {e}", "ANALYSIS")
+    
+    def load_all_tables_fallback(self):
+        """Fallback to loading all tables if saved models system not available"""
+        try:
             from k2_quant.utilities.services.stock_data_service import stock_service
             tables = stock_service.get_all_stock_tables()
             
             for table_name, size in tables:
                 self.model_list.addItem(f"{table_name} ({size})")
                 
-            k2_logger.info(f"Loaded {len(tables)} saved models", "ANALYSIS")
+            k2_logger.info(f"Loaded {len(tables)} tables (fallback mode)", "ANALYSIS")
         except Exception as e:
-            k2_logger.error(f"Failed to load models: {str(e)}", "ANALYSIS")
+            k2_logger.error(f"Failed to load tables: {str(e)}", "ANALYSIS")
+    
+    def refresh_models(self):
+        """Refresh the saved models list"""
+        k2_logger.info("Refreshing saved models list", "ANALYSIS")
+        self.load_saved_models()
     
     def load_model(self, item):
         """Load selected model"""
         if not item:
             return
-            
-        # Extract table name from item text
-        table_name = item.text().split(" (")[0]
+        
+        # Try to get table name from item data first
+        table_name = item.data(Qt.ItemDataRole.UserRole)
+        
+        # If no data stored, parse from text (fallback)
+        if not table_name:
+            # Extract table name from item text
+            table_name = item.text().split(" (")[0]
+        
         k2_logger.info(f"Loading model: {table_name}", "ANALYSIS")
         
         try:
             from k2_quant.utilities.services.stock_data_service import stock_service
             
-            # Get data from table
-            rows, total_count = stock_service.get_display_data(table_name, limit=1000)
+            # Get data from table (limit to last 500 rows)
+            rows, total_count = stock_service.get_display_data(table_name, limit=500)
             
             if rows:
                 # Update status
@@ -324,6 +361,15 @@ class AnalysisPageWidget(QWidget):
                 # Store current data
                 self.current_model = table_name
                 self.current_data = rows
+                # Restore per-model state (indicators, active strategy, chart range)
+                try:
+                    state = saved_models_manager.get_model_state(table_name)
+                    k2_logger.info(f"Restored model state for {table_name}: {state}", "ANALYSIS")
+                    # Reflect active strategy selection if present
+                    if hasattr(self, 'strategy_widget') and state.get('active_strategy'):
+                        self.strategy_widget.set_strategy_enabled(state['active_strategy'], True)
+                except Exception as e:
+                    k2_logger.warning(f"No model state available: {e}", "ANALYSIS")
                 
         except Exception as e:
             k2_logger.error(f"Failed to load model: {str(e)}", "ANALYSIS")
@@ -350,13 +396,88 @@ class AnalysisPageWidget(QWidget):
                 else:
                     self.data_table.setItem(i, j, QTableWidgetItem(f"{float(row[j]):.2f}"))
     
-    def toggle_indicator(self, indicator_name: str, state: int):
-        """Toggle technical indicator"""
-        enabled = state == 2  # Qt.CheckState.Checked
-        k2_logger.info(f"Indicator {'enabled' if enabled else 'disabled'}: {indicator_name}", "ANALYSIS")
-        
-        # In a full implementation, this would calculate and display the indicator
-        self.status_label.setText(f"{indicator_name} {'enabled' if enabled else 'disabled'}")
+    # Indicator handlers
+    def on_indicator_applied(self, name: str, params: Dict):
+        if not self.current_model:
+            return
+        try:
+            df = stock_service.get_full_dataframe(self.current_model)
+            if df is None or df.empty:
+                return
+            series = ta_service.calculate_indicator(df, name, params)
+            if series is None or series.empty:
+                return
+            col = self._indicator_column_name(name, params)
+            stock_service.ensure_indicator_column(self.current_model, col, sql_type="NUMERIC")
+            stock_service.update_indicator_column(self.current_model, col, df['timestamp'], series)
+            # persist per-model indicator state
+            state = saved_models_manager.get_model_state(self.current_model)
+            indicators = state.get('indicators', {})
+            indicators[col] = { 'name': name, 'params': params }
+            saved_models_manager.set_model_state(self.current_model, indicators=indicators, active_strategy=state.get('active_strategy'), chart_range=state.get('chart_range'))
+            # refresh table (last 500)
+            rows, total = stock_service.get_display_data(self.current_model, limit=500)
+            self.load_data_into_table(rows)
+            self.model_label.setText(f"Model: {self.current_model} ({total:,} records)")
+        except Exception as e:
+            k2_logger.error(f"on_indicator_applied failed: {str(e)}", "ANALYSIS")
+
+    def on_indicator_removed(self, name: str):
+        # UI-only removal of pane (DB column remains)
+        k2_logger.info(f"Indicator removed (UI): {name}", "ANALYSIS")
+
+    def on_indicator_params_changed(self, name: str, params: Dict):
+        # Optional live preview hook
+        pass
+
+    def _indicator_column_name(self, name: str, params: Dict) -> str:
+        items = [f"{k}_{params[k]}" for k in sorted(params.keys())] if params else []
+        return "_".join([name.lower()] + items) if items else name.lower()
+
+    def on_strategy_toggled(self, strategy_name: str, enabled: bool):
+        """Apply or remove strategy projections for current model."""
+        if not self.current_model:
+            return
+        table_name = self.current_model
+        try:
+            if enabled:
+                # Fetch strategy code
+                code = strategy_service.get_strategy_code(strategy_name)
+                if not code:
+                    k2_logger.warning(f"Strategy code not found: {strategy_name}", "ANALYSIS")
+                    return
+                # Load full dataset for computation
+                rows, _ = stock_service.get_display_data(table_name, limit=10**9)
+                import pandas as pd
+                df = pd.DataFrame(rows, columns=['date_time_market','open','high','low','close','volume','vwap'])
+                # Execute strategy via DPE
+                result = dpe_service.execute_strategy(code, df)
+                if not result.get('success'):
+                    k2_logger.error(f"Strategy execution failed: {result.get('error')}", "ANALYSIS")
+                    return
+                result_df = result.get('data') if isinstance(result.get('data'), pd.DataFrame) else df
+                # Derive projection rows: rows beyond original length or flagged
+                proj_df = result_df.iloc[len(df):].copy() if len(result_df) > len(df) else result_df[result_df.get('is_projection') == True] if 'is_projection' in result_df.columns else pd.DataFrame()
+                if proj_df.empty:
+                    k2_logger.warning("No projection rows produced by strategy", "ANALYSIS")
+                else:
+                    # Ensure required columns present
+                    missing = [c for c in ['open','high','low','close'] if c not in proj_df.columns]
+                    if missing:
+                        k2_logger.error(f"Projection rows missing columns: {missing}", "ANALYSIS")
+                        return
+                    stock_service.delete_projections(table_name, strategy_name)
+                    stock_service.insert_projections(table_name, proj_df, strategy_name)
+                    saved_models_manager.set_model_state(table_name, indicators=None, active_strategy=strategy_name, chart_range=None)
+            else:
+                stock_service.delete_projections(table_name, strategy_name)
+                saved_models_manager.set_model_state(table_name, indicators=None, active_strategy=None, chart_range=None)
+            # Reload table view (last 500 rows)
+            rows, total_count = stock_service.get_display_data(table_name, limit=500)
+            self.load_data_into_table(rows)
+            self.model_label.setText(f"Model: {table_name} ({total_count:,} records)")
+        except Exception as e:
+            k2_logger.error(f"Strategy toggle failed: {str(e)}", "ANALYSIS")
     
     def change_view(self, view_type: str):
         """Change the middle pane view"""
@@ -515,3 +636,27 @@ class AnalysisPageWidget(QWidget):
     def cleanup(self):
         """Cleanup when closing tab"""
         k2_logger.info(f"Cleaning up Analysis tab {self.tab_id}", "ANALYSIS")
+
+    def reset_after_database_cleared(self):
+        """Reset UI and state after DB deletion."""
+        try:
+            # Clear model list
+            self.model_list.clear()
+            # Clear data table
+            self.data_table.clear()
+            self.data_table.setRowCount(0)
+            self.data_table.setColumnCount(0)
+            # Reset labels
+            self.model_label.setText("No model loaded")
+            self.status_label.setText("Ready")
+            # Clear AI chat
+            self.chat_display.clear()
+            self.chat_display.append("AI: The database has been cleared. No models are available.")
+            # Reset internal state
+            self.current_model = None
+            self.current_data = None
+            # Reload models (will likely be empty)
+            self.load_saved_models()
+            k2_logger.info(f"Analysis tab {self.tab_id} reset after DB clear", "ANALYSIS")
+        except Exception as e:
+            k2_logger.error(f"Analysis reset failed: {str(e)}", "ANALYSIS")

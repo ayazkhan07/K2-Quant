@@ -5,6 +5,8 @@ from datetime import datetime
 from typing import List, Dict, Optional, Tuple, Generator
 import psycopg2
 from psycopg2.extras import execute_values, RealDictCursor
+import pandas as pd
+from datetime import datetime
 from psycopg2.pool import ThreadedConnectionPool
 from contextlib import contextmanager
 import pytz
@@ -164,6 +166,87 @@ class DatabaseManager:
         self.create_indexes(table_name)
         return table_name
 
+    # Projection helpers
+    def ensure_projection_columns(self, table_name: str) -> None:
+        """Ensure projection-related columns exist on the target table."""
+        with self.get_connection() as conn:
+            with self.get_cursor(conn) as cur:
+                try:
+                    cur.execute(
+                        f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS is_projection BOOLEAN DEFAULT FALSE"
+                    )
+                    cur.execute(
+                        f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS projection_source TEXT"
+                    )
+                    conn.commit()
+                except Exception as e:
+                    conn.rollback()
+                    k2_logger.error(f"Failed ensuring projection columns on {table_name}: {str(e)}", "DB")
+                    raise
+
+    def bulk_insert_dataframe(self, table_name: str, df) -> int:
+        """Bulk insert a pandas DataFrame into the table using execute_values.
+
+        Assumes DataFrame columns map 1:1 to table columns by name.
+        """
+        try:
+            if df is None or len(df) == 0:
+                return 0
+            columns = [str(c) for c in df.columns]
+            values = [tuple(None if pd.isna(v) else v for v in row) for row in df.itertuples(index=False, name=None)]
+            with self.get_connection() as conn:
+                with self.get_cursor(conn) as cur:
+                    execute_values(
+                        cur,
+                        f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES %s",
+                        values,
+                        page_size=self.BULK_INSERT_PAGE_SIZE,
+                    )
+                    affected = cur.rowcount or 0
+                    conn.commit()
+                    return affected
+        except Exception as e:
+            k2_logger.error(f"bulk_insert_dataframe failed: {str(e)}", "DB")
+            raise
+
+    def delete_where(self, table_name: str, where_sql: str, params: List) -> int:
+        """Delete rows from table by predicate and return affected count."""
+        with self.get_connection() as conn:
+            with self.get_cursor(conn) as cur:
+                cur.execute(f"DELETE FROM {table_name} WHERE {where_sql}", params)
+                affected = cur.rowcount or 0
+                conn.commit()
+                return affected
+
+    def ensure_indicator_column(self, table_name: str, column_name: str, sql_type: str = "NUMERIC") -> None:
+        """Add indicator column if missing."""
+        with self.get_connection() as conn:
+            with self.get_cursor(conn) as cur:
+                cur.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS {column_name} {sql_type}")
+                conn.commit()
+
+    def bulk_update_column_by_timestamp(self, table_name: str, column_name: str, ts_series: pd.Series, val_series: pd.Series) -> int:
+        """Efficiently update a numeric indicator column by joining on timestamp."""
+        pairs = [(int(ts), None if pd.isna(val) else float(val)) for ts, val in zip(ts_series.values, val_series.values)]
+        with self.get_connection() as conn:
+            with self.get_cursor(conn) as cur:
+                # Use VALUES to batch update
+                execute_values(
+                    cur,
+                    f"UPDATE {table_name} AS t SET {column_name} = v.val FROM (VALUES %s) AS v(ts, val) WHERE t.timestamp = v.ts",
+                    pairs,
+                )
+                affected = cur.rowcount or 0
+                conn.commit()
+                return affected
+
+    def fetch_dataframe(self, table_name: str) -> pd.DataFrame:
+        with self.get_connection() as conn:
+            return pd.read_sql_query(
+                f"SELECT timestamp, date_time_market, open, high, low, close, volume, vwap FROM {table_name} ORDER BY timestamp",
+                conn,
+            )
+
     def _get_market_hours_where_clause(self) -> str:
         return (
             """
@@ -256,6 +339,7 @@ class DatabaseManager:
                 return rows
 
     def get_date_range(self, table_name: str) -> Tuple[Optional[datetime], Optional[datetime]]:
+        """Get date range for a table"""
         with self.get_connection() as conn:
             with self.get_cursor(conn) as cur:
                 cur.execute(f"SELECT MIN(date_time_market), MAX(date_time_market) FROM {table_name}")
@@ -265,37 +349,28 @@ class DatabaseManager:
                 return (None, None)
 
     def get_table_statistics(self, table_name: str) -> Dict:
-        with self.get_connection() as conn:
-            with self.get_cursor(conn, cursor_factory=RealDictCursor) as cur:
-                cur.execute(
-                    f"""
-                    SELECT 
-                        COUNT(*) as total_records,
-                        MIN(date_time_market) as earliest_date,
-                        MAX(date_time_market) as latest_date,
-                        AVG(volume) as avg_volume,
-                        SUM(volume) as total_volume,
-                        MIN(low) as period_low,
-                        MAX(high) as period_high,
-                        pg_size_pretty(pg_total_relation_size('{table_name}'::regclass)) as table_size
-                    FROM {table_name}
-                    """
-                )
-                stats = dict(cur.fetchone())
-                cur.execute(
-                    f"""
-                    WITH time_diffs AS (
-                        SELECT 
-                            date_time_market,
-                            LAG(date_time_market) OVER (ORDER BY timestamp) as prev_time,
-                            date_time_market - LAG(date_time_market) OVER (ORDER BY timestamp) as time_diff
-                        FROM {table_name}
+        """Get statistics for a table including record count and size"""
+        try:
+            with self.get_connection() as conn:
+                with self.get_cursor(conn) as cur:
+                    # Get record count
+                    cur.execute(f"SELECT COUNT(*) FROM {table_name}")
+                    total_records = cur.fetchone()[0]
+                    
+                    # Get table size
+                    cur.execute(
+                        "SELECT pg_size_pretty(pg_total_relation_size(%s::regclass))",
+                        (table_name,)
                     )
-                    SELECT COUNT(*) as gaps FROM time_diffs WHERE time_diff > INTERVAL '1 day'
-                    """
-                )
-                stats['data_gaps'] = cur.fetchone()['gaps']
-                return stats
+                    size = cur.fetchone()[0]
+                    
+                    return {
+                        'total_records': total_records,
+                        'size': size
+                    }
+        except Exception as e:
+            k2_logger.error(f"Failed to get table statistics: {str(e)}", "DB")
+            return {'total_records': 0, 'size': '0 MB'}
 
     def validate_table_exists(self, table_name: str) -> bool:
         with self.get_connection() as conn:
@@ -362,4 +437,39 @@ class DatabaseManager:
 
 db_manager = DatabaseManager()
 
+# DataFrame fetch helpers for chart windowing
+def _to_dt(value):
+    if isinstance(value, datetime):
+        return value
+    return datetime.fromisoformat(str(value))
 
+def _as_read_sql(conn, query: str, params: tuple) -> pd.DataFrame:
+    return pd.read_sql_query(query, conn, params=params)
+
+def fetch_time_window_df(self, table_name: str, start_dt: datetime, end_dt: datetime) -> pd.DataFrame:
+    with self.get_connection() as conn:
+        return _as_read_sql(
+            conn,
+            f"""
+            SELECT timestamp, date_time_market, open, high, low, close, volume, vwap
+            FROM {table_name}
+            WHERE date_time_market BETWEEN %s AND %s
+            ORDER BY timestamp
+            """,
+            (start_dt, end_dt),
+        )
+
+def fetch_older_chunk_df(self, table_name: str, before_timestamp: int, limit: int) -> pd.DataFrame:
+    with self.get_connection() as conn:
+        df = _as_read_sql(
+            conn,
+            f"""
+            SELECT timestamp, date_time_market, open, high, low, close, volume, vwap
+            FROM {table_name}
+            WHERE timestamp < %s
+            ORDER BY timestamp DESC
+            LIMIT %s
+            """,
+            (before_timestamp, limit),
+        )
+        return df.iloc[::-1].reset_index(drop=True)

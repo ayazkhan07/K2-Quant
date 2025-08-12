@@ -14,6 +14,8 @@ from k2_quant.utilities.services.polygon_client import polygon_client
 from k2_quant.utilities.data.db_manager import db_manager
 from k2_quant.utilities.logger import k2_logger, log_performance
 from k2_quant.utilities.config.api_config import api_config
+from datetime import datetime, timedelta
+import pandas as pd
 
 
 class StockService:
@@ -222,6 +224,78 @@ class StockService:
 
     def get_tables_for_ticker(self, symbol: str, timespan: str = None, range_val: str = None) -> List[str]:
         return self.db.get_tables_for_ticker(symbol, timespan, range_val)
+
+    # Projections API
+    def insert_projections(self, table_name: str, rows_df, strategy_name: str) -> int:
+        """Append projection rows to a model table with flags set."""
+        try:
+            import pandas as pd
+            if rows_df is None:
+                return 0
+            if not isinstance(rows_df, pd.DataFrame):
+                rows_df = pd.DataFrame(rows_df)
+            self.db.ensure_projection_columns(table_name)
+            rows = rows_df.copy()
+            rows['is_projection'] = True
+            rows['projection_source'] = strategy_name
+            affected = self.db.bulk_insert_dataframe(table_name, rows)
+            k2_logger.database_operation("Projections inserted", f"{affected} rows into {table_name} for {strategy_name}")
+            return affected
+        except Exception as e:
+            k2_logger.error(f"insert_projections failed: {str(e)}", "DB")
+            raise
+
+    def delete_projections(self, table_name: str, strategy_name: str) -> int:
+        """Remove projection rows for a given strategy from a model table."""
+        try:
+            affected = self.db.delete_where(table_name, "is_projection = TRUE AND projection_source = %s", [strategy_name])
+            k2_logger.database_operation("Projections deleted", f"{affected} rows from {table_name} for {strategy_name}")
+            return affected
+        except Exception as e:
+            k2_logger.error(f"delete_projections failed: {str(e)}", "DB")
+            raise
+
+    # Indicator persistence and data access
+    def get_full_dataframe(self, table_name: str):
+        try:
+            import pandas as pd
+            df = self.db.fetch_dataframe(table_name)
+            return df
+        except Exception as e:
+            k2_logger.error(f"fetch_dataframe failed: {str(e)}", "DB")
+            return None
+
+    def ensure_indicator_column(self, table_name: str, column_name: str, sql_type: str = "NUMERIC"):
+        try:
+            self.db.ensure_indicator_column(table_name, column_name, sql_type)
+        except Exception as e:
+            k2_logger.error(f"ensure_indicator_column failed: {str(e)}", "DB")
+            raise
+
+    def update_indicator_column(self, table_name: str, column_name: str, ts_series, val_series) -> int:
+        try:
+            affected = self.db.bulk_update_column_by_timestamp(table_name, column_name, ts_series, val_series)
+            k2_logger.database_operation("Indicator column updated", f"{column_name} on {table_name}: {affected} rows")
+            return affected
+        except Exception as e:
+            k2_logger.error(f"update_indicator_column failed: {str(e)}", "DB")
+            raise
+
+    # Time-window data access for chart
+    def get_preset_range_df(self, table_name: str, preset: str) -> pd.DataFrame:
+        days_map = {'5D': 5, '1M': 30, '3M': 90, '6M': 180, '1Y': 365, '5Y': 1825}
+        if preset == 'All':
+            return self.db.fetch_dataframe(table_name)
+        days = days_map.get(preset, 7)
+        end = datetime.now()
+        start = end - timedelta(days=days)
+        return self.db.fetch_time_window_df(table_name, start, end)
+
+    def get_time_window_df(self, table_name: str, start: datetime, end: datetime) -> pd.DataFrame:
+        return self.db.fetch_time_window_df(table_name, start, end)
+
+    def get_older_chunk_df(self, table_name: str, before_timestamp: int, limit: int = 5000) -> pd.DataFrame:
+        return self.db.fetch_older_chunk_df(table_name, before_timestamp, limit)
 
 
 stock_service = StockService()

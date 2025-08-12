@@ -4,7 +4,7 @@ Model List Widget for K2 Quant Analysis
 Displays saved models from PostgreSQL with metadata and quick actions.
 """
 
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from datetime import datetime
 
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QListWidget, QListWidgetItem,
@@ -59,7 +59,7 @@ class ModelListWidget(QWidget):
         
         # Connect signals
         self.list_widget.itemClicked.connect(self.on_item_clicked)
-        self.list_widget.itemDoubleClicked.connect(self.on_item_double_clicked)
+        self.list_widget.itemDoubleClicked.connect(self.on_item_clicked)
         
         layout.addWidget(self.list_widget)
         
@@ -129,17 +129,11 @@ class ModelListWidget(QWidget):
         return text
     
     def on_item_clicked(self, item: QListWidgetItem):
-        """Handle item click"""
-        table_name = item.data(Qt.ItemDataRole.UserRole)
-        if table_name:
-            k2_logger.info(f"Model selected: {table_name}", "MODEL_LIST")
-    
-    def on_item_double_clicked(self, item: QListWidgetItem):
-        """Handle item double-click - load the model"""
+        """Handle item selection (single or double click)."""
         table_name = item.data(Qt.ItemDataRole.UserRole)
         if table_name:
             self.model_selected.emit(table_name)
-            k2_logger.info(f"Loading model: {table_name}", "MODEL_LIST")
+            k2_logger.info(f"Model selected: {table_name}", "MODEL_LIST")
     
     def get_selected_model(self) -> Optional[str]:
         """Get currently selected model table name"""
@@ -150,8 +144,23 @@ class ModelListWidget(QWidget):
     
     def refresh(self):
         """Refresh the model list"""
-        # This would typically reload from the service
-        pass
+        # Prefer reloading from the saved models service
+        try:
+            from k2_quant.utilities.data.saved_models_manager import saved_models_manager
+            models = saved_models_manager.get_saved_models()
+            self.populate_models(models)
+        except Exception as e:
+            k2_logger.error(f"Failed to refresh models: {e}", "MODEL_LIST")
+
+    def reload_from_service(self):
+        """Fetch models directly from the saved models manager and populate."""
+        try:
+            from k2_quant.utilities.data.saved_models_manager import saved_models_manager
+            models = saved_models_manager.get_saved_models()
+            self.populate_models(models)
+        except Exception as e:
+            k2_logger.error(f"Failed to reload saved models: {e}", "MODEL_LIST")
+            self.populate_models([])
     
     def filter_models(self, filter_text: str):
         """Filter displayed models"""

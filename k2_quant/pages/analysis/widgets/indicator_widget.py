@@ -1,13 +1,15 @@
 """
 Indicator Widget for K2 Quant Analysis
 
-Displays technical indicators alphabetically with toggle controls.
+Displays technical indicators with basic parameter editing and emits
+signals to apply/remove indicators.
 """
 
 from typing import List, Dict, Any
 
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QCheckBox, QLabel,
-                             QScrollArea, QFrame, QHBoxLayout)
+                             QScrollArea, QFrame, QHBoxLayout, QFormLayout,
+                             QSpinBox, QPushButton)
 from PyQt6.QtCore import Qt, pyqtSignal
 
 from k2_quant.utilities.services.technical_analysis_service import ta_service
@@ -16,13 +18,18 @@ from k2_quant.utilities.logger import k2_logger
 
 class IndicatorWidget(QWidget):
     """Widget for displaying and toggling technical indicators"""
-    
+
     # Signals
-    indicator_toggled = pyqtSignal(str, bool)  # indicator_name, enabled
+    indicator_toggled = pyqtSignal(str, bool)  # legacy: indicator_name, enabled
+    indicator_applied = pyqtSignal(str, dict)        # name, params
+    indicator_removed = pyqtSignal(str)              # name
+    indicator_params_changed = pyqtSignal(str, dict) # name, params
     
     def __init__(self, parent=None):
         super().__init__(parent)
         self.indicator_checkboxes = {}
+        self.param_inputs = {}
+        self.current_name = None
         self.init_ui()
         self.populate_indicators()
     
@@ -32,6 +39,20 @@ class IndicatorWidget(QWidget):
         self.layout.setContentsMargins(0, 0, 0, 0)
         self.layout.setSpacing(5)
         self.setLayout(self.layout)
+
+        # Parameter editor area
+        self.param_form = QFormLayout()
+        self.apply_btn = QPushButton("Apply")
+        self.remove_btn = QPushButton("Remove")
+        self.apply_btn.clicked.connect(self._apply)
+        self.remove_btn.clicked.connect(self._remove)
+        self.layout.addSpacing(6)
+        self.layout.addWidget(QLabel("Parameters"))
+        self.layout.addLayout(self.param_form)
+        action_row = QHBoxLayout()
+        action_row.addWidget(self.apply_btn)
+        action_row.addWidget(self.remove_btn)
+        self.layout.addLayout(action_row)
     
     def populate_indicators(self):
         """Populate widget with all available indicators"""
@@ -118,6 +139,7 @@ class IndicatorWidget(QWidget):
         checkbox.stateChanged.connect(
             lambda state, name=indicator_name: self.on_indicator_toggled(name, state)
         )
+        checkbox.clicked.connect(lambda _=None, name=indicator_name: self._select_for_params(name))
         
         layout.addWidget(checkbox)
         
@@ -152,6 +174,36 @@ class IndicatorWidget(QWidget):
             f"Indicator {'enabled' if enabled else 'disabled'}: {indicator_name}",
             "INDICATOR_WIDGET"
         )
+
+    def _select_for_params(self, indicator_name: str):
+        self.current_name = indicator_name
+        self.param_inputs.clear()
+        while self.param_form.rowCount():
+            self.param_form.removeRow(0)
+        info = ta_service.get_indicator_info(indicator_name)
+        if not info:
+            return
+        for param, default in (info.parameters or {}).items():
+            spin = QSpinBox()
+            spin.setRange(1, 1000)
+            spin.setValue(int(default))
+            spin.valueChanged.connect(lambda _=None, n=indicator_name: self._emit_params_changed(n))
+            self.param_inputs[param] = spin
+            self.param_form.addRow(QLabel(param), spin)
+
+    def _collect_params(self) -> dict:
+        return {k: w.value() for k, w in self.param_inputs.items()}
+
+    def _apply(self):
+        if self.current_name:
+            self.indicator_applied.emit(self.current_name, self._collect_params())
+
+    def _remove(self):
+        if self.current_name:
+            self.indicator_removed.emit(self.current_name)
+
+    def _emit_params_changed(self, name: str):
+        self.indicator_params_changed.emit(name, self._collect_params())
     
     def set_indicator_enabled(self, indicator_name: str, enabled: bool):
         """Programmatically set indicator state"""

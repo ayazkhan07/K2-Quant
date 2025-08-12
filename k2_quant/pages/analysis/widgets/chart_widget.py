@@ -25,6 +25,8 @@ class ChartWidget(QWidget):
     # Signals
     drawing_added = pyqtSignal(dict)  # drawing_data
     time_range_changed = pyqtSignal(str, str)  # start, end
+    time_range_selected = pyqtSignal(str)      # '5D'|'1M'|'3M'|'6M'|'1Y'|'5Y'|'All'
+    fetch_older_requested = pyqtSignal(object) # before_timestamp (int)
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -71,7 +73,7 @@ class ChartWidget(QWidget):
         self.main_plot.scene().sigMouseMoved.connect(self.on_mouse_moved)
     
     def create_toolbar(self) -> QWidget:
-        """Create drawing tools toolbar"""
+        """Create drawing tools toolbar and range buttons"""
         toolbar = QWidget()
         toolbar.setFixedHeight(35)
         toolbar.setStyleSheet("""
@@ -101,6 +103,14 @@ class ChartWidget(QWidget):
         layout.setContentsMargins(5, 0, 5, 0)
         toolbar.setLayout(layout)
         
+        # Time range buttons
+        for label in ['5D','1M','3M','6M','1Y','5Y','All']:
+            btn = QPushButton(label)
+            btn.clicked.connect(lambda _, l=label: self.time_range_selected.emit(l))
+            layout.addWidget(btn)
+
+        layout.addSpacing(10)
+
         # Drawing tools
         self.trend_btn = QPushButton("📈 Trend Line")
         self.trend_btn.setCheckable(True)
@@ -136,6 +146,19 @@ class ChartWidget(QWidget):
         layout.addWidget(self.zoom_fit_btn)
         
         return toolbar
+
+    def update_with_dataframe(self, df: pd.DataFrame):
+        """Render OHLC as 4 unique lines (time vs price)."""
+        self.clear_all()
+        if df is None or df.empty:
+            return
+        self.data = df.reset_index(drop=True)
+        self.date_column = 'date_time_market' if 'date_time_market' in df.columns else 'date'
+        self.x_values = np.arange(len(self.data))
+        # Plot four lines
+        for col, color in [('open','#4aa'), ('high','#4a4'), ('low','#a44'), ('close','#aa4')]:
+            if col in self.data.columns:
+                self.add_line(col, self.data[col], color=color)
     
     def setup_chart_style(self):
         """Setup chart appearance"""

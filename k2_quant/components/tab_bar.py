@@ -195,3 +195,25 @@ class TabBarWidget(QWidget):
                 self.tab_bar.setCurrentIndex(index)
                 return True
         return False
+
+    def close_all_analysis_tabs_except_default(self):
+        """Close all analysis tabs except the default (ID 0)."""
+        to_remove = []
+        for idx, (p_type, t_id, _) in list(self.tabs.items()):
+            if p_type == 'analysis' and t_id != 0:
+                to_remove.append(idx)
+        # Remove in reverse order to keep indices valid
+        for idx in sorted(to_remove, reverse=True):
+            self.tab_bar.removeTab(idx)
+            try:
+                del self.tabs[idx]
+            except KeyError:
+                pass
+        # Reindex remaining tabs mapping to current tab count
+        new_tabs = {}
+        for i in range(self.tab_bar.count()):
+            # Find existing mapping for tab at position i
+            if i in self.tabs:
+                new_tabs[i] = self.tabs[i]
+        self.tabs = new_tabs
+        k2_logger.ui_operation("Closed all analysis tabs except default", "TAB_BAR")
