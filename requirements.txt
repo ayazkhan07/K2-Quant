@@ -4,16 +4,26 @@
 # Core PyQt6 dependencies
 PyQt6>=6.6.0
 PyQt6-Qt6>=6.6.0
-PyQt6-multimedia>=6.6.0  # For video playback in landing page
-PyQt6-Charts>=6.6.0      # For advanced charting capabilities
+# PyQt6-multimedia>=6.6.0  # Only needed if using video in landing page
+# PyQt6-Charts>=6.6.0      # Only needed if using Qt Charts (currently using pyqtgraph)
 
 # Database
 psycopg2-binary>=2.9.0   # PostgreSQL adapter
+SQLAlchemy>=2.0.0        # Required for pandas.to_sql() operations
 
 # Data processing and analysis
 pandas>=2.0.0
 numpy>=1.24.0
 pandas-ta>=0.3.14b0      # Technical analysis indicators
+openpyxl>=3.1.0          # Excel file support for pandas
+xlsxwriter>=3.1.0        # Excel writer support
+
+# Technical Analysis
+TA-Lib>=0.4.28           # Technical analysis library
+# Note: TA-Lib requires system libraries. Install with:
+# Ubuntu/Debian: sudo apt-get install ta-lib
+# macOS: brew install ta-lib
+# Windows: Download from https://www.ta-lib.org/
 
 # API and networking
 requests>=2.31.0         # Synchronous HTTP requests
@@ -22,12 +32,17 @@ websocket-client>=1.6.0  # WebSocket connections for real-time data
 
 # AI/ML Integration
 openai>=1.0.0           # OpenAI GPT integration for chat
+anthropic>=0.7.0        # Anthropic Claude integration
 tiktoken>=0.5.0         # Token counting for OpenAI
 
-# Machine Learning (for agent system)
-yfinance>=0.2.0         # Yahoo Finance data (used by agents)
+# Machine Learning
+yfinance>=0.2.0         # Yahoo Finance data (backup data source)
 scikit-learn>=1.3.0     # ML utilities
 statsmodels>=0.14.0     # Statistical models (ARIMA)
+# xgboost>=2.0.0        # Optional: XGBoost models
+# prophet>=1.1          # Optional: Facebook Prophet for time series
+# tensorflow>=2.14.0    # Optional: Deep learning (LSTM)
+# torch>=2.0.0          # Optional: Alternative deep learning framework
 
 # Configuration and environment
 python-dotenv>=1.0.0    # Environment variable management
@@ -38,33 +53,26 @@ pytz>=2023.3            # Timezone definitions for EST conversion
 # Visualization
 pyqtgraph>=0.13.0       # High-performance plotting for PyQt
 matplotlib>=3.7.0       # Additional plotting capabilities
-plotly>=5.14.0          # Interactive charts (optional)
+# plotly>=5.14.0        # Optional: Interactive charts
 
 # Code execution and security
 RestrictedPython>=6.0   # Safe Python code execution for AI-generated code
 
-# Testing and QA (for agent system)
+# Testing and QA
 pytest>=7.4.0           # Testing framework
 pytest-asyncio>=0.21.0  # Async test support
-selenium>=4.15.0        # Web automation testing (for Mussadiq)
+# selenium>=4.15.0      # Optional: Web automation testing
 
-# Development tools
-black>=23.3.0           # Code formatting
-flake8>=6.0.0           # Code linting
-mypy>=1.5.0             # Type checking
+# Development tools (optional)
+# black>=23.3.0         # Code formatting
+# flake8>=6.0.0         # Code linting
+# mypy>=1.5.0           # Type checking
 
 # Scheduling and background tasks
-schedule>=1.2.0         # Task scheduling (for agents)
-APScheduler>=3.10.0     # Advanced scheduling (optional)
+schedule>=1.2.0         # Task scheduling
+# APScheduler>=3.10.0   # Optional: Advanced scheduling
 
 # Additional utilities
 python-dateutil>=2.8.2  # Date parsing utilities
 json5>=0.9.0            # JSON with comments support
-pyyaml>=6.0              # YAML support for configs
-
-# Optional dependencies for extended features
-# scipy>=1.10.0         # Scientific computing
-# prophet>=1.1          # Facebook Prophet for time series
-# xgboost>=2.0.0        # XGBoost models
-# tensorflow>=2.14.0    # Deep learning (LSTM)
-# torch>=2.0.0          # Alternative deep learning framework
+pyyaml>=6.0             # YAML support for configs

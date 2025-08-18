@@ -2,6 +2,7 @@
 Strategy Widget for K2 Quant Analysis
 
 Displays custom strategies with toggle controls.
+Save as: k2_quant/pages/analysis/widgets/strategy_widget.py
 """
 
 from typing import List, Dict, Any
@@ -17,8 +18,8 @@ class StrategyWidget(QWidget):
     """Widget for displaying and toggling custom strategies"""
     
     # Signals
-    strategy_toggled = pyqtSignal(str, bool)  # strategy_name, enabled
-    strategy_edited = pyqtSignal(str)  # strategy_name
+    strategy_toggled = pyqtSignal(str, bool)
+    strategy_edited = pyqtSignal(str)
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -43,7 +44,7 @@ class StrategyWidget(QWidget):
         """)
         self.layout.addWidget(self.placeholder)
     
-    def populate_strategies(self, strategies: List[Dict[str, Any]]):
+    def populate_strategies(self, strategies):
         """Populate widget with strategies"""
         # Clear existing
         self.clear()
@@ -63,7 +64,7 @@ class StrategyWidget(QWidget):
         
         k2_logger.info(f"Populated {len(strategies)} strategies", "STRATEGY_WIDGET")
     
-    def create_strategy_item(self, strategy: Dict[str, Any]) -> QFrame:
+    def create_strategy_item(self, strategy):
         """Create a strategy item widget"""
         frame = QFrame()
         frame.setStyleSheet("""
@@ -165,21 +166,21 @@ class StrategyWidget(QWidget):
         
         return frame
     
-    def on_strategy_toggled(self, strategy_name: str, state: int):
+    def on_strategy_toggled(self, strategy_name, state):
         """Handle strategy toggle"""
-        enabled = state == 2  # Qt.CheckState.Checked
+        enabled = state == 2
         self.strategy_toggled.emit(strategy_name, enabled)
         k2_logger.info(
             f"Strategy {'enabled' if enabled else 'disabled'}: {strategy_name}",
             "STRATEGY_WIDGET"
         )
     
-    def set_strategy_enabled(self, strategy_name: str, enabled: bool):
+    def set_strategy_enabled(self, strategy_name, enabled):
         """Programmatically set strategy state"""
         if strategy_name in self.strategy_checkboxes:
             self.strategy_checkboxes[strategy_name].setChecked(enabled)
     
-    def get_enabled_strategies(self) -> List[str]:
+    def get_enabled_strategies(self):
         """Get list of enabled strategies"""
         enabled = []
         for name, checkbox in self.strategy_checkboxes.items():

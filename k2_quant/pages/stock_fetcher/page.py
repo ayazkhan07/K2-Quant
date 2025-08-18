@@ -4,6 +4,7 @@ Stock Fetcher UI - Page-driven version
 
 import sys
 import os
+import glob
 from datetime import datetime
 from typing import List
 
@@ -27,6 +28,8 @@ class StockFetcherWidget(QMainWindow):
 
     stock_data_fetched = pyqtSignal(dict)
     back_to_landing = pyqtSignal()
+    model_saved = pyqtSignal(str)  # NEW SIGNAL for model saved
+    database_cleared = pyqtSignal()  # Emitted after full DB deletion & analysis reset request
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -71,7 +74,7 @@ class StockFetcherWidget(QMainWindow):
 
         sidebar_layout = QVBoxLayout()
         sidebar_layout.setContentsMargins(20, 20, 20, 20)
-        sidebar_layout.setSpacing(30)
+        sidebar_layout.setSpacing(16)
         sidebar.setLayout(sidebar_layout)
 
         ticker_section = self.create_ticker_section()
@@ -86,8 +89,6 @@ class StockFetcherWidget(QMainWindow):
         filters_section = self.create_filters_section()
         sidebar_layout.addWidget(filters_section)
 
-        sidebar_layout.addStretch()
-
         metrics_frame = self.create_metrics_frame()
         sidebar_layout.addWidget(metrics_frame)
 
@@ -96,6 +97,9 @@ class StockFetcherWidget(QMainWindow):
 
         actions_section = self.create_actions_section()
         sidebar_layout.addWidget(actions_section)
+
+        # Keep content cohesive without pushing actions off-screen
+        sidebar_layout.addStretch()
 
         parent_layout.addWidget(sidebar)
 
@@ -229,7 +233,7 @@ class StockFetcherWidget(QMainWindow):
         actions_section = QFrame()
         actions_section.setObjectName("bottomActions")
         actions_layout = QVBoxLayout()
-        actions_layout.setContentsMargins(0, 20, 0, 0)
+        actions_layout.setContentsMargins(0, 10, 0, 0)
         actions_section.setLayout(actions_layout)
 
         self.fetch_button = QPushButton("Fetch Data")
@@ -411,6 +415,117 @@ class StockFetcherWidget(QMainWindow):
             """
         )
 
+    def save_as_model(self):
+        """Save current data as a model and reset the UI"""
+        if not self.current_data or not self.current_table:
+            show_warning(self, "No Data", "No data to save as model")
+            return
+        
+        try:
+            # Import the saved models manager
+            from k2_quant.utilities.data.saved_models_manager import saved_models_manager
+            
+            # Parse timespan from table name if not in current_data
+            table_parts = self.current_table.split('_')
+            timespan = table_parts[2] if len(table_parts) > 2 else 'day'
+            
+            # Prepare model data
+            model_data = {
+                'table_name': self.current_table,
+                'symbol': self.current_data['symbol'],
+                'timespan': timespan,
+                'range_val': self.active_range,
+                'frequency': self.active_frequency,
+                'market_hours_only': self.market_hours_only,
+                'record_count': self.current_data.get('total_records', 0)
+            }
+            
+            # Save to database
+            success = saved_models_manager.save_model(model_data)
+            
+            if success:
+                # Show success message
+                show_info(
+                    self, 
+                    "Model Saved", 
+                    f"Model '{self.current_data['symbol']} - {self.active_range}' has been saved.\n"
+                    f"Table: {self.current_table}\n\n"
+                    f"You can now access this model in the Analysis page."
+                )
+                
+                # Emit signal to notify other components
+                self.model_saved.emit(self.current_table)
+                
+                # Clear the UI to prepare for next fetch
+                self.clear_ui()
+                
+                k2_logger.info(f"Model saved and UI cleared: {self.current_table}", "STOCK_FETCHER")
+            else:
+                show_error(self, "Save Error", "Failed to save model to database")
+                
+        except Exception as e:
+            k2_logger.error(f"Error saving model: {str(e)}", "STOCK_FETCHER")
+            show_error(self, "Save Error", f"Failed to save model: {str(e)}")
+
+    def clear_data(self):
+        """Handle clear data with saved model check"""
+        if not self.current_table:
+            self.clear_ui()
+            return
+            
+        # Check if this table is a saved model
+        try:
+            from k2_quant.utilities.data.saved_models_manager import saved_models_manager
+            is_saved = saved_models_manager.is_model_saved(self.current_table)
+            
+            if is_saved:
+                # Warn that this is a saved model
+                msg = QMessageBox(self)
+                msg.setWindowTitle("Clear Saved Model")
+                msg.setText(f"'{self.current_table}' is a saved model.\n\nWhat would you like to do?")
+                msg.setIcon(QMessageBox.Icon.Warning)
+                
+                delete_btn = msg.addButton("Delete Table & Unsave", QMessageBox.ButtonRole.DestructiveRole)
+                clear_btn = msg.addButton("Clear UI Only", QMessageBox.ButtonRole.AcceptRole)
+                cancel_btn = msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+                
+                msg.exec()
+                
+                if msg.clickedButton() == delete_btn:
+                    # Delete table and remove from saved models
+                    saved_models_manager.unsave_model(self.current_table, delete_table=True)
+                    show_info(self, "Model Deleted", f"Model '{self.current_table}' has been deleted.")
+                    self.check_existing_tables()
+                    self.clear_ui()
+                elif msg.clickedButton() == clear_btn:
+                    # Just clear UI
+                    self.clear_ui()
+                # else: Cancel - do nothing
+            else:
+                # Not a saved model - use original logic
+                reply = show_data_clear_options(self)
+                if reply == QMessageBox.StandardButton.Yes:
+                    self.delete_table_and_clear()
+                elif reply == QMessageBox.StandardButton.No:
+                    self.clear_ui()
+                    
+        except ImportError:
+            # SavedModelsManager doesn't exist yet - use original logic
+            reply = show_data_clear_options(self)
+            if reply == QMessageBox.StandardButton.Yes:
+                self.delete_table_and_clear()
+            elif reply == QMessageBox.StandardButton.No:
+                self.clear_ui()
+        except Exception as e:
+            k2_logger.error(f"Error checking saved model status: {str(e)}", "STOCK_FETCHER")
+            # Fall back to original behavior
+            reply = show_data_clear_options(self)
+            if reply == QMessageBox.StandardButton.Yes:
+                self.delete_table_and_clear()
+            elif reply == QMessageBox.StandardButton.No:
+                self.clear_ui()
+
+    # Keep all other methods unchanged
     def apply_market_hours_filter(self):
         self.market_hours_only = self.market_hours_checkbox.isChecked()
         if self.current_table:
@@ -517,14 +632,26 @@ class StockFetcherWidget(QMainWindow):
         for i in range(len(rows)):
             self.data_table.setRowHeight(i, 40)
         for i, row in enumerate(rows):
-            date_time = row[0]
-            date_item = QTableWidgetItem(date_time.strftime('%Y-%m-%d'))
+            # rows are standardized: Date, Time, Open, High, Low, Close, Volume, VWAP
+            date_val = row[0]
+            time_val = row[1]
+            # Date column
+            try:
+                date_text = date_val.strftime('%Y-%m-%d')
+            except Exception:
+                date_text = str(date_val)
+            date_item = QTableWidgetItem(date_text)
             date_item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
             self.data_table.setItem(i, 0, date_item)
-            time_item = QTableWidgetItem(date_time.strftime('%H:%M:%S'))
+            # Time column
+            try:
+                time_text = time_val.strftime('%H:%M:%S')
+            except Exception:
+                time_text = str(time_val)
+            time_item = QTableWidgetItem(time_text)
             time_item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
             self.data_table.setItem(i, 1, time_item)
-            for j, value in enumerate(row[1:], 2):
+            for j, value in enumerate(row[2:], 2):
                 if j == 6:
                     item = QTableWidgetItem(f"{int(value):,}")
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -624,35 +751,6 @@ class StockFetcherWidget(QMainWindow):
             self.export_button.setEnabled(True)
             self.export_button.setText("Export as CSV")
 
-    def save_as_model(self):
-        if self.current_data:
-            model_config = {
-                'symbol': self.current_data['symbol'],
-                'range': self.active_range,
-                'frequency': self.active_frequency,
-                'table_name': self.current_data['table_name'],
-                'market_hours_filter': self.market_hours_only,
-                'created_at': datetime.now().isoformat(),
-            }
-            filename = f"model_{self.current_data['symbol']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-            try:
-                import json
-                with open(filename, 'w') as f:
-                    json.dump(model_config, f, indent=2)
-                show_info(self, "Model Saved", f"Model configuration saved to: {filename}")
-            except Exception as e:
-                show_warning(self, "Save Error", str(e))
-
-    def clear_data(self):
-        if not self.current_table:
-            self.clear_ui()
-            return
-        reply = show_data_clear_options(self)
-        if reply == QMessageBox.StandardButton.Yes:
-            self.delete_table_and_clear()
-        elif reply == QMessageBox.StandardButton.No:
-            self.clear_ui()
-
     def delete_table_and_clear(self):
         if not self.current_table:
             return
@@ -688,7 +786,24 @@ class StockFetcherWidget(QMainWindow):
                     show_info(self, "No Data", "No stock data tables found.")
                     return
                 count = stock_service.delete_all_tables()
-                show_info(self, "Database Cleaned", f"Deleted {count} stock data tables\nDatabase space reclaimed.")
+                # Remove any model_*.json artifacts from repo root
+                try:
+                    for json_path in glob.glob("model_*.json"):
+                        try:
+                            os.remove(json_path)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                # Inform user and notify application for analysis reset
+                show_info(
+                    self,
+                    "Database Cleaned",
+                    f"Deleted {count} stock data tables.\n\nThe Analysis page has been reset."
+                )
+                # Broadcast to other components (Main -> Analysis tabs)
+                self.database_cleared.emit()
                 self.clear_ui()
                 self.delete_db_btn.setEnabled(False)
             except Exception as e:
@@ -717,5 +832,3 @@ if __name__ == "__main__":
     widget = StockFetcherWidget()
     widget.show()
     sys.exit(app.exec())
-
-

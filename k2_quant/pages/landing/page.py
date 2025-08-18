@@ -20,6 +20,8 @@ class LandingPageWidget(QMainWindow):
         self.video_loaded = False
         self.fade_animation = None
         self.opacity_effect = None
+        self.media_player = None  # Initialize as None
+        self.is_transitioning = False  # Add flag to prevent multiple transitions
 
         self.init_ui()
         self.setup_video_player()
@@ -133,14 +135,21 @@ class LandingPageWidget(QMainWindow):
         QTimer.singleShot(200, lambda: widget.setStyleSheet(original_style))
 
     def setup_video_player(self):
-        self.media_player = QMediaPlayer()
-        self.audio_output = QAudioOutput()
-        self.media_player.setVideoOutput(self.video_widget)
-        self.media_player.setAudioOutput(self.audio_output)
-        self.audio_output.setMuted(True)
-        self.media_player.mediaStatusChanged.connect(self.handle_media_status)
-        self.media_player.errorOccurred.connect(self.handle_media_error)
-        self.load_video()
+        try:
+            self.media_player = QMediaPlayer()
+            self.audio_output = QAudioOutput()
+            self.media_player.setVideoOutput(self.video_widget)
+            self.media_player.setAudioOutput(self.audio_output)
+            self.audio_output.setMuted(True)
+            
+            # Connect signals
+            self.media_player.mediaStatusChanged.connect(self.handle_media_status)
+            self.media_player.errorOccurred.connect(self.handle_media_error)
+            
+            self.load_video()
+        except Exception as e:
+            k2_logger.error(f"Failed to setup video player: {str(e)}", "LANDING")
+            self.show_fallback_ui()
 
     def load_video(self):
         # Prefer local assets under page folder, then fall back to legacy root assets
@@ -167,6 +176,10 @@ class LandingPageWidget(QMainWindow):
         self.show_fallback_ui()
 
     def handle_media_status(self, status):
+        # Don't process media status if we're transitioning
+        if self.is_transitioning:
+            return
+            
         from PyQt6.QtMultimedia import QMediaPlayer as MP
         status_messages = {
             MP.MediaStatus.NoMedia: "No media loaded",
@@ -186,9 +199,11 @@ class LandingPageWidget(QMainWindow):
             self.media_player.play()
             self.resize_video_widget()
         elif status == MP.MediaStatus.EndOfMedia:
-            k2_logger.info("Looping video", "LANDING")
-            self.media_player.setPosition(0)
-            self.media_player.play()
+            # Only loop if we're not transitioning
+            if not self.is_transitioning and self.media_player:
+                k2_logger.info("Looping video", "LANDING")
+                self.media_player.setPosition(0)
+                self.media_player.play()
         elif status == MP.MediaStatus.InvalidMedia:
             k2_logger.error("Invalid media - showing fallback", "LANDING")
             self.show_fallback_ui()
@@ -224,7 +239,7 @@ class LandingPageWidget(QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if self.video_loaded:
+        if self.video_loaded and not self.is_transitioning:
             QTimer.singleShot(100, self.resize_video_widget)
 
     def setup_animations(self):
@@ -238,13 +253,13 @@ class LandingPageWidget(QMainWindow):
         self.fade_animation.finished.connect(self.emit_continue_signal)
 
     def handle_click(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
+        if event.button() == Qt.MouseButton.LeftButton and not self.is_transitioning:
             k2_logger.ui_operation("User clicked", "Starting transition")
             self.start_transition()
             event.accept()
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
+        if event.button() == Qt.MouseButton.LeftButton and not self.is_transitioning:
             k2_logger.ui_operation("User clicked window", "Starting transition")
             self.start_transition()
             event.accept()
@@ -252,8 +267,28 @@ class LandingPageWidget(QMainWindow):
             super().mousePressEvent(event)
 
     def start_transition(self):
-        if self.video_loaded:
-            self.media_player.stop()
+        # Prevent multiple transitions
+        if self.is_transitioning:
+            return
+            
+        self.is_transitioning = True
+        
+        # Stop video immediately if loaded
+        if self.video_loaded and self.media_player:
+            try:
+                # Disconnect signals to prevent further processing
+                self.media_player.mediaStatusChanged.disconnect()
+                self.media_player.errorOccurred.disconnect()
+                
+                # Stop and clear the media
+                self.media_player.stop()
+                self.media_player.setSource(QUrl())  # Clear the source
+                
+                k2_logger.info("Video stopped for transition", "LANDING")
+            except Exception as e:
+                k2_logger.error(f"Error stopping video: {str(e)}", "LANDING")
+        
+        # Start fade animation
         self.fade_animation.start()
 
     def emit_continue_signal(self):
@@ -261,10 +296,57 @@ class LandingPageWidget(QMainWindow):
         self.continue_requested.emit()
 
     def cleanup(self):
+        """Properly cleanup all resources"""
+        k2_logger.info("Starting landing page cleanup", "LANDING")
+        
+        # Set transitioning flag to prevent any further media operations
+        self.is_transitioning = True
+        
+        # Stop and cleanup media player
         if hasattr(self, 'media_player') and self.media_player:
-            self.media_player.stop()
-        if hasattr(self, 'pulse_timer'):
+            try:
+                # Disconnect all signals
+                try:
+                    self.media_player.mediaStatusChanged.disconnect()
+                    self.media_player.errorOccurred.disconnect()
+                except:
+                    pass  # Signals might already be disconnected
+                
+                # Stop playback
+                self.media_player.stop()
+                
+                # Clear the source
+                self.media_player.setSource(QUrl())
+                
+                # Delete the media player
+                self.media_player.deleteLater()
+                self.media_player = None
+                
+                k2_logger.info("Media player cleaned up", "LANDING")
+            except Exception as e:
+                k2_logger.error(f"Error during media cleanup: {str(e)}", "LANDING")
+        
+        # Stop audio output
+        if hasattr(self, 'audio_output') and self.audio_output:
+            try:
+                self.audio_output.deleteLater()
+                self.audio_output = None
+            except:
+                pass
+        
+        # Stop pulse timer
+        if hasattr(self, 'pulse_timer') and self.pulse_timer:
             self.pulse_timer.stop()
+            self.pulse_timer.deleteLater()
+            self.pulse_timer = None
+        
+        # Stop fade animation
+        if hasattr(self, 'fade_animation') and self.fade_animation:
+            self.fade_animation.stop()
+            self.fade_animation.deleteLater()
+            self.fade_animation = None
+        
+        k2_logger.info("Landing page cleanup complete", "LANDING")
 
 
 if __name__ == "__main__":
@@ -272,5 +354,3 @@ if __name__ == "__main__":
     window = LandingPageWidget()
     window.show()
     sys.exit(app.exec())
-
-
