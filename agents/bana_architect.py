@@ -197,12 +197,14 @@ class BanaArchitect(BaseAgent):
         self.update_status("creating_model", f"Building {model_type} model for {symbol}")
         
         # This is a framework - actual ML model implementations would be more complex
+        # NOTE: The 'version' here represents the model configuration schema/version.
+        # Aligning with application release v6.0.0 for consistency.
         model_config = {
             'type': model_type,
             'symbol': symbol,
             'parameters': parameters,
             'created_at': datetime.now().isoformat(),
-            'version': '1.0.0'
+            'version': '6.0.0'
         }
         
         # Save model configuration
