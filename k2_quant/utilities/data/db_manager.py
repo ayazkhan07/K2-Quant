@@ -78,6 +78,8 @@ class DatabaseManager:
                     CREATE UNLOGGED TABLE IF NOT EXISTS {table_name} (
                         timestamp BIGINT PRIMARY KEY,
                         date_time_market TIMESTAMP,
+                        market_date DATE,
+                        market_time TIME,
                         open NUMERIC(12, 4),
                         high NUMERIC(12, 4),
                         low NUMERIC(12, 4),
@@ -108,10 +110,38 @@ class DatabaseManager:
         for item in data:
             if 'timestamp' in item:
                 market_datetime = self.convert_to_market_time(item['timestamp'])
-                records.append((item['timestamp'], market_datetime, item['open'], item['high'], item['low'], item['close'], item['volume'], item.get('vwap', 0), item.get('number_of_transactions', 0)))
+                market_date = market_datetime.date()
+                market_time = market_datetime.time()
+                records.append((
+                    item['timestamp'],
+                    market_datetime,
+                    market_date,
+                    market_time,
+                    item['open'],
+                    item['high'],
+                    item['low'],
+                    item['close'],
+                    item['volume'],
+                    item.get('vwap', 0),
+                    item.get('number_of_transactions', 0)
+                ))
             else:
                 market_datetime = self.convert_to_market_time(item['t'])
-                records.append((item['t'], market_datetime, item['o'], item['h'], item['l'], item['c'], item['v'], item.get('vw', 0), item.get('n', 0)))
+                market_date = market_datetime.date()
+                market_time = market_datetime.time()
+                records.append((
+                    item['t'],
+                    market_datetime,
+                    market_date,
+                    market_time,
+                    item['o'],
+                    item['h'],
+                    item['l'],
+                    item['c'],
+                    item['v'],
+                    item.get('vw', 0),
+                    item.get('n', 0)
+                ))
         if not records:
             k2_logger.warning("No records to insert", "DATABASE")
             return 0
@@ -120,9 +150,9 @@ class DatabaseManager:
                 k2_logger.database_operation("Bulk insert", f"{len(records):,} records")
                 execute_values(
                     cur,
-                    f"""INSERT INTO {table_name} (timestamp, date_time_market, open, high, low, close, volume, vwap, transactions) VALUES %s""",
+                    f"""INSERT INTO {table_name} (timestamp, date_time_market, market_date, market_time, open, high, low, close, volume, vwap, transactions) VALUES %s""",
                     records,
-                    template="(%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                     page_size=self.BULK_INSERT_PAGE_SIZE,
                 )
                 conn.commit()
@@ -152,6 +182,22 @@ class DatabaseManager:
                         CREATE INDEX IF NOT EXISTS idx_{table_name}_volume 
                         ON {table_name}(volume) 
                         WHERE volume > 0
+                    """)
+                    # New indexes for split date/time columns
+                    k2_logger.database_operation("Creating market_date index", table_name)
+                    cur.execute(f"""
+                        CREATE INDEX IF NOT EXISTS idx_{table_name}_market_date 
+                        ON {table_name}(market_date)
+                    """)
+                    k2_logger.database_operation("Creating market_time index", table_name)
+                    cur.execute(f"""
+                        CREATE INDEX IF NOT EXISTS idx_{table_name}_market_time 
+                        ON {table_name}(market_time)
+                    """)
+                    k2_logger.database_operation("Creating composite market_date_time index", table_name)
+                    cur.execute(f"""
+                        CREATE INDEX IF NOT EXISTS idx_{table_name}_market_date_time 
+                        ON {table_name}(market_date, market_time)
                     """)
             except Exception as e:
                 k2_logger.warning(f"Index creation failed: {str(e)}", "DATABASE")
@@ -241,19 +287,49 @@ class DatabaseManager:
                 return affected
 
     def fetch_dataframe(self, table_name: str) -> pd.DataFrame:
+        """Fetch dataframe with lowercase columns for TA service compatibility"""
         with self.get_connection() as conn:
             return pd.read_sql_query(
-                f"SELECT timestamp, date_time_market, open, high, low, close, volume, vwap FROM {table_name} ORDER BY timestamp",
+                f"""
+                SELECT
+                  timestamp,
+                  date_time_market,
+                  open, high, low, close, volume, vwap
+                FROM {table_name}
+                ORDER BY timestamp
+                """,
                 conn,
             )
 
-    def _get_market_hours_where_clause(self) -> str:
-        return (
-            """
-            (EXTRACT(hour FROM date_time_market) * 60 + EXTRACT(minute FROM date_time_market)) >= 570
-            AND (EXTRACT(hour FROM date_time_market) * 60 + EXTRACT(minute FROM date_time_market)) <= 960
-            """
-        )
+    def _check_column_exists(self, table_name: str, column_name: str) -> bool:
+        """Check if a column exists in a table"""
+        try:
+            with self.get_connection() as conn:
+                with self.get_cursor(conn) as cur:
+                    cur.execute("""
+                        SELECT EXISTS (
+                            SELECT 1 
+                            FROM information_schema.columns 
+                            WHERE table_name = %s 
+                            AND column_name = %s
+                        )
+                    """, (table_name, column_name))
+                    return cur.fetchone()[0]
+        except Exception:
+            return False
+
+    def _get_market_hours_where_clause(self, table_name: str = None) -> str:
+        """
+        Get market hours WHERE clause that works with both old and new table schemas.
+        Checks if market_time column exists to determine which approach to use.
+        """
+        # Check if we have the new market_time column
+        if table_name and self._check_column_exists(table_name, 'market_time'):
+            # New schema with market_time column
+            return "market_time BETWEEN TIME '09:30:00' AND TIME '16:00:00'"
+        else:
+            # Legacy approach using date_time_market (works on all tables)
+            return "CAST(date_time_market AS TIME) BETWEEN TIME '09:30:00' AND TIME '16:00:00'"
 
     def get_record_count(self, table_name: str, market_hours_only: bool = False) -> int:
         with self.get_connection() as conn:
@@ -261,7 +337,7 @@ class DatabaseManager:
                 if market_hours_only:
                     query = f"""
                         SELECT COUNT(*) FROM {table_name}
-                        WHERE {self._get_market_hours_where_clause()}
+                        WHERE {self._get_market_hours_where_clause(table_name)}
                     """
                 else:
                     query = f"SELECT COUNT(*) FROM {table_name}"
@@ -272,10 +348,29 @@ class DatabaseManager:
         with self.get_connection() as conn:
             with self.get_cursor(conn) as cur:
                 total_count = self.get_record_count(table_name, market_hours_only)
-                where_clause = f"WHERE {self._get_market_hours_where_clause()}" if market_hours_only else ""
+                
+                # Check if we have the new columns
+                has_new_columns = self._check_column_exists(table_name, 'market_date')
+                
+                # Build appropriate SELECT clause based on table schema
+                if has_new_columns:
+                    select_clause = """
+                        market_date,
+                        market_time,
+                        open, high, low, close, volume, vwap
+                    """
+                else:
+                    select_clause = """
+                        DATE(date_time_market) AS market_date,
+                        CAST(date_time_market AS TIME) AS market_time,
+                        open, high, low, close, volume, vwap
+                    """
+                
+                where_clause = f"WHERE {self._get_market_hours_where_clause(table_name)}" if market_hours_only else ""
+                
                 if total_count <= limit:
                     query = f"""
-                        SELECT date_time_market, open, high, low, close, volume, vwap
+                        SELECT {select_clause}
                         FROM {table_name}
                         {where_clause}
                         ORDER BY timestamp
@@ -285,38 +380,38 @@ class DatabaseManager:
                     if market_hours_only:
                         query = f"""
                             (
-                                SELECT date_time_market, open, high, low, close, volume, vwap
+                                SELECT {select_clause}
                                 FROM {table_name}
-                                WHERE {self._get_market_hours_where_clause()}
+                                WHERE {self._get_market_hours_where_clause(table_name)}
                                 ORDER BY timestamp ASC
                                 LIMIT {limit // 2}
                             )
                             UNION ALL
                             (
-                                SELECT date_time_market, open, high, low, close, volume, vwap
+                                SELECT {select_clause}
                                 FROM {table_name}
-                                WHERE {self._get_market_hours_where_clause()}
+                                WHERE {self._get_market_hours_where_clause(table_name)}
                                 ORDER BY timestamp DESC
                                 LIMIT {limit // 2}
                             )
-                            ORDER BY date_time_market
+                            ORDER BY 1, 2
                         """
                     else:
                         query = f"""
                             (
-                                SELECT date_time_market, open, high, low, close, volume, vwap
+                                SELECT {select_clause}
                                 FROM {table_name}
                                 ORDER BY timestamp ASC
                                 LIMIT {limit // 2}
                             )
                             UNION ALL
                             (
-                                SELECT date_time_market, open, high, low, close, volume, vwap
+                                SELECT {select_clause}
                                 FROM {table_name}
                                 ORDER BY timestamp DESC
                                 LIMIT {limit // 2}
                             )
-                            ORDER BY date_time_market
+                            ORDER BY 1, 2
                         """
                 cur.execute(query)
                 rows = cur.fetchall()
@@ -325,9 +420,27 @@ class DatabaseManager:
     def fetch_export_data(self, table_name: str, offset: int, limit: int, market_hours_only: bool = False) -> List[Tuple]:
         with self.get_connection() as conn:
             with self.get_cursor(conn) as cur:
-                where_clause = f"WHERE {self._get_market_hours_where_clause()}" if market_hours_only else ""
+                # Check if we have the new columns
+                has_new_columns = self._check_column_exists(table_name, 'market_date')
+                
+                # Build appropriate SELECT clause based on table schema
+                if has_new_columns:
+                    select_clause = """
+                        market_date,
+                        market_time,
+                        open, high, low, close, volume, vwap
+                    """
+                else:
+                    select_clause = """
+                        DATE(date_time_market) AS market_date,
+                        CAST(date_time_market AS TIME) AS market_time,
+                        open, high, low, close, volume, vwap
+                    """
+                
+                where_clause = f"WHERE {self._get_market_hours_where_clause(table_name)}" if market_hours_only else ""
+                
                 query = f"""
-                    SELECT date_time_market, open, high, low, close, volume, vwap
+                    SELECT {select_clause}
                     FROM {table_name}
                     {where_clause}
                     ORDER BY timestamp
@@ -335,8 +448,65 @@ class DatabaseManager:
                 """
                 cur.execute(query, (limit, offset))
                 rows = cur.fetchall()
-                k2_logger.database_operation("Export fetch from {table_name}", f"Retrieved {len(rows)} records (offset: {offset}, limit: {limit}, market_hours_only: {market_hours_only})")
+                k2_logger.database_operation(f"Export fetch from {table_name}", 
+                    f"Retrieved {len(rows)} records (offset: {offset}, limit: {limit}, market_hours_only: {market_hours_only})")
                 return rows
+
+    def fetch_time_window_df(self, table_name: str, start_dt: datetime, end_dt: datetime) -> pd.DataFrame:
+        """Fetch data within a time window"""
+        with self.get_connection() as conn:
+            # Check if we have the new columns
+            has_new_columns = self._check_column_exists(table_name, 'market_date')
+            
+            if has_new_columns:
+                select_clause = "timestamp, market_date, market_time, open, high, low, close, volume, vwap"
+            else:
+                select_clause = """
+                    timestamp,
+                    DATE(date_time_market) as market_date,
+                    CAST(date_time_market AS TIME) as market_time,
+                    open, high, low, close, volume, vwap
+                """
+            
+            return pd.read_sql_query(
+                f"""
+                SELECT {select_clause}
+                FROM {table_name}
+                WHERE date_time_market BETWEEN %s AND %s
+                ORDER BY timestamp
+                """,
+                conn,
+                params=(start_dt, end_dt)
+            )
+    
+    def fetch_older_chunk_df(self, table_name: str, before_timestamp: int, limit: int) -> pd.DataFrame:
+        """Fetch older data chunks for pagination"""
+        with self.get_connection() as conn:
+            # Check if we have the new columns
+            has_new_columns = self._check_column_exists(table_name, 'market_date')
+            
+            if has_new_columns:
+                select_clause = "timestamp, market_date, market_time, open, high, low, close, volume, vwap"
+            else:
+                select_clause = """
+                    timestamp,
+                    DATE(date_time_market) as market_date,
+                    CAST(date_time_market AS TIME) as market_time,
+                    open, high, low, close, volume, vwap
+                """
+            
+            df = pd.read_sql_query(
+                f"""
+                SELECT {select_clause}
+                FROM {table_name}
+                WHERE timestamp < %s
+                ORDER BY timestamp DESC
+                LIMIT %s
+                """,
+                conn,
+                params=(before_timestamp, limit)
+            )
+            return df.iloc[::-1].reset_index(drop=True)
 
     def get_date_range(self, table_name: str) -> Tuple[Optional[datetime], Optional[datetime]]:
         """Get date range for a table"""
@@ -435,41 +605,11 @@ class DatabaseManager:
         self.pool.closeall()
 
 
+# Singleton instance
 db_manager = DatabaseManager()
 
-# DataFrame fetch helpers for chart windowing
+# Helper function (outside class, doesn't use self)
 def _to_dt(value):
     if isinstance(value, datetime):
         return value
     return datetime.fromisoformat(str(value))
-
-def _as_read_sql(conn, query: str, params: tuple) -> pd.DataFrame:
-    return pd.read_sql_query(query, conn, params=params)
-
-def fetch_time_window_df(self, table_name: str, start_dt: datetime, end_dt: datetime) -> pd.DataFrame:
-    with self.get_connection() as conn:
-        return _as_read_sql(
-            conn,
-            f"""
-            SELECT timestamp, date_time_market, open, high, low, close, volume, vwap
-            FROM {table_name}
-            WHERE date_time_market BETWEEN %s AND %s
-            ORDER BY timestamp
-            """,
-            (start_dt, end_dt),
-        )
-
-def fetch_older_chunk_df(self, table_name: str, before_timestamp: int, limit: int) -> pd.DataFrame:
-    with self.get_connection() as conn:
-        df = _as_read_sql(
-            conn,
-            f"""
-            SELECT timestamp, date_time_market, open, high, low, close, volume, vwap
-            FROM {table_name}
-            WHERE timestamp < %s
-            ORDER BY timestamp DESC
-            LIMIT %s
-            """,
-            (before_timestamp, limit),
-        )
-        return df.iloc[::-1].reset_index(drop=True)

@@ -632,14 +632,26 @@ class StockFetcherWidget(QMainWindow):
         for i in range(len(rows)):
             self.data_table.setRowHeight(i, 40)
         for i, row in enumerate(rows):
-            date_time = row[0]
-            date_item = QTableWidgetItem(date_time.strftime('%Y-%m-%d'))
+            # rows are standardized: Date, Time, Open, High, Low, Close, Volume, VWAP
+            date_val = row[0]
+            time_val = row[1]
+            # Date column
+            try:
+                date_text = date_val.strftime('%Y-%m-%d')
+            except Exception:
+                date_text = str(date_val)
+            date_item = QTableWidgetItem(date_text)
             date_item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
             self.data_table.setItem(i, 0, date_item)
-            time_item = QTableWidgetItem(date_time.strftime('%H:%M:%S'))
+            # Time column
+            try:
+                time_text = time_val.strftime('%H:%M:%S')
+            except Exception:
+                time_text = str(time_val)
+            time_item = QTableWidgetItem(time_text)
             time_item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
             self.data_table.setItem(i, 1, time_item)
-            for j, value in enumerate(row[1:], 2):
+            for j, value in enumerate(row[2:], 2):
                 if j == 6:
                     item = QTableWidgetItem(f"{int(value):,}")
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)

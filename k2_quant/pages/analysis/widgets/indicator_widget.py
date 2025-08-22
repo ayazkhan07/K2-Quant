@@ -3,6 +3,7 @@ Indicator Widget for K2 Quant Analysis
 
 Displays technical indicators with basic parameter editing and emits
 signals to apply/remove indicators.
+Save as: k2_quant/pages/analysis/widgets/indicator_widget.py
 """
 
 from typing import List, Dict, Any
@@ -12,18 +13,22 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QCheckBox, QLabel,
                              QSpinBox, QPushButton)
 from PyQt6.QtCore import Qt, pyqtSignal
 
-from k2_quant.utilities.services.technical_analysis_service import ta_service
 from k2_quant.utilities.logger import k2_logger
+
+try:
+    from k2_quant.utilities.services.technical_analysis_service import ta_service
+except ImportError:
+    ta_service = None
 
 
 class IndicatorWidget(QWidget):
     """Widget for displaying and toggling technical indicators"""
 
     # Signals
-    indicator_toggled = pyqtSignal(str, bool)  # legacy: indicator_name, enabled
-    indicator_applied = pyqtSignal(str, dict)        # name, params
-    indicator_removed = pyqtSignal(str)              # name
-    indicator_params_changed = pyqtSignal(str, dict) # name, params
+    indicator_toggled = pyqtSignal(str, bool)
+    indicator_applied = pyqtSignal(str, dict)
+    indicator_removed = pyqtSignal(str)
+    indicator_params_changed = pyqtSignal(str, dict)
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -57,7 +62,9 @@ class IndicatorWidget(QWidget):
     def populate_indicators(self):
         """Populate widget with all available indicators"""
         # Get all indicators from service
-        indicators = ta_service.get_all_indicators()
+        indicators = []
+        if ta_service:
+            indicators = ta_service.get_all_indicators()
         
         if not indicators:
             placeholder = QLabel("No indicators available")
@@ -100,10 +107,12 @@ class IndicatorWidget(QWidget):
         
         k2_logger.info(f"Populated {len(indicators)} indicators", "INDICATOR_WIDGET")
     
-    def create_indicator_checkbox(self, indicator_name: str) -> QWidget:
+    def create_indicator_checkbox(self, indicator_name):
         """Create checkbox for an indicator"""
         # Get indicator info
-        info = ta_service.get_indicator_info(indicator_name)
+        info = None
+        if ta_service:
+            info = ta_service.get_indicator_info(indicator_name)
         
         # Create container
         container = QWidget()
@@ -139,13 +148,13 @@ class IndicatorWidget(QWidget):
         checkbox.stateChanged.connect(
             lambda state, name=indicator_name: self.on_indicator_toggled(name, state)
         )
-        checkbox.clicked.connect(lambda _=None, name=indicator_name: self._select_for_params(name))
+        checkbox.clicked.connect(lambda _, name=indicator_name: self._select_for_params(name))
         
         layout.addWidget(checkbox)
         
         # Add pane indicator
-        if info and info.pane == 'separate':
-            pane_label = QLabel("◧")  # Separate pane indicator
+        if info and hasattr(info, 'pane') and info.pane == 'separate':
+            pane_label = QLabel("◧")
             pane_label.setStyleSheet("""
                 QLabel {
                     color: #666;
@@ -160,13 +169,18 @@ class IndicatorWidget(QWidget):
         
         # Set tooltip with description
         if info:
-            checkbox.setToolTip(f"{info.full_name}\n{info.description}")
+            tooltip = indicator_name
+            if hasattr(info, 'full_name'):
+                tooltip = info.full_name
+            if hasattr(info, 'description'):
+                tooltip += f"\n{info.description}"
+            checkbox.setToolTip(tooltip)
         
         return container
     
-    def on_indicator_toggled(self, indicator_name: str, state: int):
+    def on_indicator_toggled(self, indicator_name, state):
         """Handle indicator toggle"""
-        enabled = state == 2  # Qt.CheckState.Checked
+        enabled = state == 2
         self.indicator_toggled.emit(indicator_name, enabled)
         
         # Log the action
@@ -175,44 +189,61 @@ class IndicatorWidget(QWidget):
             "INDICATOR_WIDGET"
         )
 
-    def _select_for_params(self, indicator_name: str):
+    def _select_for_params(self, indicator_name):
+        """Select indicator for parameter editing"""
         self.current_name = indicator_name
         self.param_inputs.clear()
+        
+        # Clear form
         while self.param_form.rowCount():
             self.param_form.removeRow(0)
-        info = ta_service.get_indicator_info(indicator_name)
+        
+        # Get indicator info
+        info = None
+        if ta_service:
+            info = ta_service.get_indicator_info(indicator_name)
         if not info:
             return
-        for param, default in (info.parameters or {}).items():
+        
+        # Add parameter inputs
+        parameters = {}
+        if hasattr(info, 'parameters'):
+            parameters = info.parameters
+        
+        for param, default in parameters.items():
             spin = QSpinBox()
             spin.setRange(1, 1000)
             spin.setValue(int(default))
-            spin.valueChanged.connect(lambda _=None, n=indicator_name: self._emit_params_changed(n))
+            spin.valueChanged.connect(lambda _, n=indicator_name: self._emit_params_changed(n))
             self.param_inputs[param] = spin
             self.param_form.addRow(QLabel(param), spin)
 
-    def _collect_params(self) -> dict:
+    def _collect_params(self):
+        """Collect parameters from inputs"""
         return {k: w.value() for k, w in self.param_inputs.items()}
 
     def _apply(self):
+        """Apply indicator with current parameters"""
         if self.current_name:
             self.indicator_applied.emit(self.current_name, self._collect_params())
 
     def _remove(self):
+        """Remove current indicator"""
         if self.current_name:
             self.indicator_removed.emit(self.current_name)
 
-    def _emit_params_changed(self, name: str):
+    def _emit_params_changed(self, name):
+        """Emit params changed signal"""
         self.indicator_params_changed.emit(name, self._collect_params())
     
-    def set_indicator_enabled(self, indicator_name: str, enabled: bool):
+    def set_indicator_enabled(self, indicator_name, enabled):
         """Programmatically set indicator state"""
         if indicator_name in self.indicator_checkboxes:
             checkbox = self.indicator_checkboxes[indicator_name].findChild(QCheckBox)
             if checkbox:
                 checkbox.setChecked(enabled)
     
-    def get_enabled_indicators(self) -> List[str]:
+    def get_enabled_indicators(self):
         """Get list of enabled indicators"""
         enabled = []
         for name, container in self.indicator_checkboxes.items():
@@ -228,7 +259,7 @@ class IndicatorWidget(QWidget):
             if checkbox:
                 checkbox.setChecked(False)
     
-    def filter_indicators(self, filter_text: str):
+    def filter_indicators(self, filter_text):
         """Filter displayed indicators"""
         filter_lower = filter_text.lower()
         

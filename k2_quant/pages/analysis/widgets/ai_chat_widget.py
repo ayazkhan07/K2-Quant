@@ -1,458 +1,664 @@
 """
-AI Chat Service for K2 Quant
+AI Chat Widget for K2 Quant Analysis
 
-Supports OpenAI GPT models and Anthropic Claude with streaming responses
-for collaborative strategy development.
+Provides AI chat interface with streaming responses for strategy development.
+Save as: k2_quant/pages/analysis/widgets/ai_chat_widget.py
 """
 
-import os
 import json
-import asyncio
-from typing import Dict, List, Any, Optional, Generator
+from typing import Dict, Any, Optional, List, Generator
 from datetime import datetime
-from dataclasses import dataclass, asdict
 
-import openai
-import anthropic
-from openai import OpenAI, AsyncOpenAI
-from anthropic import Anthropic, AsyncAnthropic
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QTextEdit,
+                             QLineEdit, QPushButton, QLabel, QComboBox,
+                             QProgressBar)
+from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer
+from PyQt6.QtGui import QTextCursor, QFont, QTextCharFormat, QColor
 
 from k2_quant.utilities.logger import k2_logger
 
 
-@dataclass
-class Message:
-    """Chat message structure"""
-    role: str  # 'user', 'assistant', 'system'
-    content: str
-    timestamp: datetime = None
-    metadata: Dict[str, Any] = None
+class AIStreamThread(QThread):
+    """Thread for streaming AI responses"""
     
-    def __post_init__(self):
-        if self.timestamp is None:
-            self.timestamp = datetime.now()
-        if self.metadata is None:
-            self.metadata = {}
+    text_chunk = pyqtSignal(str)
+    complete = pyqtSignal()
+    error = pyqtSignal(str)
     
-    def to_dict(self) -> Dict:
-        """Convert to dictionary for API calls"""
-        return {
-            'role': self.role,
-            'content': self.content
-        }
+    def __init__(self, message, provider=None):
+        super().__init__()
+        self.message = message
+        self.provider = provider
+    
+    def run(self):
+        """Stream AI response"""
+        try:
+            # Check if AI service is available
+            try:
+                from k2_quant.utilities.services.ai_chat_service import ai_chat_service
+                
+                if not ai_chat_service:
+                    self.error.emit("AI service not available")
+                    return
+                
+                # Stream response
+                for chunk in ai_chat_service.get_streaming_response(self.message):
+                    self.text_chunk.emit(chunk)
+                
+            except ImportError:
+                # Fallback if AI service not available
+                self.text_chunk.emit("AI service not configured. Please set up API keys.")
+            
+            self.complete.emit()
+            
+        except Exception as e:
+            self.error.emit(str(e))
 
 
-class AIProvider:
-    """Base class for AI providers"""
+class AIChatWidget(QWidget):
+    """AI chat widget with streaming support"""
     
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self.conversation_history: List[Message] = []
+    # Signals
+    code_generated = pyqtSignal(str, str)
+    strategy_saved = pyqtSignal(str, str)
+    message_sent = pyqtSignal(str)
     
-    def add_message(self, role: str, content: str, metadata: Dict = None):
-        """Add message to conversation history"""
-        message = Message(role, content, metadata=metadata)
-        self.conversation_history.append(message)
-        return message
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        
+        self.current_context = None
+        self.conversation_history = []
+        self.ai_thread = None
+        self.current_code_block = ""
+        self.is_streaming = False
+        
+        self.init_ui()
+        self.setup_styling()
+        self.show_welcome_message()
     
-    def get_history_for_api(self, max_messages: int = 20) -> List[Dict]:
-        """Get conversation history formatted for API"""
-        recent_messages = self.conversation_history[-max_messages:]
-        return [msg.to_dict() for msg in recent_messages]
+    def init_ui(self):
+        """Initialize the UI"""
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+        self.setLayout(layout)
+        
+        # Header
+        header = self.create_header()
+        layout.addWidget(header)
+        
+        # Provider and Model selector
+        model_selector = self.create_model_selector()
+        layout.addWidget(model_selector)
+        
+        # Chat display area
+        self.chat_display = QTextEdit()
+        self.chat_display.setReadOnly(True)
+        self.chat_display.setObjectName("chatDisplay")
+        layout.addWidget(self.chat_display)
+        
+        # Streaming indicator
+        self.streaming_indicator = QProgressBar()
+        self.streaming_indicator.setMaximum(0)
+        self.streaming_indicator.setTextVisible(False)
+        self.streaming_indicator.setFixedHeight(3)
+        self.streaming_indicator.hide()
+        layout.addWidget(self.streaming_indicator)
+        
+        # Quick actions
+        quick_actions = self.create_quick_actions()
+        layout.addWidget(quick_actions)
+        
+        # Input area
+        input_widget = self.create_input_area()
+        layout.addWidget(input_widget)
     
-    def clear_history(self):
-        """Clear conversation history"""
-        self.conversation_history.clear()
-
-
-class OpenAIProvider(AIProvider):
-    """OpenAI GPT provider with streaming support"""
+    def create_header(self):
+        """Create header widget"""
+        header = QWidget()
+        header.setFixedHeight(30)
+        
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        header.setLayout(layout)
+        
+        label = QLabel("AI ASSISTANT")
+        label.setObjectName("headerLabel")
+        layout.addWidget(label)
+        
+        layout.addStretch()
+        
+        # Clear chat button
+        clear_btn = QPushButton("Clear")
+        clear_btn.setFixedWidth(50)
+        clear_btn.clicked.connect(self.clear_chat)
+        clear_btn.setObjectName("clearChatBtn")
+        layout.addWidget(clear_btn)
+        
+        return header
     
-    AVAILABLE_MODELS = [
-        'gpt-4-turbo-preview',
-        'gpt-4',
-        'gpt-4-32k',
-        'gpt-3.5-turbo',
-        'gpt-3.5-turbo-16k'
-    ]
+    def create_model_selector(self):
+        """Create model selector widget"""
+        widget = QWidget()
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        widget.setLayout(layout)
+        
+        # Provider selector
+        layout.addWidget(QLabel("Provider:"))
+        
+        self.provider_selector = QComboBox()
+        self.provider_selector.addItems(["OpenAI", "Anthropic", "Local"])
+        self.provider_selector.currentTextChanged.connect(self.on_provider_changed)
+        self.provider_selector.setObjectName("providerSelector")
+        layout.addWidget(self.provider_selector)
+        
+        layout.addSpacing(10)
+        
+        # Model selector
+        layout.addWidget(QLabel("Model:"))
+        
+        self.model_selector = QComboBox()
+        self.update_model_list()
+        self.model_selector.currentTextChanged.connect(self.on_model_changed)
+        self.model_selector.setObjectName("modelSelector")
+        layout.addWidget(self.model_selector)
+        
+        layout.addStretch()
+        
+        return widget
     
-    def __init__(self, api_key: str):
-        super().__init__(api_key)
-        self.client = OpenAI(api_key=api_key)
-        self.async_client = AsyncOpenAI(api_key=api_key)
-        self.current_model = 'gpt-4'
+    def create_quick_actions(self):
+        """Create quick action buttons"""
+        widget = QWidget()
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 5)
+        widget.setLayout(layout)
+        
+        # Quick prompts
+        elasticity_btn = QPushButton("📊 Elasticity")
+        elasticity_btn.setToolTip("Generate elasticity strategy")
+        elasticity_btn.clicked.connect(lambda: self.send_quick_prompt("elasticity"))
+        elasticity_btn.setObjectName("quickBtn")
+        layout.addWidget(elasticity_btn)
+        
+        projection_btn = QPushButton("📈 Projection")
+        projection_btn.setToolTip("Create price projections")
+        projection_btn.clicked.connect(lambda: self.send_quick_prompt("projection"))
+        projection_btn.setObjectName("quickBtn")
+        layout.addWidget(projection_btn)
+        
+        pattern_btn = QPushButton("🔍 Pattern")
+        pattern_btn.setToolTip("Find pattern matches")
+        pattern_btn.clicked.connect(lambda: self.send_quick_prompt("pattern"))
+        pattern_btn.setObjectName("quickBtn")
+        layout.addWidget(pattern_btn)
+        
+        layout.addStretch()
+        
+        return widget
     
-    def set_model(self, model_name: str):
-        """Set the model to use"""
-        if model_name in self.AVAILABLE_MODELS:
-            self.current_model = model_name
-            k2_logger.info(f"OpenAI model set to: {model_name}", "AI_CHAT")
+    def create_input_area(self):
+        """Create input area widget"""
+        widget = QWidget()
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        widget.setLayout(layout)
+        
+        self.input_field = QLineEdit()
+        self.input_field.setPlaceholderText("Describe your strategy or ask a question...")
+        self.input_field.returnPressed.connect(self.send_message)
+        self.input_field.setObjectName("chatInput")
+        layout.addWidget(self.input_field)
+        
+        self.send_btn = QPushButton("Send")
+        self.send_btn.setFixedWidth(60)
+        self.send_btn.clicked.connect(self.send_message)
+        self.send_btn.setObjectName("sendBtn")
+        layout.addWidget(self.send_btn)
+        
+        return widget
+    
+    def update_model_list(self):
+        """Update model list based on provider"""
+        provider = self.provider_selector.currentText().lower()
+        
+        if provider == "openai":
+            models = ["gpt-4", "gpt-4-turbo-preview", "gpt-3.5-turbo"]
+        elif provider == "anthropic":
+            models = ["claude-3-opus-20240229", "claude-3-sonnet-20240229"]
+        elif provider == "local":
+            models = ["No models (simulated)"]
         else:
-            k2_logger.warning(f"Model {model_name} not available", "AI_CHAT")
+            models = []
+        
+        self.model_selector.clear()
+        self.model_selector.addItems(models)
     
-    def get_streaming_response(self, message: str, system_prompt: str = None) -> Generator:
-        """Get streaming response from OpenAI"""
-        # Add user message to history
-        self.add_message('user', message)
+    def on_provider_changed(self, provider):
+        """Handle provider change"""
+        self.update_model_list()
         
-        # Prepare messages for API
-        messages = []
-        
-        # Add system prompt if provided
-        if system_prompt:
-            messages.append({'role': 'system', 'content': system_prompt})
-        
-        # Add conversation history
-        messages.extend(self.get_history_for_api())
-        
+        # Try to set provider in AI service
         try:
-            # Create streaming completion
-            stream = self.client.chat.completions.create(
-                model=self.current_model,
-                messages=messages,
-                stream=True,
-                temperature=0.7,
-                max_tokens=2000
-            )
-            
-            full_response = ""
-            
-            # Stream the response
-            for chunk in stream:
-                if chunk.choices[0].delta.content is not None:
-                    content = chunk.choices[0].delta.content
-                    full_response += content
-                    yield content
-            
-            # Add assistant response to history
-            self.add_message('assistant', full_response)
-            
-        except Exception as e:
-            error_msg = f"OpenAI API error: {str(e)}"
-            k2_logger.error(error_msg, "AI_CHAT")
-            yield f"\n[Error: {error_msg}]"
+            from k2_quant.utilities.services.ai_chat_service import ai_chat_service
+            if ai_chat_service:
+                ai_chat_service.set_provider(provider.lower())
+                k2_logger.info(f"AI provider changed to {provider}", "AI_CHAT")
+        except ImportError:
+            k2_logger.debug("AI service not available", "AI_CHAT")
     
-    async def get_async_response(self, message: str, system_prompt: str = None) -> str:
-        """Get async response from OpenAI"""
-        # Add user message to history
-        self.add_message('user', message)
-        
-        # Prepare messages
-        messages = []
-        if system_prompt:
-            messages.append({'role': 'system', 'content': system_prompt})
-        messages.extend(self.get_history_for_api())
-        
+    def on_model_changed(self, model):
+        """Handle model change"""
         try:
-            response = await self.async_client.chat.completions.create(
-                model=self.current_model,
-                messages=messages,
-                temperature=0.7,
-                max_tokens=2000
-            )
-            
-            content = response.choices[0].message.content
-            self.add_message('assistant', content)
-            return content
-            
-        except Exception as e:
-            error_msg = f"OpenAI API error: {str(e)}"
-            k2_logger.error(error_msg, "AI_CHAT")
-            return f"Error: {error_msg}"
+            from k2_quant.utilities.services.ai_chat_service import ai_chat_service
+            if ai_chat_service and model:
+                ai_chat_service.set_model(model)
+                k2_logger.info(f"AI model changed to {model}", "AI_CHAT")
+        except ImportError:
+            k2_logger.debug("AI service not available", "AI_CHAT")
     
-    def generate_strategy_code(self, description: str, requirements: List[str]) -> Dict[str, Any]:
-        """Generate Python code for a trading strategy"""
-        system_prompt = """You are an expert quantitative analyst and Python programmer.
-        Generate clean, efficient Python code for stock market analysis and projections.
-        The code should work with pandas DataFrames and numpy arrays.
-        Include detailed comments explaining the mathematical logic.
-        """
+    def show_welcome_message(self):
+        """Show welcome message"""
+        welcome = """<div style='color: #999; font-style: italic;'>
+        Welcome to K2 Quant AI Assistant!<br><br>
+        I can help you:
+        <ul>
+        <li>Create custom trading strategies</li>
+        <li>Generate price projections</li>
+        <li>Analyze patterns in your data</li>
+        <li>Write Python code for complex calculations</li>
+        </ul>
+        Load a model and describe what you'd like to analyze.
+        </div>"""
         
-        user_prompt = f"""Create a Python function for the following trading strategy:
-        
-        Description: {description}
-        
-        Requirements:
-        {chr(10).join(f'- {req}' for req in requirements)}
-        
-        The function should:
-        1. Accept a pandas DataFrame with columns: date_time, open, high, low, close, volume
-        2. Perform the calculations as described
-        3. Return the DataFrame with new columns added for projections/signals
-        4. Include error handling for edge cases
-        
-        Provide the code in a format ready to execute.
-        """
-        
-        # Get response
-        response_text = ""
-        for chunk in self.get_streaming_response(user_prompt, system_prompt):
-            response_text += chunk
-        
-        # Extract code from response
-        code = self.extract_code_from_response(response_text)
-        
-        return {
-            'success': True,
-            'code': code,
-            'description': description,
-            'full_response': response_text
+        self.chat_display.setHtml(welcome)
+    
+    def set_data_context(self, data, metadata):
+        """Set the data context for AI"""
+        self.current_context = {
+            'metadata': metadata,
+            'data_shape': data.shape if hasattr(data, 'shape') else len(data),
+            'columns': list(data.columns) if hasattr(data, 'columns') else None
         }
-    
-    def extract_code_from_response(self, response: str) -> str:
-        """Extract Python code from AI response"""
-        # Look for code blocks
-        if '```python' in response:
-            parts = response.split('```python')
-            if len(parts) > 1:
-                code_part = parts[1].split('```')[0]
-                return code_part.strip()
-        elif '```' in response:
-            parts = response.split('```')
-            if len(parts) > 1:
-                code_part = parts[1].split('```')[0]
-                return code_part.strip()
         
-        # Return full response if no code blocks found
-        return response
-
-
-class AnthropicProvider(AIProvider):
-    """Anthropic Claude provider with streaming support"""
-    
-    AVAILABLE_MODELS = [
-        'claude-3-opus-20240229',
-        'claude-3-sonnet-20240229',
-        'claude-2.1',
-        'claude-2.0'
-    ]
-    
-    def __init__(self, api_key: str):
-        super().__init__(api_key)
-        self.client = Anthropic(api_key=api_key)
-        self.async_client = AsyncAnthropic(api_key=api_key)
-        self.current_model = 'claude-3-opus-20240229'
-    
-    def set_model(self, model_name: str):
-        """Set the model to use"""
-        if model_name in self.AVAILABLE_MODELS:
-            self.current_model = model_name
-            k2_logger.info(f"Anthropic model set to: {model_name}", "AI_CHAT")
-    
-    def get_streaming_response(self, message: str, system_prompt: str = None) -> Generator:
-        """Get streaming response from Anthropic"""
-        # Add user message to history
-        self.add_message('user', message)
-        
-        # Prepare prompt
-        prompt = ""
-        if system_prompt:
-            prompt = f"{system_prompt}\n\n"
-        
-        # Add conversation history
-        for msg in self.get_history_for_api():
-            if msg['role'] == 'user':
-                prompt += f"Human: {msg['content']}\n\n"
-            elif msg['role'] == 'assistant':
-                prompt += f"Assistant: {msg['content']}\n\n"
-        
-        prompt += "Assistant: "
-        
+        # Update AI service context
         try:
-            # Create streaming completion
-            stream = self.client.completions.create(
-                model=self.current_model,
-                prompt=prompt,
-                max_tokens_to_sample=2000,
-                stream=True,
-                temperature=0.7
-            )
-            
-            full_response = ""
-            
-            # Stream the response
-            for chunk in stream:
-                if hasattr(chunk, 'completion'):
-                    content = chunk.completion
-                    full_response += content
-                    yield content
-            
-            # Add assistant response to history
-            self.add_message('assistant', full_response)
-            
-        except Exception as e:
-            error_msg = f"Anthropic API error: {str(e)}"
-            k2_logger.error(error_msg, "AI_CHAT")
-            yield f"\n[Error: {error_msg}]"
-
-
-class AIChatService:
-    """Main AI chat service managing multiple providers"""
-    
-    def __init__(self):
-        self.providers = {}
-        self.current_provider = None
-        self.system_context = None
+            from k2_quant.utilities.services.ai_chat_service import ai_chat_service
+            if ai_chat_service:
+                context = f"""
+                Working with stock data:
+                - Symbol: {metadata.get('symbol', 'Unknown')}
+                - Records: {self.current_context['data_shape'][0] if isinstance(self.current_context['data_shape'], tuple) else self.current_context['data_shape']}
+                - Columns: {', '.join(self.current_context['columns']) if self.current_context['columns'] else 'Unknown'}
+                """
+                ai_chat_service.set_system_context(context)
+        except ImportError:
+            pass
         
-        # Initialize providers if API keys are available
-        self.initialize_providers()
+        # Show in chat
+        records = self.current_context['data_shape'][0] if isinstance(self.current_context['data_shape'], tuple) else self.current_context['data_shape']
+        self.add_system_message(f"📊 Loaded {metadata.get('symbol', 'Unknown')} data with {records} records")
     
-    def initialize_providers(self):
-        """Initialize available AI providers"""
-        # OpenAI
-        openai_key = os.getenv('OPENAI_API_KEY')
-        if openai_key:
-            self.providers['openai'] = OpenAIProvider(openai_key)
-            self.current_provider = 'openai'
-            k2_logger.info("OpenAI provider initialized", "AI_CHAT")
+    def send_quick_prompt(self, prompt_type):
+        """Send a quick prompt based on type"""
+        prompts = {
+            'elasticity': "Create an elasticity strategy that calculates (high-low)/low*100, finds patterns within 5% tolerance, and projects 10 days forward",
+            'projection': "Generate a 30-day price projection based on historical patterns and trends",
+            'pattern': "Find repeating patterns in the price data and identify similar historical movements"
+        }
         
-        # Anthropic
-        anthropic_key = os.getenv('ANTHROPIC_API_KEY')
-        if anthropic_key:
-            self.providers['anthropic'] = AnthropicProvider(anthropic_key)
-            if not self.current_provider:
-                self.current_provider = 'anthropic'
-            k2_logger.info("Anthropic provider initialized", "AI_CHAT")
-        
-        if not self.providers:
-            k2_logger.warning("No AI providers available - add API keys to .env", "AI_CHAT")
+        if prompt_type in prompts:
+            self.input_field.setText(prompts[prompt_type])
+            self.send_message()
     
-    def set_provider(self, provider_name: str):
-        """Switch AI provider"""
-        if provider_name in self.providers:
-            self.current_provider = provider_name
-            k2_logger.info(f"Switched to {provider_name} provider", "AI_CHAT")
-            return True
-        return False
-    
-    def set_model(self, model_name: str):
-        """Set model for current provider"""
-        if self.current_provider and self.current_provider in self.providers:
-            self.providers[self.current_provider].set_model(model_name)
-    
-    def set_system_context(self, context: str):
-        """Set system context for strategy development"""
-        self.system_context = f"""You are an expert quantitative analyst helping develop trading strategies.
-        You have deep knowledge of:
-        - Mathematical formulas and statistical analysis
-        - Technical indicators and chart patterns
-        - Python programming with pandas, numpy, and scipy
-        - Time series analysis and forecasting
-        
-        Context: {context}
-        
-        When developing strategies:
-        1. Ask clarifying questions to understand requirements fully
-        2. Break down complex calculations into clear steps
-        3. Provide detailed mathematical explanations
-        4. Generate clean, well-commented Python code
-        5. Focus on accuracy and performance for large datasets
-        """
-    
-    def get_streaming_response(self, message: str) -> Generator:
-        """Get streaming response from current provider"""
-        if not self.current_provider or self.current_provider not in self.providers:
-            yield "No AI provider available. Please configure API keys."
+    def send_message(self):
+        """Send message to AI"""
+        message = self.input_field.text().strip()
+        if not message or self.is_streaming:
             return
         
-        provider = self.providers[self.current_provider]
+        # Add user message to display
+        self.add_user_message(message)
         
-        # Use system context if available
-        system_prompt = self.system_context or None
+        # Clear input
+        self.input_field.clear()
         
-        # Stream response
-        for chunk in provider.get_streaming_response(message, system_prompt):
-            yield chunk
+        # Emit signal
+        self.message_sent.emit(message)
+        
+        # Start streaming
+        self.start_streaming(message)
     
-    def generate_strategy_code(self, description: str, requirements: List[str]) -> Dict[str, Any]:
-        """Generate strategy code using current provider"""
-        if not self.current_provider or self.current_provider not in self.providers:
-            return {
-                'success': False,
-                'error': 'No AI provider available'
-            }
+    def start_streaming(self, message):
+        """Start streaming AI response"""
+        self.is_streaming = True
+        self.current_code_block = ""
         
-        provider = self.providers[self.current_provider]
+        # Disable input
+        self.input_field.setEnabled(False)
+        self.send_btn.setEnabled(False)
         
-        if isinstance(provider, OpenAIProvider):
-            return provider.generate_strategy_code(description, requirements)
+        # Show streaming indicator
+        self.streaming_indicator.show()
+        
+        # Add AI message placeholder
+        self.add_ai_message("")
+        
+        # Start thread
+        self.ai_thread = AIStreamThread(message)
+        self.ai_thread.text_chunk.connect(self.append_ai_text)
+        self.ai_thread.complete.connect(self.streaming_complete)
+        self.ai_thread.error.connect(self.streaming_error)
+        self.ai_thread.start()
+    
+    def append_ai_text(self, chunk):
+        """Append streamed text to AI message"""
+        cursor = self.chat_display.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        
+        # Check for code blocks
+        if "```python" in chunk or "```" in chunk:
+            self.current_code_block += chunk
         else:
-            # Fallback for other providers
-            prompt = f"Create a Python trading strategy: {description}"
-            response = ""
-            for chunk in provider.get_streaming_response(prompt):
-                response += chunk
-            
-            return {
-                'success': True,
-                'code': response,
-                'description': description
-            }
-    
-    def clear_history(self):
-        """Clear conversation history for all providers"""
-        for provider in self.providers.values():
-            provider.clear_history()
-    
-    def get_available_models(self) -> Dict[str, List[str]]:
-        """Get available models for each provider"""
-        models = {}
+            cursor.insertText(chunk)
         
-        if 'openai' in self.providers:
-            models['openai'] = OpenAIProvider.AVAILABLE_MODELS
-        
-        if 'anthropic' in self.providers:
-            models['anthropic'] = AnthropicProvider.AVAILABLE_MODELS
-        
-        return models
+        # Auto-scroll
+        scrollbar = self.chat_display.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
     
-    def save_conversation(self, filepath: str):
-        """Save conversation history to file"""
-        if self.current_provider and self.current_provider in self.providers:
-            provider = self.providers[self.current_provider]
-            
-            conversation = {
-                'provider': self.current_provider,
-                'timestamp': datetime.now().isoformat(),
-                'messages': [
-                    {
-                        'role': msg.role,
-                        'content': msg.content,
-                        'timestamp': msg.timestamp.isoformat()
-                    }
-                    for msg in provider.conversation_history
-                ]
-            }
-            
-            with open(filepath, 'w') as f:
-                json.dump(conversation, f, indent=2)
-            
-            k2_logger.info(f"Conversation saved to {filepath}", "AI_CHAT")
+    def streaming_complete(self):
+        """Handle streaming completion"""
+        self.is_streaming = False
+        
+        # Re-enable input
+        self.input_field.setEnabled(True)
+        self.send_btn.setEnabled(True)
+        
+        # Hide streaming indicator
+        self.streaming_indicator.hide()
+        
+        # Process any code blocks
+        if self.current_code_block:
+            self.process_code_block(self.current_code_block)
+        
+        k2_logger.info("AI streaming complete", "AI_CHAT")
     
-    def load_conversation(self, filepath: str):
-        """Load conversation history from file"""
+    def streaming_error(self, error):
+        """Handle streaming error"""
+        self.is_streaming = False
+        
+        # Re-enable input
+        self.input_field.setEnabled(True)
+        self.send_btn.setEnabled(True)
+        
+        # Hide streaming indicator
+        self.streaming_indicator.hide()
+        
+        # Show error
+        self.add_system_message(f"❌ Error: {error}")
+        k2_logger.error(f"AI streaming error: {error}", "AI_CHAT")
+    
+    def process_code_block(self, text):
+        """Process code block from AI response"""
+        # Extract Python code
+        if "```python" in text:
+            parts = text.split("```python")
+            if len(parts) > 1:
+                code = parts[1].split("```")[0].strip()
+                
+                # Show code in formatted block
+                self.add_code_block(code)
+                
+                # Ask if user wants to execute
+                self.add_system_message("📝 Code generated. Click 'Execute' to run this strategy.")
+                
+                # Store for execution
+                self.current_code_block = code
+                
+                # Emit signal
+                self.code_generated.emit(code, "AI Generated Strategy")
+    
+    def add_user_message(self, message):
+        """Add user message to chat"""
+        cursor = self.chat_display.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        
+        # Add spacing
+        cursor.insertText("\n\n")
+        
+        # Add user label
+        format = QTextCharFormat()
+        format.setForeground(QColor("#4a4"))
+        format.setFontWeight(QFont.Weight.Bold)
+        cursor.setCharFormat(format)
+        cursor.insertText("YOU: ")
+        
+        # Add message
+        format.setForeground(QColor("#fff"))
+        format.setFontWeight(QFont.Weight.Normal)
+        cursor.setCharFormat(format)
+        cursor.insertText(message)
+        
+        # Auto-scroll
+        scrollbar = self.chat_display.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+        
+        # Add to history
+        self.conversation_history.append({
+            'role': 'user',
+            'content': message,
+            'timestamp': datetime.now().isoformat()
+        })
+    
+    def add_ai_message(self, message):
+        """Add AI message to chat"""
+        cursor = self.chat_display.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        
+        # Add spacing
+        cursor.insertText("\n\n")
+        
+        # Add AI label
+        format = QTextCharFormat()
+        format.setForeground(QColor("#4aa"))
+        format.setFontWeight(QFont.Weight.Bold)
+        cursor.setCharFormat(format)
+        cursor.insertText("AI: ")
+        
+        # Add message
+        format.setForeground(QColor("#ccc"))
+        format.setFontWeight(QFont.Weight.Normal)
+        cursor.setCharFormat(format)
+        
+        if message:
+            cursor.insertText(message)
+        
+        # Auto-scroll
+        scrollbar = self.chat_display.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+    
+    def add_system_message(self, message):
+        """Add system message to chat"""
+        cursor = self.chat_display.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        
+        # Add spacing
+        cursor.insertText("\n\n")
+        
+        # Add message
+        format = QTextCharFormat()
+        format.setForeground(QColor("#999"))
+        format.setFontItalic(True)
+        cursor.setCharFormat(format)
+        cursor.insertText(message)
+        
+        # Auto-scroll
+        scrollbar = self.chat_display.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+    
+    def add_code_block(self, code):
+        """Add formatted code block to chat"""
+        cursor = self.chat_display.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        
+        # Add spacing
+        cursor.insertText("\n\n")
+        
+        # Add code in monospace
+        format = QTextCharFormat()
+        format.setForeground(QColor("#4f4"))
+        format.setFontFamily("Consolas, Monaco, monospace")
+        format.setBackground(QColor("#1a1a1a"))
+        cursor.setCharFormat(format)
+        cursor.insertText(code)
+        
+        # Reset format
+        format = QTextCharFormat()
+        cursor.setCharFormat(format)
+    
+    def clear_chat(self):
+        """Clear chat history"""
+        self.chat_display.clear()
+        self.conversation_history.clear()
+        self.show_welcome_message()
+        
         try:
-            with open(filepath, 'r') as f:
-                conversation = json.load(f)
+            from k2_quant.utilities.services.ai_chat_service import ai_chat_service
+            if ai_chat_service:
+                ai_chat_service.clear_history()
+        except ImportError:
+            pass
+        
+        k2_logger.info("Chat cleared", "AI_CHAT")
+    
+    def show_error(self, error):
+        """Show error message in chat"""
+        self.add_system_message(f"⚠️ {error}")
+    
+    def setup_styling(self):
+        """Apply styling to the widget"""
+        self.setStyleSheet("""
+            #headerLabel {
+                font-size: 11px;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+                color: #999;
+                font-weight: 600;
+            }
             
-            provider_name = conversation.get('provider')
-            if provider_name in self.providers:
-                provider = self.providers[provider_name]
-                provider.clear_history()
-                
-                for msg_data in conversation.get('messages', []):
-                    provider.add_message(
-                        msg_data['role'],
-                        msg_data['content']
-                    )
-                
-                k2_logger.info(f"Conversation loaded from {filepath}", "AI_CHAT")
-                return True
-                
-        except Exception as e:
-            k2_logger.error(f"Failed to load conversation: {str(e)}", "AI_CHAT")
-            return False
-
-
-# Singleton instance
-ai_chat_service = AIChatService()
+            #chatDisplay {
+                background-color: #0a0a0a;
+                color: #ccc;
+                border: 1px solid #1a1a1a;
+                border-radius: 4px;
+                padding: 10px;
+                font-family: 'Segoe UI', Arial, sans-serif;
+                font-size: 13px;
+                line-height: 1.6;
+            }
+            
+            #chatInput {
+                background-color: #1a1a1a;
+                color: #fff;
+                border: 1px solid #2a2a2a;
+                padding: 8px;
+                border-radius: 3px;
+                font-size: 13px;
+            }
+            
+            #chatInput:focus {
+                border-color: #3a3a3a;
+            }
+            
+            #sendBtn {
+                background-color: #1a1a1a;
+                color: #fff;
+                border: 1px solid #4a4a4a;
+                padding: 8px;
+                border-radius: 3px;
+                font-weight: bold;
+            }
+            
+            #sendBtn:hover:enabled {
+                background-color: #2a2a2a;
+                border-color: #5a5a5a;
+            }
+            
+            #sendBtn:disabled {
+                background-color: #0a0a0a;
+                color: #444;
+                border-color: #2a2a2a;
+            }
+            
+            #clearChatBtn {
+                background-color: transparent;
+                color: #666;
+                border: 1px solid #2a2a2a;
+                padding: 3px 8px;
+                border-radius: 2px;
+                font-size: 10px;
+            }
+            
+            #clearChatBtn:hover {
+                background-color: #1a1a1a;
+                color: #999;
+            }
+            
+            #quickBtn {
+                background-color: #1a1a1a;
+                color: #888;
+                border: 1px solid #2a2a2a;
+                padding: 4px 8px;
+                border-radius: 3px;
+                font-size: 11px;
+            }
+            
+            #quickBtn:hover {
+                background-color: #2a2a2a;
+                color: #fff;
+            }
+            
+            #providerSelector, #modelSelector {
+                background-color: #1a1a1a;
+                color: #fff;
+                border: 1px solid #2a2a2a;
+                padding: 4px;
+                border-radius: 3px;
+                font-size: 11px;
+            }
+            
+            QComboBox::drop-down {
+                border: none;
+            }
+            
+            QComboBox::down-arrow {
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 4px solid #666;
+                width: 0;
+                height: 0;
+                margin-right: 4px;
+            }
+            
+            QLabel {
+                color: #999;
+                font-size: 11px;
+            }
+            
+            QProgressBar {
+                background-color: #1a1a1a;
+                border: none;
+            }
+            
+            QProgressBar::chunk {
+                background-color: #4aa;
+            }
+        """)
+    
+    def cleanup(self):
+        """Cleanup resources"""
+        if self.ai_thread and self.ai_thread.isRunning():
+            self.ai_thread.terminate()
+            self.ai_thread.wait()

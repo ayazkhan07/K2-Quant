@@ -2,6 +2,7 @@
 Model List Widget for K2 Quant Analysis
 
 Displays saved models from PostgreSQL with metadata and quick actions.
+Save as: k2_quant/pages/analysis/widgets/model_list_widget.py
 """
 
 from typing import List, Dict, Any, Optional
@@ -19,8 +20,8 @@ class ModelListWidget(QWidget):
     """Widget for displaying and selecting saved models"""
     
     # Signals
-    model_selected = pyqtSignal(str)  # table_name
-    model_deleted = pyqtSignal(str)  # table_name
+    model_selected = pyqtSignal(str)
+    model_deleted = pyqtSignal(str)
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -74,7 +75,7 @@ class ModelListWidget(QWidget):
         """)
         layout.addWidget(self.info_label)
     
-    def populate_models(self, models: List[Dict[str, Any]]):
+    def populate_models(self, models):
         """Populate the list with models"""
         self.models = models
         self.list_widget.clear()
@@ -89,7 +90,7 @@ class ModelListWidget(QWidget):
             item = QListWidgetItem(item_text)
             
             # Store table name in item data
-            item.setData(Qt.ItemDataRole.UserRole, model['table_name'])
+            item.setData(Qt.ItemDataRole.UserRole, model.get('table_name'))
             
             # Add to list
             self.list_widget.addItem(item)
@@ -97,7 +98,7 @@ class ModelListWidget(QWidget):
         self.info_label.setText(f"{len(models)} models available")
         k2_logger.info(f"Populated {len(models)} models", "MODEL_LIST")
     
-    def format_model_text(self, model: Dict[str, Any]) -> str:
+    def format_model_text(self, model):
         """Format model information for display"""
         symbol = model.get('symbol', 'UNKNOWN')
         timespan = model.get('timespan', '')
@@ -117,7 +118,9 @@ class ModelListWidget(QWidget):
         text = f"{symbol} - {range_val.upper()}"
         if timespan:
             text += f" ({timespan})"
-        text += f"\n{record_str} records | {size}"
+        text += f"\n{record_str} records"
+        if size:
+            text += f" | {size}"
         
         # Add date range if available
         date_range = model.get('date_range')
@@ -128,14 +131,14 @@ class ModelListWidget(QWidget):
         
         return text
     
-    def on_item_clicked(self, item: QListWidgetItem):
+    def on_item_clicked(self, item):
         """Handle item selection (single or double click)."""
         table_name = item.data(Qt.ItemDataRole.UserRole)
         if table_name:
             self.model_selected.emit(table_name)
             k2_logger.info(f"Model selected: {table_name}", "MODEL_LIST")
     
-    def get_selected_model(self) -> Optional[str]:
+    def get_selected_model(self):
         """Get currently selected model table name"""
         current = self.list_widget.currentItem()
         if current:
@@ -162,7 +165,7 @@ class ModelListWidget(QWidget):
             k2_logger.error(f"Failed to reload saved models: {e}", "MODEL_LIST")
             self.populate_models([])
     
-    def filter_models(self, filter_text: str):
+    def filter_models(self, filter_text):
         """Filter displayed models"""
         filter_lower = filter_text.lower()
         
