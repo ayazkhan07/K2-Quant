@@ -192,23 +192,36 @@ class AnalysisPageWidget(QWidget):
                 self.current_model = table_name
                 self.current_data = rows
                 
-                # Get metadata
-                metadata = saved_models_manager.get_model_metadata(table_name)
-                self.current_metadata = metadata or {'symbol': table_name, 'records': total_count}
+                # Gather metadata
+                base_metadata = saved_models_manager.get_model_metadata(table_name) or {'symbol': table_name}
+                table_info = stock_service.get_table_info(table_name) or {}
+                date_range = table_info.get('date_range')
+                
+                # Merge metadata while keeping existing keys stable
+                self.current_metadata = dict(base_metadata)
+                self.current_metadata.update({
+                    'records': total_count,
+                    'table_name': table_name,
+                    'total_records': total_count,
+                    'date_range': date_range
+                })
                 
                 # Update status
                 self.model_label.setText(f"Model: {table_name} ({total_count:,} records)")
                 self.status_label.setText("Model loaded")
                 
-                # Load into middle pane
+                # Load into middle pane (chart uses limited data; table uses limited data)
                 self.middle_pane.load_data(rows, self.current_metadata)
                 
                 # Update AI context
-                self.right_pane.set_data_context({
+                ctx = {
                     'symbol': self.current_metadata.get('symbol', table_name),
                     'records': total_count,
                     'table_name': table_name
-                })
+                }
+                if date_range:
+                    ctx['date_range'] = date_range
+                self.right_pane.set_data_context(ctx)
                 
                 # Clear any existing indicators/strategies when loading new model
                 self.left_pane.clear_all_indicators()

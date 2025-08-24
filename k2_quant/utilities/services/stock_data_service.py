@@ -4,7 +4,6 @@ Stock Data Service Layer
 Orchestrates data fetching from Polygon API and storage in database.
 Supports range parameter in table naming, CSV export, and market hours filter.
 """
-
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional, Generator
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -181,6 +180,22 @@ class StockService:
             k2_logger.error(f"Streaming export failed: {str(e)}", "EXPORT")
             raise
 
+    # Minimal chart helpers (no DB manager changes needed)
+    def get_chart_data_chunk(self, table_name: str, start_idx: int, end_idx: int) -> pd.DataFrame:
+        """Return a DataFrame of rows [start_idx, end_idx) in display format."""
+        try:
+            limit = max(0, end_idx - start_idx)
+            if limit <= 0:
+                return pd.DataFrame()
+            rows = self.db.fetch_export_data(table_name, offset=start_idx, limit=limit, market_hours_only=False)
+            if not rows:
+                return pd.DataFrame()
+            columns = ['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'VWAP']
+            return pd.DataFrame(rows, columns=columns[:len(rows[0])])
+        except Exception as e:
+            k2_logger.error(f"get_chart_data_chunk failed: {str(e)}", "CHART_DATA")
+            return pd.DataFrame()
+
     def get_table_info(self, table_name: str) -> Dict:
         try:
             _, total_records = self.get_display_data(table_name, limit=1)
@@ -225,9 +240,8 @@ class StockService:
     def get_tables_for_ticker(self, symbol: str, timespan: str = None, range_val: str = None) -> List[str]:
         return self.db.get_tables_for_ticker(symbol, timespan, range_val)
 
-    # Projections API
+    # Projections API (unchanged)
     def insert_projections(self, table_name: str, rows_df, strategy_name: str) -> int:
-        """Append projection rows to a model table with flags set."""
         try:
             import pandas as pd
             if rows_df is None:
@@ -246,7 +260,6 @@ class StockService:
             raise
 
     def delete_projections(self, table_name: str, strategy_name: str) -> int:
-        """Remove projection rows for a given strategy from a model table."""
         try:
             affected = self.db.delete_where(table_name, "is_projection = TRUE AND projection_source = %s", [strategy_name])
             k2_logger.database_operation("Projections deleted", f"{affected} rows from {table_name} for {strategy_name}")
@@ -255,7 +268,7 @@ class StockService:
             k2_logger.error(f"delete_projections failed: {str(e)}", "DB")
             raise
 
-    # Indicator persistence and data access
+    # Indicator persistence and data access (unchanged)
     def get_full_dataframe(self, table_name: str):
         try:
             import pandas as pd
@@ -281,7 +294,6 @@ class StockService:
             k2_logger.error(f"update_indicator_column failed: {str(e)}", "DB")
             raise
 
-    # Time-window data access for chart
     def get_preset_range_df(self, table_name: str, preset: str) -> pd.DataFrame:
         days_map = {'5D': 5, '1M': 30, '3M': 90, '6M': 180, '1Y': 365, '5Y': 1825}
         if preset == 'All':
@@ -299,5 +311,3 @@ class StockService:
 
 
 stock_service = StockService()
-
-

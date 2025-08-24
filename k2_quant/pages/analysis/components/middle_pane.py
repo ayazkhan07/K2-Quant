@@ -11,7 +11,7 @@ import numpy as np
 
 from PyQt6.QtWidgets import (QFrame, QVBoxLayout, QHBoxLayout, QWidget,
                              QPushButton, QComboBox, QLabel, QSplitter,
-                             QTableWidget, QTableWidgetItem)
+                             QTableWidget, QTableWidgetItem, QProgressBar)
 from PyQt6.QtCore import Qt, pyqtSignal
 
 from k2_quant.utilities.logger import k2_logger
@@ -34,6 +34,8 @@ class MiddlePaneWidget(QFrame):
         
         self.current_data = None
         self.current_metadata = None
+        self.current_table_name = None
+        self.total_records = 0
         self.active_columns = []
         self.active_indicators = {}
         
@@ -44,6 +46,8 @@ class MiddlePaneWidget(QFrame):
         self.controls_bar = None
         self.splitter = None
         self.empty_placeholder = None
+        self.status_label = None
+        self.loading_bar = None
         
         self.init_ui()
         self.setup_styling()
@@ -79,7 +83,27 @@ class MiddlePaneWidget(QFrame):
         self.view_selector.currentTextChanged.connect(self.change_view)
         layout.addWidget(self.view_selector)
         
+        # Viewport/status label
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: #666; font-size: 11px;")
+        layout.addWidget(self.status_label)
+        
         layout.addStretch()
+        
+        # Navigation controls
+        prev_btn = QPushButton("◀")
+        prev_btn.setFixedSize(30, 30)
+        prev_btn.setToolTip("Previous")
+        prev_btn.clicked.connect(self.navigate_prev)
+        layout.addWidget(prev_btn)
+        
+        next_btn = QPushButton("▶")
+        next_btn.setFixedSize(30, 30)
+        next_btn.setToolTip("Next")
+        next_btn.clicked.connect(self.navigate_next)
+        layout.addWidget(next_btn)
+        
+        layout.addWidget(QLabel(" | "))
         
         # Zoom controls
         zoom_in_btn = QPushButton("+")
@@ -93,8 +117,14 @@ class MiddlePaneWidget(QFrame):
         layout.addWidget(zoom_out_btn)
         
         reset_btn = QPushButton("Reset")
+        reset_btn.setToolTip("Reset view")
         reset_btn.clicked.connect(lambda: self.chart_widget.reset_zoom() if self.chart_widget else None)
         layout.addWidget(reset_btn)
+        
+        end_btn = QPushButton("End")
+        end_btn.setToolTip("Jump to latest data")
+        end_btn.clicked.connect(self.jump_to_end)
+        layout.addWidget(end_btn)
         
         return controls
     
@@ -109,14 +139,21 @@ class MiddlePaneWidget(QFrame):
         # Get main layout
         layout = self.layout()
         
-        # Create controls bar if not exists
+        # Controls bar
         if not self.controls_bar:
             self.controls_bar = self.create_controls_bar()
             layout.insertWidget(0, self.controls_bar)
         
+        # Loading bar
+        if not self.loading_bar:
+            self.loading_bar = QProgressBar()
+            self.loading_bar.setFixedHeight(3)
+            self.loading_bar.setTextVisible(False)
+            self.loading_bar.hide()
+            layout.insertWidget(1, self.loading_bar)
+        
         # Create splitter if not exists
         if not self.splitter:
-            # Create vertical splitter for chart and table
             self.splitter = QSplitter(Qt.Orientation.Vertical)
             self.splitter.setHandleWidth(2)
             self.splitter.setObjectName("dataSplitter")
@@ -124,6 +161,12 @@ class MiddlePaneWidget(QFrame):
             # Import and create chart widget
             from k2_quant.pages.analysis.widgets.chart_widget import ChartWidget
             self.chart_widget = ChartWidget()
+            
+            # Connect chart signals
+            self.chart_widget.data_loading.connect(self.on_data_loading)
+            self.chart_widget.data_loaded.connect(self.on_data_loaded)
+            self.chart_widget.viewport_changed.connect(self.on_viewport_changed)
+            
             self.splitter.addWidget(self.chart_widget)
             
             # Create data table widget
@@ -161,10 +204,11 @@ class MiddlePaneWidget(QFrame):
         k2_logger.info("Loading data into middle pane", "MIDDLE_PANE")
         
         self.current_metadata = metadata or {}
+        self.current_table_name = self.current_metadata.get('table_name')
+        self.total_records = int(self.current_metadata.get('total_records', 0) or 0)
         
-        # Convert to DataFrame if needed
+        # Convert to DataFrame if needed (limited data for table)
         if isinstance(data, list) and len(data) > 0:
-            # Standardized 8-column format
             columns = ['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'VWAP']
             df = pd.DataFrame(data, columns=columns[:len(data[0])])
             self.current_data = df
@@ -174,18 +218,34 @@ class MiddlePaneWidget(QFrame):
             k2_logger.error("Invalid data format", "MIDDLE_PANE")
             return
         
-        # Create data interface on first data load
+        # Create UI
         if not self.chart_widget:
             self.create_data_interface()
         
-        # Load into chart
+        # Chart: prefer DB source if table_name present; else limited data
         if self.chart_widget:
-            self.chart_widget.load_data(self.current_data)
+            if self.current_table_name and self.total_records > 0:
+                self.chart_widget.load_data_from_table(
+                    table_name=self.current_table_name,
+                    total_records=self.total_records,
+                    metadata=self.current_metadata
+                )
+            else:
+                self.chart_widget.load_data(self.current_data)
         
-        # Load into table
+        # Table: limited data
         self.load_data_into_table(self.current_data)
         
-        # Emit update signal
+        # Initial status
+        if self.status_label and self.total_records > 0:
+            table_rows = len(self.current_data) if self.current_data is not None else 0
+            if table_rows < self.total_records:
+                self.status_label.setText(
+                    f"Table: {table_rows:,} rows | Chart: {self.total_records:,} total"
+                )
+            else:
+                self.status_label.setText(f"Total: {self.total_records:,} records")
+        
         self.data_updated.emit()
     
     def load_data_into_table(self, data):
@@ -199,7 +259,7 @@ class MiddlePaneWidget(QFrame):
             columns = list(data.columns)
         elif isinstance(data, list):
             rows = data
-            columns = ['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'VWAP']
+            columns = ['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'VWAP']
         else:
             return
         
@@ -211,7 +271,6 @@ class MiddlePaneWidget(QFrame):
         # Populate table
         for i, row in enumerate(rows):
             for j, value in enumerate(row):
-                # Format based on column
                 if columns[j] in ['Open', 'High', 'Low', 'Close', 'VWAP']:
                     try:
                         text = f"{float(value):.2f}"
@@ -242,12 +301,42 @@ class MiddlePaneWidget(QFrame):
                 del self.active_indicators[indicator_name]
             k2_logger.info(f"Removed indicator: {indicator_name}", "MIDDLE_PANE")
     
+    # Navigation helpers
+    def navigate_prev(self):
+        if self.chart_widget:
+            self.chart_widget.pan_left()
+    
+    def navigate_next(self):
+        if self.chart_widget:
+            self.chart_widget.pan_right()
+    
+    def jump_to_end(self):
+        if self.chart_widget:
+            self.chart_widget.jump_to_end()
+    
+    # Chart signal handlers
+    def on_viewport_changed(self, start_idx: int, end_idx: int, total: int):
+        if self.status_label and total > 0:
+            shown = max(0, end_idx - start_idx)
+            percent = (shown / total) * 100 if total else 0
+            self.status_label.setText(
+                f"Showing {start_idx:,}-{end_idx:,} of {total:,} ({percent:.1f}%)"
+            )
+    
+    def on_data_loading(self):
+        if self.loading_bar:
+            self.loading_bar.show()
+            self.loading_bar.setRange(0, 0)
+    
+    def on_data_loaded(self):
+        if self.loading_bar:
+            self.loading_bar.hide()
+    
     def apply_quick_indicator(self, indicator_type: str):
         """Apply a quick indicator with default parameters"""
         if not self.current_data:
             return
         
-        # Define default parameters
         params = {
             'SMA': {'period': 20},
             'EMA': {'period': 20},
@@ -280,6 +369,11 @@ class MiddlePaneWidget(QFrame):
             self.controls_bar.deleteLater()
             self.controls_bar = None
         
+        if self.loading_bar:
+            self.loading_bar.setParent(None)
+            self.loading_bar.deleteLater()
+            self.loading_bar = None
+        
         if self.splitter:
             self.splitter.setParent(None)
             self.splitter.deleteLater()
@@ -288,6 +382,8 @@ class MiddlePaneWidget(QFrame):
         # Reset data
         self.current_data = None
         self.current_metadata = None
+        self.current_table_name = None
+        self.total_records = 0
         self.active_indicators.clear()
         
         # Show empty placeholder again
@@ -366,4 +462,7 @@ class MiddlePaneWidget(QFrame):
             self.chart_widget.cleanup()
         self.current_data = None
         self.current_metadata = None
+        self.current_table_name = None
+        self.total_records = 0
         self.active_indicators.clear()
+        k2_logger.info("Middle pane cleaned up", "MIDDLE_PANE")
