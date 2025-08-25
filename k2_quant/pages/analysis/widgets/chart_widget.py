@@ -262,6 +262,10 @@ class ChartWidget(QWidget):
         self._data_cache = {}
         self._grid_cache = {}
 
+        # Auto-preload state
+        self.is_fetching = False
+        self.viewport_update_timer = None
+
         # DB-backed context
         self.current_table_name = None
         self.total_records = 0
@@ -277,6 +281,12 @@ class ChartWidget(QWidget):
         self.range_update_timer = QTimer()
         self.range_update_timer.setSingleShot(True)
         self.range_update_timer.timeout.connect(self.update_axis_geometry)
+
+        # Debounce viewport updates to trigger auto preloading when panning
+        self.viewport_update_timer = QTimer()
+        self.viewport_update_timer.setSingleShot(True)
+        self.viewport_update_timer.setInterval(300)
+        self.viewport_update_timer.timeout.connect(self._check_and_fetch_older_if_needed)
 
     def init_ui(self):
         """Initialize UI"""
@@ -388,6 +398,11 @@ class ChartWidget(QWidget):
 
         # Emit viewport updates for status
         self.main_plot.getViewBox().sigRangeChanged.connect(self._emit_viewport_changed)
+
+        # Debounced auto-preload trigger during mouse pan
+        self.main_plot.getViewBox().sigRangeChanged.connect(
+            lambda: self.viewport_update_timer.start() if self.current_table_name else None
+        )
 
         try:
             self.main_plot.getViewBox().sigResized.connect(
@@ -1021,39 +1036,19 @@ class ChartWidget(QWidget):
     # Viewport API
     # -------------
     def pan_left(self, points: int = 200):
-        """Pan left; load older chunk if near the left edge"""
-        if self.data is None or self.current_table_name is None:
+        """Pan left and rely on debounced auto-preload when near edge"""
+        if self.data is None:
             return
-
         vb = self.main_plot.getViewBox()
         x_min, x_max = vb.viewRange()[0]
         x_width = x_max - x_min
         new_x_min = max(0, int(round(x_min - points)))
         new_x_max = int(round(new_x_min + x_width))
-
-        if new_x_min < 50 and self._global_start_index > 0:
-            try:
-                self.data_loading.emit()
-                fetch_size = self._initial_chunk_size
-                older_end = self._global_start_index
-                older_start = max(0, older_end - fetch_size)
-                df = stock_service.get_chart_data_chunk(self.current_table_name, older_start, older_end)
-                if isinstance(df, pd.DataFrame) and not df.empty:
-                    self._global_start_index = older_start
-                    self.original_data = pd.concat([df, self.original_data], ignore_index=True)
-                    self.process_timeframe_data()
-                    self.display_ohlc_lines()
-                    shift = len(df)
-                    vb.setXRange(new_x_min + shift, new_x_max + shift, padding=0)
-                    self._emit_viewport_changed()
-            except Exception as e:
-                k2_logger.error(f"pan_left prepend failed: {e}", "CHART")
-            finally:
-                self.data_loaded.emit()
-        else:
-            vb.setXRange(new_x_min, new_x_max, padding=0)
-            self.auto_scale_y_for_visible_data()
-            self._emit_viewport_changed()
+        vb.setXRange(new_x_min, new_x_max, padding=0)
+        self.auto_scale_y_for_visible_data()
+        if self.current_table_name:
+            self.viewport_update_timer.start()
+        self._emit_viewport_changed()
 
     def pan_right(self, points: int = 200):
         """Pan right within the already loaded buffer"""
@@ -1096,6 +1091,47 @@ class ChartWidget(QWidget):
         end_global = self._global_start_index + end_idx_local
         total = self.total_records if self.total_records else len(self.data)
         self.viewport_changed.emit(start_global, end_global, total)
+
+    def _check_and_fetch_older_if_needed(self):
+        """Debounced check to fetch older data when panning near left edge."""
+        if not self.current_table_name or self.is_fetching or self.data is None:
+            return
+        vb = self.main_plot.getViewBox()
+        x_min, _ = vb.viewRange()[0]
+        NEAR_EDGE_THRESHOLD = 50
+        if int(round(x_min)) <= NEAR_EDGE_THRESHOLD and self._global_start_index > 0:
+            self._fetch_and_prepend_older_chunk()
+
+    def _fetch_and_prepend_older_chunk(self):
+        """Fetch a previous chunk and prepend, preserving the current view window."""
+        try:
+            self.is_fetching = True
+            self.data_loading.emit()
+            fetch_size = self._initial_chunk_size
+            older_end = self._global_start_index
+            older_start = max(0, older_end - fetch_size)
+            df = stock_service.get_chart_data_chunk(self.current_table_name, older_start, older_end)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                prepend_len = len(df)
+                self._global_start_index = older_start
+                vb = self.main_plot.getViewBox()
+                x_min, x_max = vb.viewRange()[0]
+                # Re-ingest and shift by prepended amount
+                self.original_data = pd.concat([df, self.original_data], ignore_index=True)
+                self.process_timeframe_data()
+                self.display_ohlc_lines()
+                new_x_min = int(round(x_min + prepend_len))
+                new_x_max = int(round(x_max + prepend_len))
+                new_x_min = max(0, min(new_x_min, len(self.data) - 1))
+                new_x_max = max(0, min(new_x_max, len(self.data)))
+                vb.setXRange(new_x_min, new_x_max, padding=0)
+                self.auto_scale_y_for_visible_data()
+                self._emit_viewport_changed()
+        except Exception as e:
+            k2_logger.error(f"_fetch_and_prepend_older_chunk failed: {e}", "CHART")
+        finally:
+            self.is_fetching = False
+            self.data_loaded.emit()
 
     # -------------
     # Crosshair/UX

@@ -222,7 +222,7 @@ class MiddlePaneWidget(QFrame):
         if not self.chart_widget:
             self.create_data_interface()
         
-        # Chart: prefer DB source if table_name present; else limited data
+        # Chart: require DB source; do not fallback to limited DataFrame
         if self.chart_widget:
             if self.current_table_name and self.total_records > 0:
                 self.chart_widget.load_data_from_table(
@@ -231,7 +231,9 @@ class MiddlePaneWidget(QFrame):
                     metadata=self.current_metadata
                 )
             else:
-                self.chart_widget.load_data(self.current_data)
+                k2_logger.warning("No table_name provided; chart requires DB source", "MIDDLE_PANE")
+                if self.status_label:
+                    self.status_label.setText("Chart requires DB source")
         
         # Table: limited data
         self.load_data_into_table(self.current_data)
