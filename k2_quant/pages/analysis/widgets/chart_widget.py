@@ -1,17 +1,23 @@
 """
-Chart Widget for K2 Quant Analysis
-Complete implementation with discrete X-axis behavior and context-aware grid system
-Fixed overflow issues and data handling
+Enhanced Chart Widget for K2 Quant Analysis - Fully Fixed Version
+All issues resolved:
+- Fixed duplicate OHLC lines when fetching data
+- Fixed type errors with inf checking
+- Fixed Y-axis scaling to show actual price range
+- Fixed X-axis labels disappearing
+- Fixed viewport positioning to show actual data
+- Fixed boundary constraints properly
 """
 
 import pyqtgraph as pg
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any, Tuple, Set
-from functools import lru_cache, partial
+from typing import Dict, List, Optional, Any, Tuple, Set, Union
+from functools import lru_cache, partial, wraps
 from dataclasses import dataclass, field
 from collections import deque
+from enum import Enum
 import gc
 import math
 
@@ -20,7 +26,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QPointF, QRectF, QEvent
 from PyQt6.QtGui import QColor, QPen, QBrush, QFont, QCursor
 
-# If k2_logger is not available, create a simple replacement
+# Logger setup
 try:
     from k2_quant.utilities.logger import k2_logger
 except ImportError:
@@ -28,46 +34,246 @@ except ImportError:
         def info(self, msg, category=""): print(f"INFO [{category}]: {msg}")
         def error(self, msg, category=""): print(f"ERROR [{category}]: {msg}")
         def debug(self, msg, category=""): pass
+        def warning(self, msg, category=""): print(f"WARNING [{category}]: {msg}")
     k2_logger = DummyLogger()
 
-# Service import for DB-backed loading
-from k2_quant.utilities.services.stock_data_service import stock_service
+# Service import
+try:
+    from k2_quant.utilities.services.stock_data_service import stock_service
+except ImportError:
+    stock_service = None
+
+
+# Time span enumeration
+class TimeSpan(Enum):
+    """Time span categories for adaptive formatting"""
+    INTRADAY_MINUTES = "minutes"     # < 1 hour
+    INTRADAY_HOURS = "hours"         # 1 hour - 1 day
+    DAILY = "daily"                  # 1-7 days
+    WEEKLY = "weekly"                # 1-4 weeks
+    MONTHLY = "monthly"              # 1-3 months
+    QUARTERLY = "quarterly"          # 3-12 months
+    YEARLY = "yearly"                # 1-5 years
+    MULTI_YEAR = "multi_year"        # > 5 years
 
 
 # Constants
 OHLC_COLORS = {
     'Open': '#00ff00',
-    'High': '#0080ff',
+    'High': '#0080ff', 
     'Low': '#ff0000',
     'Close': '#ffff00'
 }
 
-TIMEFRAME_RULES = {
-    '15m': '15min',
-    '30m': '30min',
-    '1h': '1h',
-    '4h': '4h',
-    '1W': 'W',
-    '1M': 'M',
-    '3M': '3M',
-    '1Y': 'A'
+TIMEFRAME_CONFIG = {
+    '1m': {'rule': '1min',  'points_per_day': 390, 'interval_minutes': 1},
+    '5m': {'rule': '5min',  'points_per_day': 78,  'interval_minutes': 5},
+    '15m': {'rule': '15min', 'points_per_day': 26, 'interval_minutes': 15},
+    '30m': {'rule': '30min', 'points_per_day': 13, 'interval_minutes': 30},
+    '1h': {'rule': '1h', 'points_per_day': 7, 'interval_minutes': 60},
+    '4h': {'rule': '4h', 'points_per_day': 2, 'interval_minutes': 240},
+    '1D': {'rule': 'D', 'points_per_day': 1, 'interval_minutes': 1440}
 }
 
-POINTS_PER_DAY = {
-    '15m': 26,
-    '30m': 13,
-    '1h': 7,
-    '4h': 2,
-    '1D': 1,
-    '1W': 0.2,
-    '1M': 0.05,
-    '3M': 0.017,
-    '1Y': 0.004
+# View range definitions (duration presets)
+class ViewRange(Enum):
+    M15 = "15m"
+    M30 = "30m"
+    H1  = "1h"
+    H4  = "4h"
+    D1  = "1D"
+    D5  = "5D"
+    M1  = "1M"
+    M3  = "3M"
+    YTD = "YTD"
+    Y1  = "1Y"
+    ALL = "All"
+
+VIEW_RANGE_CONFIG = {
+    ViewRange.M15: {"kind": "timedelta", "minutes": 15},
+    ViewRange.M30: {"kind": "timedelta", "minutes": 30},
+    ViewRange.H1:  {"kind": "timedelta", "hours": 1},
+    ViewRange.H4:  {"kind": "timedelta", "hours": 4},
+    ViewRange.D1:  {"kind": "timedelta", "days": 1},
+    ViewRange.D5:  {"kind": "timedelta", "days": 5},
+    ViewRange.M1:  {"kind": "months",   "months": 1},
+    ViewRange.M3:  {"kind": "months",   "months": 3},
+    ViewRange.YTD: {"kind": "ytd"},
+    ViewRange.Y1:  {"kind": "years",    "years": 1},
+    ViewRange.ALL: {"kind": "all"}
+}
+
+# Fixed Time format configurations - using MM-DD-YYYY
+TIME_FORMATS = {
+    TimeSpan.INTRADAY_MINUTES: {
+        'major': '%m-%d-%Y %H:%M',
+        'minor': '%H:%M',
+        'context': None,
+        'interval_func': lambda span: timedelta(minutes=5 if span < 1800 else 15 if span < 3600 else 30)
+    },
+    TimeSpan.INTRADAY_HOURS: {
+        'major': '%m-%d-%Y %H:00',
+        'minor': '%H:%M',
+        'context': None,
+        'interval_func': lambda span: timedelta(hours=1 if span < 21600 else 2 if span < 43200 else 4)
+    },
+    TimeSpan.DAILY: {
+        'major': '%m-%d-%Y',
+        'minor': '%m-%d',
+        'context': None,
+        'interval_func': lambda span: timedelta(days=1)
+    },
+    TimeSpan.WEEKLY: {
+        'major': '%m-%d-%Y',
+        'minor': '%m-%d',
+        'context': None,
+        'interval_func': lambda span: timedelta(days=1 if span < 604800 else 7)
+    },
+    TimeSpan.MONTHLY: {
+        'major': '%m-%d-%Y',
+        'minor': '%m-%d',
+        'context': None,
+        'interval_func': lambda span: timedelta(days=7 if span < 2592000 else 14)
+    },
+    TimeSpan.QUARTERLY: {
+        'major': '%m-%d-%Y',
+        'minor': '%m-%Y',
+        'context': None,
+        'interval_func': lambda span: timedelta(days=30)
+    },
+    TimeSpan.YEARLY: {
+        'major': '%m-%d-%Y',
+        'minor': '%m-%Y',
+        'context': None,
+        'interval_func': lambda span: timedelta(days=90 if span < 31536000 else 180)
+    },
+    TimeSpan.MULTI_YEAR: {
+        'major': '%m-%d-%Y',
+        'minor': '%Y',
+        'context': None,
+        'interval_func': lambda span: timedelta(days=365)
+    }
 }
 
 NUMERIC_COLUMNS = frozenset(['Open', 'High', 'Low', 'Close', 'Volume', 'VWAP'])
-INTRADAY_TIMEFRAMES = frozenset(['15m', '30m', '1h', '4h'])
-DAILY_PLUS_TIMEFRAMES = frozenset(['1D', '1W', '1M', '3M', '1Y'])
+INTRADAY_TIMEFRAMES = frozenset(['1m', '5m', '15m', '30m', '1h', '4h'])
+DAILY_PLUS_TIMEFRAMES = frozenset(['1D'])
+
+
+# Utility functions
+def safe_strftime(date_val, format_string, default=""):
+    """Safely format a date, handling NaT and other edge cases"""
+    try:
+        if pd.isna(date_val):
+            return default
+        
+        if isinstance(date_val, np.datetime64):
+            date_val = pd.Timestamp(date_val)
+            if pd.isna(date_val):
+                return default
+        
+        if hasattr(date_val, 'strftime'):
+            return date_val.strftime(format_string)
+        else:
+            return str(date_val)[:len(format_string)]
+    except (ValueError, AttributeError, TypeError):
+        return default
+
+
+def get_time_span(start_date, end_date) -> Tuple[TimeSpan, float]:
+    """
+    Determine the time span category and duration in seconds
+    """
+    if pd.isna(start_date) or pd.isna(end_date):
+        return TimeSpan.DAILY, 86400  # Default to daily
+    
+    duration = (end_date - start_date).total_seconds()
+    
+    if duration < 3600:  # < 1 hour
+        return TimeSpan.INTRADAY_MINUTES, duration
+    elif duration < 86400:  # < 1 day
+        return TimeSpan.INTRADAY_HOURS, duration
+    elif duration < 604800:  # < 1 week
+        return TimeSpan.DAILY, duration
+    elif duration < 2592000:  # < 30 days
+        return TimeSpan.WEEKLY, duration
+    elif duration < 7776000:  # < 90 days
+        return TimeSpan.MONTHLY, duration
+    elif duration < 31536000:  # < 1 year
+        return TimeSpan.QUARTERLY, duration
+    elif duration < 157680000:  # < 5 years
+        return TimeSpan.YEARLY, duration
+    else:
+        return TimeSpan.MULTI_YEAR, duration
+
+
+def snap_to_time_boundary(dt, interval_type: TimeSpan):
+    """
+    Snap a datetime to the nearest meaningful boundary
+    """
+    if pd.isna(dt):
+        return dt
+    
+    if interval_type == TimeSpan.INTRADAY_MINUTES:
+        # Snap to 5, 15, or 30 minute boundaries
+        minute = dt.minute
+        if minute % 30 == 0:
+            return dt.replace(second=0, microsecond=0)
+        elif minute % 15 == 0:
+            return dt.replace(second=0, microsecond=0)
+        else:
+            snap_minute = (minute // 5) * 5
+            return dt.replace(minute=snap_minute, second=0, microsecond=0)
+    
+    elif interval_type == TimeSpan.INTRADAY_HOURS:
+        # Snap to hour boundaries
+        return dt.replace(minute=0, second=0, microsecond=0)
+    
+    elif interval_type in [TimeSpan.DAILY, TimeSpan.WEEKLY]:
+        # Snap to day boundaries
+        return dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    elif interval_type == TimeSpan.MONTHLY:
+        # Snap to week boundaries (Monday)
+        days_since_monday = dt.weekday()
+        if days_since_monday > 0:
+            dt = dt - timedelta(days=days_since_monday)
+        return dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    elif interval_type == TimeSpan.QUARTERLY:
+        # Snap to month boundaries
+        return dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    
+    elif interval_type == TimeSpan.YEARLY:
+        # Snap to quarter boundaries
+        month = dt.month
+        quarter_month = ((month - 1) // 3) * 3 + 1
+        return dt.replace(month=quarter_month, day=1, hour=0, minute=0, second=0, microsecond=0)
+    
+    else:  # MULTI_YEAR
+        # Snap to year boundaries
+        return dt.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+def debounce(wait_ms):
+    """Debounce decorator for methods"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(self, *args, **kwargs):
+            if not hasattr(self, '_debounce_timers'):
+                self._debounce_timers = {}
+            
+            timer_name = func.__name__
+            if timer_name in self._debounce_timers:
+                self._debounce_timers[timer_name].stop()
+            
+            timer = QTimer()
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda: func(self, *args, **kwargs))
+            timer.start(wait_ms)
+            self._debounce_timers[timer_name] = timer
+        return wrapper
+    return decorator
 
 
 @dataclass
@@ -80,8 +286,225 @@ class DrawingConfig:
     vertical: tuple = ('│', 'Vertical Line', '#00ffff')
 
 
-class SimplePlotCurveItem(pg.PlotCurveItem):
-    """Custom PlotCurveItem that ensures no fill rendering"""
+@dataclass
+class ViewportState:
+    """Immutable viewport state"""
+    x_min: int
+    x_max: int
+    y_min: float
+    y_max: float
+    
+    def __hash__(self):
+        return hash((self.x_min, self.x_max, self.y_min, self.y_max))
+
+
+class TimeAxisManager:
+    """Manages intelligent time axis labeling and formatting"""
+    
+    def __init__(self):
+        self.label_cache = {}
+        self.format_cache = {}
+        self.max_labels = 20
+        self.min_label_spacing = 50  # pixels
+        
+    def calculate_time_labels(self, data, date_column, x_range, axis_width):
+        """
+        Calculate optimal time labels based on visible range and zoom level
+        """
+        if data is None or len(data) == 0 or date_column not in data.columns:
+            return []
+        
+        # Get visible data indices with strict bounds checking
+        x_min = int(max(0, round(x_range[0])))
+        x_max = int(min(len(data) - 1, round(x_range[1])))
+        
+        # Validate range
+        if x_min >= len(data) or x_max < 0 or x_min > x_max:
+            return []
+        
+        # Additional check for minimum visible points
+        if x_max - x_min < 1:  # Need at least 2 points to show labels
+            return []
+        
+        # Get date range
+        try:
+            start_date = pd.to_datetime(data.iloc[x_min][date_column])
+            end_date = pd.to_datetime(data.iloc[x_max][date_column])
+        except:
+            return []
+        
+        if pd.isna(start_date) or pd.isna(end_date):
+            return []
+        
+        # Determine time span and get format config
+        time_span, duration_seconds = get_time_span(start_date, end_date)
+        format_config = TIME_FORMATS[time_span]
+        
+        # Calculate interval
+        interval = format_config['interval_func'](duration_seconds)
+        
+        # Calculate maximum number of labels that fit
+        max_labels_for_width = int(axis_width / self.min_label_spacing)
+        num_labels = min(self.max_labels, max_labels_for_width)
+        
+        # Generate label positions
+        labels = []
+        
+        # Find first label position (snapped to boundary)
+        current_time = snap_to_time_boundary(start_date, time_span)
+        if current_time < start_date:
+            current_time += interval
+        
+        # Generate labels at intervals
+        last_x_pos = -self.min_label_spacing
+        prev_formatted = ""
+        context_shown = False
+        
+        while current_time <= end_date and len(labels) < num_labels:
+            # Find the data point closest to this time
+            time_diffs = np.abs((data[date_column] - current_time).dt.total_seconds())
+            
+            # Skip if no valid time differences
+            if time_diffs.isna().all():
+                current_time += interval
+                continue
+                
+            closest_idx = time_diffs.idxmin()
+            
+            if pd.notna(closest_idx) and x_min <= closest_idx <= x_max:
+                # Calculate pixel position
+                x_pos = axis_width * ((closest_idx - x_range[0]) / (x_range[1] - x_range[0]))
+                
+                # Check minimum spacing
+                if x_pos - last_x_pos >= self.min_label_spacing:
+                    # Format label
+                    label_text = self._format_time_label(
+                        current_time, time_span, format_config, 
+                        prev_formatted, context_shown
+                    )
+                    
+                    if label_text:
+                        labels.append((label_text, x_pos))
+                        last_x_pos = x_pos
+                        prev_formatted = label_text
+                        
+                        # Check if we showed context (year change, etc.)
+                        if format_config.get('context') and not context_shown:
+                            if self._should_show_context(current_time, start_date, time_span):
+                                context_shown = True
+            
+            current_time += interval
+        
+        return labels
+    
+    def _format_time_label(self, dt, time_span, format_config, prev_label, context_shown):
+        """
+        Format a datetime for axis label with intelligent context
+        """
+        if pd.isna(dt):
+            return ""
+        
+        # Use major format
+        label = safe_strftime(dt, format_config['major'], '')
+        
+        # Add context if needed (removed since we set context to None)
+        if format_config.get('context') and not context_shown:
+            if time_span in [TimeSpan.DAILY, TimeSpan.WEEKLY, TimeSpan.MONTHLY]:
+                # Show year on first label or year change
+                if not prev_label or dt.year != pd.to_datetime(prev_label).year:
+                    context = safe_strftime(dt, format_config['context'], '')
+                    if context:
+                        label = f"{label}\n{context}"
+        
+        return label
+    
+    def _should_show_context(self, current_time, start_time, time_span):
+        """
+        Determine if context information should be shown
+        """
+        if time_span in [TimeSpan.DAILY, TimeSpan.WEEKLY]:
+            # Show year at start or on year boundary
+            return current_time == start_time or current_time.month == 1
+        elif time_span == TimeSpan.MONTHLY:
+            # Show year on quarter boundaries
+            return current_time.month in [1, 4, 7, 10]
+        return False
+    
+    def calculate_grid_positions(self, data, date_column, x_range, interval_type=None):
+        """
+        Calculate grid line positions based on time intervals
+        """
+        if data is None or len(data) == 0:
+            return []
+        
+        x_min = int(max(0, round(x_range[0])))
+        x_max = int(min(len(data) - 1, round(x_range[1])))
+        
+        if x_min >= x_max:
+            return []
+        
+        # For small ranges, show grid at each data point
+        visible_points = x_max - x_min + 1
+        if visible_points <= 50:
+            return list(range(x_min, x_max + 1))
+        
+        # For larger ranges, use time-based grid
+        try:
+            start_date = pd.to_datetime(data.iloc[x_min][date_column])
+            end_date = pd.to_datetime(data.iloc[x_max][date_column])
+        except:
+            # Fallback to regular intervals
+            step = max(1, visible_points // 50)
+            return list(range(x_min, x_max + 1, step))
+        
+        if pd.isna(start_date) or pd.isna(end_date):
+            step = max(1, visible_points // 50)
+            return list(range(x_min, x_max + 1, step))
+        
+        # Get appropriate interval
+        time_span, duration = get_time_span(start_date, end_date)
+        
+        # Use smaller intervals for grid than for labels
+        if time_span == TimeSpan.INTRADAY_MINUTES:
+            grid_interval = timedelta(minutes=1)
+        elif time_span == TimeSpan.INTRADAY_HOURS:
+            grid_interval = timedelta(minutes=30)
+        elif time_span == TimeSpan.DAILY:
+            grid_interval = timedelta(hours=6)
+        elif time_span == TimeSpan.WEEKLY:
+            grid_interval = timedelta(days=1)
+        elif time_span == TimeSpan.MONTHLY:
+            grid_interval = timedelta(days=1)
+        elif time_span == TimeSpan.QUARTERLY:
+            grid_interval = timedelta(days=7)
+        elif time_span == TimeSpan.YEARLY:
+            grid_interval = timedelta(days=30)
+        else:  # MULTI_YEAR
+            grid_interval = timedelta(days=90)
+        
+        # Generate grid positions
+        positions = []
+        current_time = snap_to_time_boundary(start_date, time_span)
+        
+        while current_time <= end_date:
+            # Find closest data point
+            time_diffs = np.abs((data[date_column] - current_time).dt.total_seconds())
+            if not time_diffs.isna().all():
+                closest_idx = time_diffs.idxmin()
+                if pd.notna(closest_idx) and x_min <= closest_idx <= x_max:
+                    positions.append(closest_idx)
+            
+            current_time += grid_interval
+            
+            # Limit grid lines to prevent performance issues
+            if len(positions) > 100:
+                break
+        
+        return positions
+
+
+class OptimizedPlotDataItem(pg.PlotDataItem):
+    """Optimized PlotDataItem with better memory management"""
     def __init__(self, *args, **kwargs):
         kwargs.pop('fillLevel', None)
         kwargs.pop('fillBrush', None)
@@ -89,58 +512,96 @@ class SimplePlotCurveItem(pg.PlotCurveItem):
         super().__init__(*args, **kwargs)
         self.opts['fillLevel'] = None
         self.opts['fillBrush'] = None
-        self.opts['brush'] = None
+        
+    def setData(self, *args, **kwargs):
+        if 'x' in kwargs and len(kwargs.get('x', [])) > 5000:
+            kwargs['downsample'] = 10
+            kwargs['downsampleMethod'] = 'peak'
+        super().setData(*args, **kwargs)
 
 
 class DiscreteViewBox(pg.ViewBox):
-    """Custom ViewBox with discrete X-axis behavior and overflow prevention"""
-
+    """Optimized ViewBox with discrete X-axis behavior and proper boundaries"""
+    
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.discrete_x = True
-        self.setLimits(
-            xMin=-1e6,
-            xMax=1e6,
-            yMin=-1e6,
-            yMax=1e6
-        )
-
+        # Start with reasonable defaults, will be updated when data is loaded
+        self.setLimits(xMin=0, xMax=1e6, yMin=0, yMax=1e6)
+        self._drag_cache = {}
+        self.data_x_max = 0  # Will be updated when data is loaded
+        
     def mouseDragEvent(self, ev, axis=None):
-        if self.discrete_x and (axis is None or axis == 0):
-            if ev.button() == Qt.MouseButton.LeftButton:
-                if ev.isStart():
-                    self._drag_start_pos = ev.pos()
-                    self._drag_start_range = self.viewRange()
-                elif ev.isFinish():
-                    self._drag_start_pos = None
-                    self._drag_start_range = None
-                else:
-                    if hasattr(self, '_drag_start_pos') and self._drag_start_pos:
-                        delta = ev.pos() - self._drag_start_pos
-                        x_range = self._drag_start_range[0]
-                        x_scale = (x_range[1] - x_range[0]) / self.width()
-                        x_offset = round(delta.x() * x_scale)
-                        new_x_min = round(self._drag_start_range[0][0] - x_offset)
-                        new_x_max = round(self._drag_start_range[0][1] - x_offset)
-                        self.setXRange(new_x_min, new_x_max, padding=0)
-                        if axis is None or axis == 1:
-                            y_range = self._drag_start_range[1]
-                            y_scale = (y_range[1] - y_range[0]) / self.height()
-                            y_offset = delta.y() * y_scale
-                            self.setYRange(self._drag_start_range[1][0] + y_offset,
-                                           self._drag_start_range[1][1] + y_offset, padding=0)
-                ev.accept()
-        else:
+        if not self.discrete_x or axis == 1:
             super().mouseDragEvent(ev, axis)
+            return
+            
+        if ev.button() != Qt.MouseButton.LeftButton:
+            return
+            
+        if ev.isStart():
+            self._drag_cache = {
+                'start_pos': ev.pos(),
+                'start_range': self.viewRange()
+            }
+        elif ev.isFinish():
+            self._drag_cache.clear()
+        elif self._drag_cache:
+            delta = ev.pos() - self._drag_cache['start_pos']
+            x_range = self._drag_cache['start_range'][0]
+            
+            # Guard against zero width
+            width = self.width()
+            if width == 0:
+                return
+                
+            x_scale = (x_range[1] - x_range[0]) / width
+            x_offset = round(delta.x() * x_scale)
+            
+            new_x_min = round(self._drag_cache['start_range'][0][0] - x_offset)
+            new_x_max = round(self._drag_cache['start_range'][0][1] - x_offset)
+            
+            # Enforce X boundaries
+            new_x_min = max(0, new_x_min)  # Can't go before first data point
+            if hasattr(self, 'data_x_max') and self.data_x_max > 0:
+                # Allow small buffer past last data point
+                buffer = min(50, int((new_x_max - new_x_min) * 0.1))
+                new_x_max = min(self.data_x_max + buffer, new_x_max)
+                new_x_min = min(new_x_min, new_x_max - 10)  # Ensure at least 10 points visible
+            
+            self.setXRange(new_x_min, new_x_max, padding=0)
+            
+            if axis is None:
+                y_range = self._drag_cache['start_range'][1]
+                
+                # Guard against zero height
+                height = self.height()
+                if height == 0:
+                    return
+                    
+                y_scale = (y_range[1] - y_range[0]) / height
+                y_offset = delta.y() * y_scale
+                
+                # Calculate new Y range
+                new_y_min = self._drag_cache['start_range'][1][0] + y_offset
+                new_y_max = self._drag_cache['start_range'][1][1] + y_offset
+                
+                # Enforce Y boundaries - prices can't be negative
+                new_y_min = max(0, new_y_min)
+                new_y_max = max(new_y_min + 0.01, new_y_max)  # Ensure some range
+                
+                self.setYRange(new_y_min, new_y_max, padding=0)
+        ev.accept()
 
 
 class EmbeddedAxis(pg.GraphicsWidget):
-    """Custom axis widget for chart"""
+    """Custom axis widget for chart with enhanced time display"""
 
     def __init__(self, orientation='left', parent=None):
         super().__init__(parent)
         self.orientation = orientation
         self.labels = []
+        self.sublabels = []  # For multi-level time display
         self.parent_plot = parent
 
         self._setup_appearance()
@@ -151,11 +612,14 @@ class EmbeddedAxis(pg.GraphicsWidget):
 
     def _setup_appearance(self):
         self.font = QFont('Arial', 9)
+        self.small_font = QFont('Arial', 8)
         self.text_color = QColor('#999999')
+        self.subtext_color = QColor('#666666')
         self.bg_color = QColor(10, 10, 10, 230)
         self.border_color = QColor(42, 42, 42)
         self.pen = QPen(self.border_color, 1)
         self.text_pen = QPen(self.text_color)
+        self.subtext_pen = QPen(self.subtext_color)
 
     def _setup_dimensions(self):
         if self.orientation == 'left':
@@ -163,7 +627,7 @@ class EmbeddedAxis(pg.GraphicsWidget):
             self._height = 100
         else:
             self._width = 100
-            self._height = 35
+            self._height = 40  # Increased height for multi-level labels
 
     def boundingRect(self):
         return QRectF(0, 0, self._width, self._height)
@@ -179,23 +643,41 @@ class EmbeddedAxis(pg.GraphicsWidget):
         rect = self.boundingRect()
         painter.fillRect(rect, self.bg_color)
         painter.setPen(self.pen)
+        
         if self.orientation == 'left':
             painter.drawLine(QPointF(rect.right(), rect.top()),
                              QPointF(rect.right(), rect.bottom()))
         else:
             painter.drawLine(QPointF(rect.left(), rect.top()),
                              QPointF(rect.right(), rect.top()))
+        
         if self.labels:
             painter.setPen(self.text_pen)
             painter.setFont(self.font)
+            
             if self.orientation == 'left':
                 for label, pos in self.labels:
                     text_rect = QRectF(5, pos - 10, self._width - 10, 20)
                     painter.drawText(text_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, label)
             else:
+                # Draw main labels
                 for label, pos in self.labels:
-                    text_rect = QRectF(pos - 40, 5, 80, self._height - 10)
-                    painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, label)
+                    # Check for multi-line labels (with context)
+                    if '\n' in label:
+                        parts = label.split('\n')
+                        # Main label
+                        text_rect = QRectF(pos - 40, 5, 80, 20)
+                        painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, parts[0])
+                        # Context label (smaller, below)
+                        painter.setFont(self.small_font)
+                        painter.setPen(self.subtext_pen)
+                        text_rect = QRectF(pos - 40, 20, 80, 15)
+                        painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, parts[1])
+                        painter.setFont(self.font)
+                        painter.setPen(self.text_pen)
+                    else:
+                        text_rect = QRectF(pos - 40, 5, 80, self._height - 10)
+                        painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, label)
 
     def setLabels(self, labels):
         if labels != self.labels:
@@ -204,165 +686,175 @@ class EmbeddedAxis(pg.GraphicsWidget):
 
 
 class ChartWidget(QWidget):
-    """Trading-view style chart widget with discrete X-axis and context-aware grid (DB-only input)"""
-
+    """Enhanced Trading-view style chart widget with intelligent time axis"""
+    
     # Signals
     drawing_added = pyqtSignal(dict)
     time_range_changed = pyqtSignal(str, str)
     time_range_selected = pyqtSignal(str)
     fetch_older_requested = pyqtSignal(object)
     timeframe_changed = pyqtSignal(str)
+    view_range_changed = pyqtSignal(str)
+    allowed_view_ranges_changed = pyqtSignal(list)
     data_loading = pyqtSignal()
     data_loaded = pyqtSignal()
-    viewport_changed = pyqtSignal(int, int, int)  # start_idx, end_idx, total
-
+    viewport_changed = pyqtSignal(int, int, int)
+    
     def __init__(self, parent=None):
         super().__init__(parent)
-
         self._init_data_structures()
         self.init_ui()
-        self.setup_chart_style()
         self._setup_timers()
-
+        self.setup_chart_style()
+        
     def _init_data_structures(self):
-        """Initialize data structures"""
+        """Initialize data structures with optimization"""
+        # Core data
         self.data = None
         self.original_data = None
         self.date_column = None
         self.x_values = None
         self.current_timeframe = '1D'
+        self.current_view_range = ViewRange.D5
+        self.min_visible_points = 10
         self.min_granularity = None
         self.last_5_days_range = None
-
+        
+        # Time axis manager
+        self.time_axis_manager = TimeAxisManager()
+        
+        # Collections
         self.active_lines = {}
         self.indicator_panes = {}
         self.indicator_overlays = {}
+        self.drawings = []
+        
+        # UI element references
         self.ohlc_buttons = {}
         self.timeframe_buttons = {}
-        self.drawings = []
-
+        self.tool_buttons = {}
+        
+        # Drawing state
         self.drawing_mode = None
         self.drawing_start_point = None
         self.temp_drawing = None
-        self.tool_buttons = {}
-
+        
+        # Axis interaction state
         self.dragging_y_axis = False
         self.dragging_x_axis = False
         self.drag_start_pos = None
         self.drag_start_y_range = None
         self.drag_start_x_range = None
         self.axis_hover = None
-
-        # Grid lines storage
-        self.v_grid_lines = []
-        self.h_grid_lines = []
-        self.grid_initialized = False
-
+        
+        # Grid lines pool (reusable)
+        self._grid_pool = {'v': [], 'h': []}
+        self._active_grids = {'v': 0, 'h': 0}
+        
+        # Caching
+        self._viewport_cache = None
         self._label_cache = {}
-        self._data_cache = {}
-        self._grid_cache = {}
-
-        # Auto-preload state
-        self.is_fetching = False
-        self.viewport_update_timer = None
-
-        # DB-backed context
+        self._format_cache = {}
+        self._method_cache = {}
+        
+        # DB context
         self.current_table_name = None
         self.total_records = 0
-        self._global_start_index = 0  # table index of original_data[0]
+        self._global_start_index = 0
         self._initial_chunk_size = 1000
-
+        self.is_fetching = False
+        
+        # Debounce timers dict
+        self._debounce_timers = {}
+        
     def _setup_timers(self):
-        """Setup update timers"""
+        """Setup optimized timers with single timer reuse"""
+        # Axis update timer
         self.axis_update_timer = QTimer()
         self.axis_update_timer.setSingleShot(True)
+        self.axis_update_timer.setInterval(16)
         self.axis_update_timer.timeout.connect(self.update_axis_labels_and_grid)
-
+        
+        # Axis geometry update timer
         self.range_update_timer = QTimer()
         self.range_update_timer.setSingleShot(True)
+        self.range_update_timer.setInterval(16)
         self.range_update_timer.timeout.connect(self.update_axis_geometry)
-
-        # Debounce viewport updates to trigger auto preloading when panning
+        
+        # Viewport update timer for auto-loading
         self.viewport_update_timer = QTimer()
         self.viewport_update_timer.setSingleShot(True)
         self.viewport_update_timer.setInterval(300)
-        self.viewport_update_timer.timeout.connect(self._check_and_fetch_older_if_needed)
-
+        self.viewport_update_timer.timeout.connect(self._check_and_fetch_if_needed)
+        
     def init_ui(self):
-        """Initialize UI"""
-        main_layout = QHBoxLayout()
+        """Initialize UI with optimized layout"""
+        main_layout = QHBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
-        self.setLayout(main_layout)
-
+        
+        # Drawing toolbar
         self.drawing_toolbar = self._create_drawing_toolbar()
         main_layout.addWidget(self.drawing_toolbar)
-
-        chart_container = self._create_chart_container()
-        main_layout.addWidget(chart_container)
-
+        
+        # Chart container
+        chart_widget = self._create_chart_container()
+        main_layout.addWidget(chart_widget)
+        
     def _create_chart_container(self):
-        """Create main chart container"""
+        """Create optimized chart container"""
         container = QWidget()
-        layout = QVBoxLayout()
+        layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        container.setLayout(layout)
-
+        
+        # OHLC toggles
         self.ohlc_bar = self._create_ohlc_toggles()
         layout.addWidget(self.ohlc_bar)
-
+        
+        # Timeframe selector
         self.timeframe_bar = self._create_timeframe_selector()
         layout.addWidget(self.timeframe_bar)
-
+        
         # Main chart
         self.chart_container = pg.GraphicsLayoutWidget()
         self.chart_container.setBackground('#0a0a0a')
         self.chart_container.ci.layout.setContentsMargins(0, 0, 0, 0)
-
-        # Create custom ViewBox
+        
+        # Create plot with custom ViewBox
         vb = DiscreteViewBox()
         self.main_plot = self.chart_container.addPlot(row=0, col=0, viewBox=vb)
         self._setup_main_plot()
-
+        
         layout.addWidget(self.chart_container, stretch=3)
-
+        
         # Indicator container
         self.indicator_container = QVBoxLayout()
         self.indicator_container.setSpacing(2)
         layout.addLayout(self.indicator_container, stretch=1)
-
+        
         return container
-
+        
     def _setup_main_plot(self):
-        """Setup main plot"""
+        """Setup main plot with optimizations"""
         self.main_plot.hideAxis('left')
         self.main_plot.hideAxis('bottom')
         self.main_plot.showGrid(x=False, y=False)
         self.main_plot.getViewBox().setMouseEnabled(x=True, y=False)
         self.main_plot.getViewBox().disableAutoRange()
-
+        
+        # Create embedded axes
         self._create_embedded_axes()
-        self._initialize_grid_lines()
+        
+        # Initialize grid pool
+        self._init_grid_pool()
+        
+        # Add crosshair
         self._add_crosshair()
+        
+        # Connect events
         self._connect_plot_events()
-
-    def _initialize_grid_lines(self):
-        """Initialize grid line items"""
-        for i in range(500):
-            line = pg.InfiniteLine(angle=90, pen=pg.mkPen('#1a1a1a', width=1))
-            line.setVisible(False)
-            self.main_plot.addItem(line, ignoreBounds=True)
-            self.v_grid_lines.append(line)
-
-        for i in range(20):
-            line = pg.InfiniteLine(angle=0, pen=pg.mkPen('#1a1a1a', width=1))
-            line.setVisible(False)
-            self.main_plot.addItem(line, ignoreBounds=True)
-            self.h_grid_lines.append(line)
-
-        self.grid_initialized = True
-
+        
     def _create_embedded_axes(self):
         """Create embedded axes"""
         self.y_axis = EmbeddedAxis('left', self.main_plot)
@@ -372,49 +864,65 @@ class ChartWidget(QWidget):
         self.main_plot.scene().addItem(self.x_axis)
 
         QTimer.singleShot(0, self.update_axis_geometry)
-
+        
+    def _init_grid_pool(self):
+        """Initialize reusable grid line pool"""
+        # Create pool of vertical lines
+        for _ in range(200):
+            line = pg.InfiniteLine(angle=90, pen=pg.mkPen('#1a1a1a', width=1))
+            line.setVisible(False)
+            self.main_plot.addItem(line, ignoreBounds=True)
+            self._grid_pool['v'].append(line)
+            
+        # Create pool of horizontal lines  
+        for _ in range(15):
+            line = pg.InfiniteLine(angle=0, pen=pg.mkPen('#1a1a1a', width=1))
+            line.setVisible(False)
+            self.main_plot.addItem(line, ignoreBounds=True)
+            self._grid_pool['h'].append(line)
+            
     def _add_crosshair(self):
-        """Add crosshair"""
+        """Add crosshair with optimized updates"""
         self.vLine = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('#666', width=1))
-        self.main_plot.addItem(self.vLine, ignoreBounds=True)
-
         self.hLine = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen('#666', width=1))
+        self.main_plot.addItem(self.vLine, ignoreBounds=True)
         self.main_plot.addItem(self.hLine, ignoreBounds=True)
-
+        
         self.value_label = pg.TextItem(color='#fff', anchor=(0, 1))
         self.value_label.setFont(QFont('Arial', 10))
         self.main_plot.addItem(self.value_label)
-
-        self.proxy = pg.SignalProxy(self.main_plot.scene().sigMouseMoved,
-                                    rateLimit=33, slot=self.update_crosshair)
-
+        
+        # Rate-limited crosshair updates
+        self.proxy = pg.SignalProxy(
+            self.main_plot.scene().sigMouseMoved,
+            rateLimit=33,
+            slot=self.update_crosshair
+        )
+        
     def _connect_plot_events(self):
         """Connect plot events"""
         self.main_plot.scene().sigMouseClicked.connect(self.on_mouse_clicked)
         self.main_plot.scene().sigMouseMoved.connect(self.on_mouse_moved)
-
-        self.main_plot.getViewBox().sigRangeChanged.connect(
-            lambda: self.axis_update_timer.start(16))
-
-        # Emit viewport updates for status
-        self.main_plot.getViewBox().sigRangeChanged.connect(self._emit_viewport_changed)
-
-        # Debounced auto-preload trigger during mouse pan
-        self.main_plot.getViewBox().sigRangeChanged.connect(
+        
+        # Range change handlers
+        vb = self.main_plot.getViewBox()
+        vb.sigRangeChanged.connect(lambda: self.axis_update_timer.start())
+        vb.sigRangeChanged.connect(self._emit_viewport_changed)
+        vb.sigRangeChanged.connect(
             lambda: self.viewport_update_timer.start() if self.current_table_name else None
         )
-
+        
         try:
-            self.main_plot.getViewBox().sigResized.connect(
-                lambda: self.range_update_timer.start(16))
+            vb.sigResized.connect(lambda: self.range_update_timer.start())
         except AttributeError:
             pass
-
+        
+        # Setup event filter
         self.chart_container.viewport().installEventFilter(self)
         self.chart_container.viewport().setMouseTracking(True)
-
+        
     def _create_drawing_toolbar(self):
-        """Create drawing toolbar"""
+        """Create drawing toolbar with full implementation"""
         toolbar = QFrame()
         toolbar.setFixedWidth(40)
         toolbar.setStyleSheet("""
@@ -438,12 +946,12 @@ class ChartWidget(QWidget):
                 color: #4a4;
             }
         """)
-
+        
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 10, 0, 10)
         layout.setSpacing(2)
         toolbar.setLayout(layout)
-
+        
         config = DrawingConfig()
         for tool_id in ['trend', 'ray', 'extended', 'horizontal', 'vertical']:
             icon, tooltip, _ = getattr(config, tool_id)
@@ -454,19 +962,19 @@ class ChartWidget(QWidget):
             btn.clicked.connect(partial(self.set_drawing_mode, tool_id))
             layout.addWidget(btn)
             self.tool_buttons[tool_id] = btn
-
+        
         layout.addStretch()
-
-        clear_btn = QPushButton('Clear')
+        
+        clear_btn = QPushButton('×')
         clear_btn.setToolTip('Clear All Drawings')
         clear_btn.setFixedSize(32, 32)
         clear_btn.clicked.connect(self.clear_all_drawings)
         layout.addWidget(clear_btn)
-
+        
         return toolbar
-
+        
     def _create_ohlc_toggles(self):
-        """Create OHLC toggle buttons"""
+        """Create OHLC toggles with full implementation"""
         container = QWidget()
         container.setFixedHeight(32)
         container.setStyleSheet("""
@@ -475,12 +983,12 @@ class ChartWidget(QWidget):
                 border-bottom: 1px solid #1a1a1a;
             }
         """)
-
+        
         layout = QHBoxLayout()
         layout.setContentsMargins(10, 0, 10, 0)
         layout.setSpacing(5)
         container.setLayout(layout)
-
+        
         for name, color in OHLC_COLORS.items():
             btn = QPushButton(name)
             btn.setCheckable(True)
@@ -505,12 +1013,12 @@ class ChartWidget(QWidget):
             btn.clicked.connect(partial(self.toggle_ohlc_line, name))
             layout.addWidget(btn)
             self.ohlc_buttons[name] = btn
-
+        
         layout.addStretch()
         return container
-
+        
     def _create_timeframe_selector(self):
-        """Create timeframe selector"""
+        """Create timeframe selector with full implementation"""
         container = QWidget()
         container.setFixedHeight(32)
         container.setStyleSheet("""
@@ -519,17 +1027,16 @@ class ChartWidget(QWidget):
                 border-bottom: 1px solid #1a1a1a;
             }
         """)
-
+        
         layout = QHBoxLayout()
         layout.setContentsMargins(10, 0, 10, 0)
         layout.setSpacing(3)
         container.setLayout(layout)
-
-        timeframes = ['15m', '30m', '1h', '4h', '1D', '1W', '1M', '3M', '1Y']
+        
         self.timeframe_button_group = QButtonGroup(container)
         self.timeframe_button_group.setExclusive(True)
-
-        for tf in timeframes:
+        
+        for tf in TIMEFRAME_CONFIG.keys():
             btn = QPushButton(tf)
             btn.setCheckable(True)
             btn.setFixedHeight(24)
@@ -556,313 +1063,15 @@ class ChartWidget(QWidget):
             self.timeframe_button_group.addButton(btn)
             layout.addWidget(btn)
             self.timeframe_buttons[tf] = btn
-
+            
             if tf == '1D':
                 btn.setChecked(True)
-
+        
         layout.addStretch()
         return container
-
-    # -----------------------
-    # DB-backed data loading
-    # -----------------------
-    def load_data_from_table(self, table_name: str, total_records: Optional[int] = None, metadata: Optional[Dict] = None):
-        """Load latest chunk directly from DB table and initialize chart"""
-        try:
-            self.data_loading.emit()
-            self.current_table_name = table_name
-            if total_records is None:
-                info = stock_service.get_table_info(table_name) or {}
-                self.total_records = int(info.get('total_records', 0) or 0)
-            else:
-                self.total_records = int(total_records or 0)
-
-            if self.total_records <= 0:
-                k2_logger.warning("No records to load for chart", "CHART")
-                return
-
-            # Initial chunk: last N points (bounded)
-            chunk = min(self._initial_chunk_size, self.total_records)
-            start_idx = max(0, self.total_records - chunk)
-            end_idx = self.total_records
-
-            df = stock_service.get_chart_data_chunk(table_name, start_idx, end_idx)
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                self._global_start_index = start_idx
-                self._ingest_dataframe(df)
-                self._emit_viewport_changed()
-        except Exception as e:
-            k2_logger.error(f"load_data_from_table failed: {e}", "CHART")
-        finally:
-            self.data_loaded.emit()
-
-    def _ingest_dataframe(self, df: pd.DataFrame):
-        """Internal ingestion pipeline for DB-fetched data"""
-        self.original_data = df.copy()
-
-        # Convert numeric columns without downcasting to maintain precision
-        for col in NUMERIC_COLUMNS & set(self.original_data.columns):
-            self.original_data[col] = pd.to_numeric(self.original_data[col], errors='coerce')
-
-        self.detect_granularity()
-        self.process_timeframe_data()
-        self.display_ohlc_lines()
-        self.set_default_view()
-
-        self.update_axis_geometry()
-        QTimer.singleShot(0, self.update_axis_labels_and_grid)
-
-        k2_logger.info(f"Data loaded: {len(self.data)} records", "CHART")
-
-    def detect_granularity(self):
-        """Detect data granularity"""
-        if self.original_data is None or len(self.original_data) == 0:
-            self.min_granularity = '1D'
-            return
-
-        if 'Time' not in self.original_data.columns or self.original_data['Time'].iloc[0] is None:
-            self.min_granularity = '1D'
-            for tf in INTRADAY_TIMEFRAMES:
-                if tf in self.timeframe_buttons:
-                    self.timeframe_buttons[tf].setEnabled(False)
-        else:
-            try:
-                if 'datetime' not in self.original_data.columns:
-                    self.original_data['datetime'] = pd.to_datetime(
-                        self.original_data['Date'].astype(str) + ' ' +
-                        self.original_data['Time'].astype(str),
-                        format='%Y-%m-%d %H:%M:%S',
-                        errors='coerce'
-                    )
-
-                time_diffs = self.original_data['datetime'].diff().dt.total_seconds() / 60
-                min_interval = time_diffs[time_diffs > 0].min()
-
-                if min_interval <= 15:
-                    self.min_granularity = '15m'
-                    enabled_from = 0
-                elif min_interval <= 30:
-                    self.min_granularity = '30m'
-                    enabled_from = 1
-                elif min_interval <= 60:
-                    self.min_granularity = '1h'
-                    enabled_from = 2
-                elif min_interval <= 240:
-                    self.min_granularity = '4h'
-                    enabled_from = 3
-                else:
-                    self.min_granularity = '1D'
-                    enabled_from = 4
-
-                timeframe_order = ['15m', '30m', '1h', '4h', '1D', '1W', '1M', '3M', '1Y']
-                for i, tf in enumerate(timeframe_order):
-                    if tf in self.timeframe_buttons:
-                        self.timeframe_buttons[tf].setEnabled(i >= enabled_from)
-
-            except Exception as e:
-                k2_logger.error(f"Error detecting granularity: {e}", "CHART")
-                self.min_granularity = '1D'
-
-    def process_timeframe_data(self):
-        """Process data for selected timeframe"""
-        self.data = self.original_data.copy()
-
-        if 'datetime' in self.data.columns:
-            self.date_column = 'datetime'
-        elif 'Date' in self.data.columns:
-            if 'Time' in self.data.columns:
-                try:
-                    self.data['datetime'] = pd.to_datetime(
-                        self.data['Date'].astype(str) + ' ' + self.data['Time'].astype(str),
-                        format='%Y-%m-%d %H:%M:%S',
-                        errors='coerce'
-                    )
-                    self.date_column = 'datetime'
-                except:
-                    self.date_column = 'Date'
-            else:
-                self.date_column = 'Date'
-
-        if self.current_timeframe != '1D' and self.date_column == 'datetime':
-            self._aggregate_timeframe_data()
-
-        if self.data is None or len(self.data) == 0:
-            k2_logger.error("No data after processing timeframe", "CHART")
-            return
-
-        self.clear_all()
-        self.x_values = np.arange(len(self.data), dtype=np.float64)
-
-    def _aggregate_timeframe_data(self):
-        """Aggregate data for timeframe"""
-        if self.current_timeframe not in TIMEFRAME_RULES:
-            return
-
-        try:
-            self.data.set_index('datetime', inplace=True)
-
-            agg_dict = {}
-            if 'Open' in self.data.columns: agg_dict['Open'] = 'first'
-            if 'High' in self.data.columns: agg_dict['High'] = 'max'
-            if 'Low' in self.data.columns: agg_dict['Low'] = 'min'
-            if 'Close' in self.data.columns: agg_dict['Close'] = 'last'
-            if 'Volume' in self.data.columns: agg_dict['Volume'] = 'sum'
-
-            if agg_dict:
-                self.data = self.data.resample(
-                    TIMEFRAME_RULES[self.current_timeframe],
-                    closed='left',
-                    label='left'
-                ).agg(agg_dict)
-
-                self.data = self.data.dropna(how='all')
-                self.data.reset_index(inplace=True)
-                self.date_column = 'datetime'
-        except Exception as e:
-            k2_logger.error(f"Error resampling data: {e}", "CHART")
-            self.data = self.original_data.copy()
-
-    def display_ohlc_lines(self):
-        """Display OHLC lines"""
-        for col_name in ['Open', 'High', 'Low', 'Close']:
-            if col_name in self.data.columns and self.ohlc_buttons[col_name].isChecked():
-                self.add_ohlc_line(col_name)
-
-    def add_ohlc_line(self, column_name):
-        """Add OHLC line with overflow prevention"""
-        if column_name in self.active_lines or column_name not in self.data.columns:
-            return
-
-        y_values = self.data[column_name].values.astype(np.float64)
-        y_values = np.clip(y_values, -1e6, 1e6)
-        y_values[np.isinf(y_values)] = np.nan
-
-        x_values = self.x_values[:len(y_values)]
-
-        finite_mask = np.isfinite(y_values)
-        if not np.any(finite_mask):
-            return
-
-        color = OHLC_COLORS.get(column_name, '#ffffff')
-
-        plot_item = pg.PlotDataItem(
-            x=x_values,
-            y=y_values,
-            pen=pg.mkPen(color=color, width=2),
-            connect='finite'
-        )
-        plot_item.curve.setBrush(None)
-        plot_item.curve.setFillLevel(None)
-
-        self.main_plot.addItem(plot_item)
-        self.active_lines[column_name] = plot_item
-
-        k2_logger.info(f"Added {column_name} line", "CHART")
-
-    def toggle_ohlc_line(self, column_name, visible=None):
-        """Toggle OHLC line visibility"""
-        if visible is None:
-            visible = self.ohlc_buttons[column_name].isChecked()
-
-        if visible and column_name not in self.active_lines:
-            self.add_ohlc_line(column_name)
-        elif not visible and column_name in self.active_lines:
-            item = self.active_lines.pop(column_name)
-            self.main_plot.removeItem(item)
-
-    def set_default_view(self):
-        """Set default view"""
-        if self.data is None or len(self.data) == 0:
-            return
-
-        points_per_day = POINTS_PER_DAY.get(self.current_timeframe, 1)
-        points_for_5_days = int(5 * points_per_day)
-        points_for_5_days = max(20, min(points_for_5_days, len(self.data)))
-
-        future_points = int(points_for_5_days * 0.2)
-
-        x_max = len(self.data) - 1 + future_points
-        x_min = max(0, len(self.data) - 1 - points_for_5_days)
-
-        x_min = int(round(x_min))
-        x_max = int(round(x_max))
-
-        self.main_plot.setXRange(x_min, x_max, padding=0)
-        self._auto_scale_y_range(x_min, min(len(self.data) - 1, x_max))
-
-        self.last_5_days_range = ((x_min, x_max), self.main_plot.getViewBox().viewRange()[1])
-
-    def _auto_scale_y_range(self, x_min, x_max):
-        """Auto-scale Y range with overflow prevention"""
-        if self.data is None or len(self.data) == 0:
-            return
-
-        x_min = int(max(0, x_min))
-        x_max = int(min(len(self.data) - 1, x_max))
-
-        if x_min >= len(self.data) or x_min > x_max:
-            return
-
-        visible_data = self.data.iloc[x_min:x_max + 1]
-
-        active_columns = [col for col in ['Open', 'High', 'Low', 'Close']
-                          if col in visible_data.columns and col in self.active_lines]
-
-        if active_columns:
-            data_array = visible_data[active_columns].values
-            data_array = np.clip(data_array, -1e6, 1e6)
-            data_array[np.isinf(data_array)] = np.nan
-            finite_mask = np.isfinite(data_array)
-
-            if np.any(finite_mask):
-                finite_data = data_array[finite_mask]
-                if len(finite_data) > 0:
-                    y_min = np.min(finite_data)
-                    y_max = np.max(finite_data)
-
-                    padding = (y_max - y_min) * 0.1
-                    y_min = max(0, y_min - padding)
-                    y_max = y_max + padding
-
-                    self.main_plot.setYRange(y_min, y_max, padding=0)
-
-    def change_timeframe(self, timeframe):
-        """Change timeframe"""
-        if self.current_timeframe == timeframe:
-            return
-
-        self.current_timeframe = timeframe
-        self.timeframe_changed.emit(timeframe)
-
-        if self.original_data is not None:
-            self.process_timeframe_data()
-            self.display_ohlc_lines()
-            self.set_default_view()
-
-            self.update_axis_geometry()
-            QTimer.singleShot(0, self.update_axis_labels_and_grid)
-
-            k2_logger.info(f"Timeframe changed to {timeframe}", "CHART")
-
-    def update_axis_geometry(self):
-        """Update axis geometry"""
-        if not hasattr(self, 'y_axis') or not hasattr(self, 'x_axis'):
-            return
-
-        vb = self.main_plot.getViewBox()
-        vb_rect = vb.sceneBoundingRect()
-
-        y_axis_width = 70
-        x_axis_height = 35
-
-        self.y_axis.setSize(y_axis_width, vb_rect.height())
-        self.x_axis.setSize(vb_rect.width(), x_axis_height)
-
-        self.y_axis.setPos(vb_rect.right() - y_axis_width, vb_rect.top())
-        self.x_axis.setPos(vb_rect.left(), vb_rect.bottom() - x_axis_height)
-
+        
     def update_axis_labels_and_grid(self):
-        """Update axis labels and grid lines"""
+        """Update axis labels and grid lines with intelligent time handling"""
         if not hasattr(self, 'y_axis') or not hasattr(self, 'x_axis'):
             return
 
@@ -870,8 +1079,8 @@ class ChartWidget(QWidget):
         x_range, y_range = vb.viewRange()
 
         self._update_y_axis_and_grid(y_range)
-        self._update_x_axis_and_grid(x_range)
-
+        self._update_x_axis_and_grid_intelligent(x_range)
+        
     def _update_y_axis_and_grid(self, y_range):
         """Update Y-axis labels and horizontal grid lines"""
         y_labels = []
@@ -879,7 +1088,7 @@ class ChartWidget(QWidget):
 
         if y_max - y_min > 0:
             price_range = y_max - y_min
-            interval = self.get_price_interval(price_range)
+            interval = self._get_price_interval(price_range)
 
             first_line = math.ceil(y_min / interval) * interval
             last_line = math.floor(y_max / interval) * interval
@@ -895,8 +1104,10 @@ class ChartWidget(QWidget):
 
             axis_height = self.y_axis._height
 
-            for line in self.h_grid_lines:
-                line.setVisible(False)
+            # Hide all then show needed
+            for i in range(self._active_grids['h']):
+                if i < len(self._grid_pool['h']):
+                    self._grid_pool['h'][i].setVisible(False)
 
             for i, price in enumerate(prices):
                 pos = axis_height * (1 - (price - y_min) / (y_max - y_min))
@@ -910,272 +1121,665 @@ class ChartWidget(QWidget):
 
                 y_labels.append((label, pos))
 
-                if i < len(self.h_grid_lines):
-                    self.h_grid_lines[i].setPos(price)
-                    self.h_grid_lines[i].setVisible(True)
+                if i < len(self._grid_pool['h']):
+                    self._grid_pool['h'][i].setPos(price)
+                    self._grid_pool['h'][i].setVisible(True)
+            
+            # Cap active grids to pool size
+            self._active_grids['h'] = min(len(prices), len(self._grid_pool['h']))
 
         self.y_axis.setLabels(y_labels)
+        
+    def _update_x_axis_and_grid_intelligent(self, x_range):
+        """Update X-axis with intelligent time-aware labeling"""
+        # Hide all vertical grid lines first
+        for i in range(self._active_grids['v']):
+            if i < len(self._grid_pool['v']):
+                self._grid_pool['v'][i].setVisible(False)
+        
+        if self.data is None or self.date_column not in self.data.columns or len(self.data) == 0:
+            self.x_axis.setLabels([])
+            return
+        
+        # Validate x_range
+        x_min = max(0, int(round(x_range[0])))
+        x_max = min(len(self.data) - 1, int(round(x_range[1])))
+        
+        # Prevent invalid ranges
+        if x_min >= len(self.data) or x_max < 0 or x_min > x_max:
+            self.x_axis.setLabels([])
+            return
+        
+        # Ensure we have valid data in range
+        try:
+            visible_data = self.data.iloc[x_min:x_max+1]
+            if visible_data.empty or visible_data[self.date_column].isna().all():
+                self.x_axis.setLabels([])
+                return
+        except (IndexError, KeyError):
+            self.x_axis.setLabels([])
+            return
+        
+        # Convert date column to datetime if needed
+        if self.date_column in self.data.columns:
+            try:
+                if not pd.api.types.is_datetime64_any_dtype(self.data[self.date_column]):
+                    self.data[self.date_column] = pd.to_datetime(self.data[self.date_column], errors='coerce')
+            except:
+                pass
+        
+        axis_width = self.x_axis._width
+        
+        # Get time-aware labels
+        labels = self.time_axis_manager.calculate_time_labels(
+            self.data, self.date_column, x_range, axis_width
+        )
+        
+        # Get grid positions
+        grid_positions = self.time_axis_manager.calculate_grid_positions(
+            self.data, self.date_column, x_range
+        )
+        
+        # Show grid lines
+        for i, pos in enumerate(grid_positions[:len(self._grid_pool['v'])]):
+            if i < len(self._grid_pool['v']):
+                self._grid_pool['v'][i].setPos(pos)
+                self._grid_pool['v'][i].setVisible(True)
+        
+        self._active_grids['v'] = len(grid_positions[:len(self._grid_pool['v'])])
+        
+        # Set labels
+        self.x_axis.setLabels(labels)
+        
+    def update_axis_geometry(self):
+        """Update axis geometry"""
+        if not hasattr(self, 'y_axis') or not hasattr(self, 'x_axis'):
+            return
 
-    def _update_x_axis_and_grid(self, x_range):
-        """Update X-axis labels and vertical grid lines"""
-        x_labels = []
+        vb = self.main_plot.getViewBox()
+        vb_rect = vb.sceneBoundingRect()
 
-        for line in self.v_grid_lines:
-            line.setVisible(False)
+        y_axis_width = 70
+        x_axis_height = 40  # Increased for multi-level labels
 
-        if self.data is not None and self.date_column and len(self.data) > 0:
-            x_min = int(max(0, round(x_range[0])))
-            x_max = int(min(len(self.data) - 1, round(x_range[1])))
+        self.y_axis.setSize(y_axis_width, vb_rect.height())
+        self.x_axis.setSize(vb_rect.width(), x_axis_height)
 
-            visible_points = x_max - x_min + 1
-            label_interval = self.get_label_interval(visible_points, self.current_timeframe)
-
-            axis_width = self.x_axis._width
-
-            label_indices = []
-            current = x_min
-            while current <= x_max:
-                if current % label_interval == 0:
-                    label_indices.append(current)
-                current += 1
-
-            grid_line_idx = 0
-            for x_idx in range(x_min, min(x_max + 1, len(self.data))):
-                if grid_line_idx < len(self.v_grid_lines):
-                    self.v_grid_lines[grid_line_idx].setPos(x_idx)
-                    self.v_grid_lines[grid_line_idx].setVisible(True)
-                    grid_line_idx += 1
-
-            for x_idx in label_indices:
-                if 0 <= x_idx < len(self.data):
-                    pos = axis_width * ((x_idx - x_range[0]) / (x_range[1] - x_range[0]))
-
-                    date_val = self.data.iloc[x_idx][self.date_column]
-
-                    if isinstance(date_val, (pd.Timestamp, np.datetime64, datetime)):
-                        if isinstance(date_val, np.datetime64):
-                            date_val = pd.Timestamp(date_val)
-
-                        if self.current_timeframe in INTRADAY_TIMEFRAMES:
-                            label = date_val.strftime('%H:%M')
-                        else:
-                            label = date_val.strftime('%m/%d')
-                    else:
-                        try:
-                            date_str = str(date_val)
-                            if len(date_str) >= 10:
-                                label = f"{date_str[5:7]}/{date_str[8:10]}"
-                            else:
-                                label = date_str[:10]
-                        except:
-                            label = str(date_val)[:10]
-
-                    x_labels.append((label, pos))
-
-        self.x_axis.setLabels(x_labels)
-
-    def get_price_interval(self, price_range):
-        """Get context-aware price interval for Y-axis grid"""
+        self.y_axis.setPos(vb_rect.right() - y_axis_width, vb_rect.top())
+        self.x_axis.setPos(vb_rect.left(), vb_rect.bottom() - x_axis_height)
+        
+    def _get_price_interval(self, price_range):
+        """Get appropriate price interval"""
         if price_range <= 0:
             return 0.1
-
+            
         magnitude = 10 ** math.floor(math.log10(price_range))
         normalized = price_range / magnitude
-
+        
         if price_range > 100:
-            if normalized < 2:
-                return 10
-            elif normalized < 4:
-                return 20
-            elif normalized < 5:
-                return 25
-            else:
-                return 50
+            return 10 if normalized < 2 else 20 if normalized < 4 else 25 if normalized < 5 else 50
         elif price_range > 20:
-            if normalized < 4:
-                return 2
-            elif normalized < 8:
-                return 5
-            else:
-                return 10
+            return 2 if normalized < 4 else 5 if normalized < 8 else 10
         elif price_range > 5:
-            if normalized < 10:
-                return 0.5
-            elif normalized < 20:
-                return 1
-            else:
-                return 2
+            return 0.5 if normalized < 10 else 1 if normalized < 20 else 2
         elif price_range > 1:
-            if normalized < 2:
-                return 0.1
-            elif normalized < 5:
-                return 0.2
-            else:
-                return 0.5
+            return 0.1 if normalized < 2 else 0.2 if normalized < 5 else 0.5
         else:
             return 0.1
-
-    def get_label_interval(self, visible_points, timeframe):
-        """Get appropriate label interval based on visible points"""
-        if visible_points > 300:
-            return 50
-        elif visible_points > 200:
-            return 30
-        elif visible_points > 100:
-            return 20
-        elif visible_points > 50:
-            return 10
-        elif visible_points > 20:
-            return 5
-        elif visible_points > 10:
-            return 2
-        else:
-            return 1
-
-    # -------------
-    # Viewport API
-    # -------------
-    def pan_left(self, points: int = 200):
-        """Pan left and rely on debounced auto-preload when near edge"""
-        if self.data is None:
+            
+    def load_data_from_table(self, table_name: str, total_records: Optional[int] = None, 
+                            metadata: Optional[Dict] = None):
+        """Load data with optimized chunking"""
+        if self.is_fetching:
             return
-        vb = self.main_plot.getViewBox()
-        x_min, x_max = vb.viewRange()[0]
-        x_width = x_max - x_min
-        new_x_min = max(0, int(round(x_min - points)))
-        new_x_max = int(round(new_x_min + x_width))
-        vb.setXRange(new_x_min, new_x_max, padding=0)
-        self.auto_scale_y_for_visible_data()
-        if self.current_table_name:
-            self.viewport_update_timer.start()
-        self._emit_viewport_changed()
-
-    def pan_right(self, points: int = 200):
-        """Pan right within the already loaded buffer"""
-        if self.data is None or self.current_table_name is None:
-            return
-
-        vb = self.main_plot.getViewBox()
-        x_min, x_max = vb.viewRange()[0]
-        x_width = x_max - x_min
-
-        max_points = len(self.data)
-        new_x_min = int(round(min(max_points - x_width, x_min + points)))
-        new_x_max = int(round(new_x_min + x_width))
-        vb.setXRange(new_x_min, new_x_max, padding=0)
-        self.auto_scale_y_for_visible_data()
-        self._emit_viewport_changed()
-
-    def jump_to_end(self):
-        """Jump to latest data"""
-        if self.data is None:
-            return
-        points_per_day = POINTS_PER_DAY.get(self.current_timeframe, 1)
-        points_for_5_days = int(5 * points_per_day)
-        points_for_5_days = max(20, min(points_for_5_days, len(self.data)))
-        x_max = len(self.data) - 1 + int(points_for_5_days * 0.2)
-        x_min = max(0, len(self.data) - 1 - points_for_5_days)
-        self.main_plot.setXRange(int(round(x_min)), int(round(x_max)), padding=0)
-        self._auto_scale_y_range(x_min, min(len(self.data) - 1, x_max))
-        self._emit_viewport_changed()
-
-    def _emit_viewport_changed(self):
-        """Emit viewport_changed with global indices when possible"""
-        if self.data is None:
-            return
-        vb = self.main_plot.getViewBox()
-        x_min, x_max = vb.viewRange()[0]
-        start_idx_local = int(max(0, round(x_min)))
-        end_idx_local = int(min(len(self.data), round(x_max)))
-        start_global = self._global_start_index + start_idx_local
-        end_global = self._global_start_index + end_idx_local
-        total = self.total_records if self.total_records else len(self.data)
-        self.viewport_changed.emit(start_global, end_global, total)
-
-    def _check_and_fetch_older_if_needed(self):
-        """Debounced check to fetch older data when panning near left edge."""
-        if not self.current_table_name or self.is_fetching or self.data is None:
-            return
-        vb = self.main_plot.getViewBox()
-        x_min, _ = vb.viewRange()[0]
-        NEAR_EDGE_THRESHOLD = 50
-        if int(round(x_min)) <= NEAR_EDGE_THRESHOLD and self._global_start_index > 0:
-            self._fetch_and_prepend_older_chunk()
-
-    def _fetch_and_prepend_older_chunk(self):
-        """Fetch a previous chunk and prepend, preserving the current view window."""
+            
         try:
             self.is_fetching = True
             self.data_loading.emit()
-            fetch_size = self._initial_chunk_size
-            older_end = self._global_start_index
-            older_start = max(0, older_end - fetch_size)
-            df = stock_service.get_chart_data_chunk(self.current_table_name, older_start, older_end)
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                prepend_len = len(df)
-                self._global_start_index = older_start
-                vb = self.main_plot.getViewBox()
-                x_min, x_max = vb.viewRange()[0]
-                # Re-ingest and shift by prepended amount
-                self.original_data = pd.concat([df, self.original_data], ignore_index=True)
-                self.process_timeframe_data()
-                self.display_ohlc_lines()
-                new_x_min = int(round(x_min + prepend_len))
-                new_x_max = int(round(x_max + prepend_len))
-                new_x_min = max(0, min(new_x_min, len(self.data) - 1))
-                new_x_max = max(0, min(new_x_max, len(self.data)))
-                vb.setXRange(new_x_min, new_x_max, padding=0)
-                self.auto_scale_y_for_visible_data()
-                self._emit_viewport_changed()
+            
+            self.current_table_name = table_name
+            self.total_records = total_records or 0
+            
+            if not self.total_records and stock_service:
+                info = stock_service.get_table_info(table_name) or {}
+                self.total_records = int(info.get('total_records', 0))
+                
+            if self.total_records <= 0:
+                k2_logger.warning("No records to load for chart", "CHART")
+                return
+                
+            # Load initial chunk
+            chunk_size = min(self._initial_chunk_size, self.total_records)
+            start_idx = max(0, self.total_records - chunk_size)
+            
+            if stock_service:
+                df = stock_service.get_chart_data_chunk(table_name, start_idx, self.total_records)
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    self._global_start_index = start_idx
+                    self._process_dataframe(df)
+            else:
+                k2_logger.warning("Stock service not available", "CHART")
+                    
         except Exception as e:
-            k2_logger.error(f"_fetch_and_prepend_older_chunk failed: {e}", "CHART")
+            k2_logger.error(f"Failed to load data: {e}", "CHART")
         finally:
             self.is_fetching = False
             self.data_loaded.emit()
+            
+    def _process_dataframe(self, df: pd.DataFrame):
+        """Process dataframe with optimizations and set viewport limits"""
+        # Store original
+        self.original_data = df.copy()
+        
+        # Convert numeric columns efficiently
+        numeric_cols = list(NUMERIC_COLUMNS & set(df.columns))
+        if numeric_cols:
+            for col in numeric_cols:
+                self.original_data[col] = pd.to_numeric(self.original_data[col], errors='coerce')
+            
+        # Detect granularity
+        self._detect_granularity_optimized()
+        
+        # Process for current timeframe
+        self._process_timeframe_optimized()
+        
+        # Update ViewBox limits based on actual data
+        self._update_viewport_limits()
+        
+        # Display lines
+        self._display_ohlc_optimized()
+        
+        # Set view
+        self.set_default_view()
+        
+        # Update UI
+        self.update_axis_geometry()
+        QTimer.singleShot(0, self.update_axis_labels_and_grid)
+        
+        k2_logger.info(f"Data loaded: {len(self.data)} records", "CHART")
+        
+    def _update_viewport_limits(self):
+        """Update ViewBox limits based on actual data - FIXED VERSION"""
+        if self.data is None or len(self.data) == 0:
+            return
+            
+        vb = self.main_plot.getViewBox()
+        
+        # Calculate Y limits from data
+        y_min = float('inf')
+        y_max = float('-inf')
+        
+        for col in ['Open', 'High', 'Low', 'Close']:
+            if col in self.data.columns:
+                # Ensure data is numeric
+                col_data = pd.to_numeric(self.data[col], errors='coerce').dropna()
+                if len(col_data) > 0:
+                    # Filter out any remaining inf values
+                    col_data = col_data[~np.isinf(col_data)]
+                    if len(col_data) > 0:
+                        y_min = min(y_min, col_data.min())
+                        y_max = max(y_max, col_data.max())
+        
+        # Ensure valid Y range
+        if y_min == float('inf') or y_max == float('-inf'):
+            y_min, y_max = 0, 100
+        
+        # Set limits with appropriate padding
+        x_max = len(self.data) - 1
+        y_min = max(0, y_min * 0.9)  # 10% padding below (but never negative)
+        y_max = y_max * 1.2  # 20% padding above (not 2x!)
+        
+        # Update ViewBox limits
+        vb.setLimits(
+            xMin=0,
+            xMax=x_max + 50,  # Fixed 50 point buffer instead of percentage
+            yMin=0,  # Prices can't be negative
+            yMax=y_max  # Just 20% above max, not doubled
+        )
+        
+        # Store max X in ViewBox for reference
+        if isinstance(vb, DiscreteViewBox):
+            vb.data_x_max = x_max
+            
+    def _detect_granularity_optimized(self):
+        """Optimized granularity detection"""
+        if self.original_data is None or len(self.original_data) == 0:
+            self.min_granularity = '1D'
+            return
+            
+        # Quick check for time column
+        if 'Time' not in self.original_data.columns:
+            self.min_granularity = '1D'
+            self._update_timeframe_buttons('1D')
+            return
+            
+        try:
+            # Create datetime column if needed
+            if 'datetime' not in self.original_data.columns:
+                self.original_data['datetime'] = pd.to_datetime(
+                    self.original_data['Date'].astype(str) + ' ' +
+                    self.original_data['Time'].astype(str),
+                    format='%Y-%m-%d %H:%M:%S',
+                    errors='coerce'
+                )
+                
+            # Sample intervals for speed (use first 100 rows)
+            sample = self.original_data['datetime'].head(100)
+            diffs = sample.diff().dt.total_seconds() / 60
+            diffs = diffs[diffs > 0]
+            
+            if len(diffs) > 0 and not diffs.isna().all():
+                min_interval = diffs[~diffs.isna()].min()
+                
+                # Determine granularity
+                for tf, config in TIMEFRAME_CONFIG.items():
+                    if min_interval <= config['interval_minutes']:
+                        self.min_granularity = tf
+                        break
+                else:
+                    self.min_granularity = '1D'
+            else:
+                self.min_granularity = '1D'
+                
+            self._update_timeframe_buttons(self.min_granularity)
+            
+        except Exception as e:
+            k2_logger.error(f"Granularity detection failed: {e}", "CHART")
+            self.min_granularity = '1D'
+            self._update_timeframe_buttons('1D')
+            
+    def _update_timeframe_buttons(self, min_tf):
+        """Update timeframe button states"""
+        timeframes = list(TIMEFRAME_CONFIG.keys())
+        min_idx = timeframes.index(min_tf) if min_tf in timeframes else 4
+        
+        for i, tf in enumerate(timeframes):
+            if tf in self.timeframe_buttons:
+                self.timeframe_buttons[tf].setEnabled(i >= min_idx)
+                
+    def _process_timeframe_optimized(self):
+        """Optimized timeframe processing with improved date handling"""
+        self.data = self.original_data.copy()
+        
+        # More robust date handling
+        if 'Date' in self.data.columns:
+            # First ensure Date column is properly formatted
+            self.data['Date'] = pd.to_datetime(self.data['Date'], errors='coerce')
 
-    # -------------
-    # Crosshair/UX
-    # -------------
+            # If intraday, drop off-market hours and weekends before plotting
+            if 'Time' in self.data.columns and self.current_timeframe in INTRADAY_TIMEFRAMES:
+                try:
+                    combined_dt = pd.to_datetime(
+                        self.data['Date'].dt.strftime('%Y-%m-%d') + ' ' + self.data['Time'].astype(str),
+                        format='%Y-%m-%d %H:%M:%S',
+                        errors='coerce'
+                    )
+                except Exception:
+                    combined_dt = pd.to_datetime(
+                        self.data['Date'].astype(str) + ' ' + self.data['Time'].astype(str),
+                        errors='coerce'
+                    )
+
+                try:
+                    start_t = datetime.strptime('09:30:00', '%H:%M:%S').time()
+                    end_t = datetime.strptime('16:00:00', '%H:%M:%S').time()
+                    mask = (combined_dt.dt.weekday < 5) & (combined_dt.dt.time >= start_t) & (combined_dt.dt.time < end_t)
+                    self.data = self.data[mask].reset_index(drop=True)
+                except Exception:
+                    # If anything fails, keep data as-is (fail-safe)
+                    pass
+            
+            # Check if we have valid dates
+            if self.data['Date'].notna().any():
+                if 'Time' in self.data.columns and self.current_timeframe in INTRADAY_TIMEFRAMES:
+                    # Only combine with time for intraday timeframes
+                    try:
+                        self.data['datetime'] = pd.to_datetime(
+                            self.data['Date'].dt.strftime('%Y-%m-%d') + ' ' + 
+                            self.data['Time'].astype(str),
+                            format='%Y-%m-%d %H:%M:%S',
+                            errors='coerce'
+                        )
+                    except:
+                        self.data['datetime'] = self.data['Date']
+                else:
+                    # For daily+ timeframes, just use date without time
+                    self.data['datetime'] = self.data['Date'].dt.normalize()  # Remove time component
+                
+                self.date_column = 'datetime'
+            else:
+                k2_logger.error("No valid dates found in Date column", "CHART")
+                self.date_column = None
+        
+        # Resample if needed (only 1D remains for daily+; no weekly/monthly/yearly)
+        if self.current_timeframe not in INTRADAY_TIMEFRAMES and self.current_timeframe != '1D':
+            # No resampling paths for removed timeframes
+            pass
+            
+        # Create x values
+        self.clear_all()
+        self.x_values = np.arange(len(self.data), dtype=np.float32)
+        
+    def _resample_data_optimized(self):
+        """Optimized data resampling"""
+        config = TIMEFRAME_CONFIG.get(self.current_timeframe)
+        if not config:
+            return
+            
+        try:
+            # Preserve the last actual trading row in each business period
+            df = self.data.copy()
+            df.set_index('datetime', inplace=True)
+
+            tf = self.current_timeframe
+
+            def last_per(period_alias: str):
+                # Group by business period and keep the last row (preserves the real timestamp)
+                return df.groupby(df.index.to_period(period_alias)).tail(1)
+
+            if tf == '1W':
+                # Weeks anchored to Friday; picks Friday's last trade (or prior day if Friday closed)
+                sampled = last_per('W-FRI')
+            elif tf == '1M':
+                sampled = last_per('M')
+            elif tf == '3M':
+                sampled = last_per('3M')
+            elif tf == '1Y':
+                sampled = last_per('Y')
+            else:
+                # For intraday/1D, keep existing (no period compression here)
+                sampled = df
+
+            self.data = sampled.reset_index()
+
+        except Exception as e:
+            k2_logger.error(f"Resampling failed: {e}", "CHART")
+            self.data = self.original_data.copy()
+            
+    def _display_ohlc_optimized(self):
+        """Optimized OHLC display - FIXED to clear existing lines first"""
+        # Clear any existing lines to prevent duplicates
+        for line in list(self.active_lines.values()):
+            if line.scene():  # Check if item is still in scene
+                self.main_plot.removeItem(line)
+        self.active_lines.clear()
+        
+        # Now add the lines that should be visible
+        for col in ['Open', 'High', 'Low', 'Close']:
+            if col in self.data.columns and col in self.ohlc_buttons:
+                if self.ohlc_buttons[col].isChecked():
+                    self._add_ohlc_line_optimized(col)
+                
+    def _add_ohlc_line_optimized(self, column_name):
+        """Add OHLC line with optimization"""
+        if column_name in self.active_lines:
+            return
+            
+        if column_name not in self.data.columns:
+            return
+            
+        # Get data efficiently
+        y_values = self.data[column_name].values
+        
+        # Ensure numeric type
+        y_values = pd.to_numeric(y_values, errors='coerce')
+        y_values = np.array(y_values, dtype=np.float32)
+        
+        # Clean data - remove inf and clip
+        y_values[np.isinf(y_values)] = np.nan
+        y_values = np.clip(y_values, -1e6, 1e6)
+        
+        # Check for valid data
+        finite_mask = np.isfinite(y_values)
+        if not np.any(finite_mask):
+            return
+        
+        # Create plot item
+        color = OHLC_COLORS.get(column_name, '#ffffff')
+        plot_item = OptimizedPlotDataItem(
+            x=self.x_values[:len(y_values)],
+            y=y_values,
+            pen=pg.mkPen(color=color, width=2),
+            connect='finite'
+        )
+        
+        self.main_plot.addItem(plot_item)
+        self.active_lines[column_name] = plot_item
+        k2_logger.info(f"Added {column_name} line", "CHART")
+        
+    def set_default_view(self):
+        """Set default view with optimization"""
+        if self.data is None or len(self.data) == 0:
+            return
+            
+        config = TIMEFRAME_CONFIG.get(self.current_timeframe, {})
+        points_per_day = config.get('points_per_day', 1)
+        points_for_5_days = int(5 * points_per_day)
+        points_for_5_days = max(20, min(points_for_5_days, len(self.data)))
+        
+        future_points = min(50, int(points_for_5_days * 0.1))  # Smaller future buffer
+        x_max = len(self.data) - 1 + future_points
+        x_min = max(0, len(self.data) - 1 - points_for_5_days)
+        
+        x_min = int(round(x_min))
+        x_max = int(round(x_max))
+        
+        self.main_plot.setXRange(x_min, x_max, padding=0)
+        self._auto_scale_y_range(x_min, min(len(self.data) - 1, x_max))
+        
+        # Store default range
+        self.last_5_days_range = ((x_min, x_max), self.main_plot.getViewBox().viewRange()[1])
+        
+    def _auto_scale_y_range(self, x_min, x_max):
+        """Auto-scale Y range with numpy optimization"""
+        if self.data is None or len(self.data) == 0:
+            return
+            
+        x_min = int(max(0, x_min))
+        x_max = int(min(len(self.data) - 1, x_max))
+        
+        if x_min >= len(self.data) or x_min > x_max:
+            return
+            
+        # Get visible data slice
+        visible_data = self.data.iloc[x_min:x_max + 1]
+        active_cols = [col for col in ['Open', 'High', 'Low', 'Close']
+                      if col in visible_data.columns and col in self.active_lines]
+        
+        if not active_cols:
+            return
+            
+        # Vectorized min/max calculation
+        data_array = visible_data[active_cols].values
+        
+        # Convert to numeric and filter
+        data_array = pd.to_numeric(data_array.flatten(), errors='coerce')
+        data_array = data_array[~np.isnan(data_array)]
+        data_array = data_array[~np.isinf(data_array)]
+        
+        if len(data_array) > 0:
+            y_min = np.min(data_array)
+            y_max = np.max(data_array)
+            
+            padding = (y_max - y_min) * 0.1
+            y_min = max(0, y_min - padding)
+            y_max = y_max + padding
+            
+            self.main_plot.setYRange(y_min, y_max, padding=0)
+            
     def update_crosshair(self, evt):
-        """Update crosshair with discrete X-axis snapping"""
+        """Optimized crosshair update with correct coordinate mapping and date formatting"""
         pos = evt[0]
         if not self.main_plot.sceneBoundingRect().contains(pos):
             return
-
+            
         mousePoint = self.main_plot.getViewBox().mapSceneToView(pos)
-
+        
+        # Snap to discrete X
         x_raw = mousePoint.x()
         x_snapped = int(round(x_raw))
         x_snapped = max(0, min(x_snapped, len(self.data) - 1) if self.data is not None else x_snapped)
-
+        
         self.vLine.setPos(x_snapped)
         self.hLine.setPos(mousePoint.y())
-
+        
+        # Update label with proper date formatting and price from data
         if self.data is not None and self.date_column and len(self.data) > 0:
             if 0 <= x_snapped < len(self.data):
+                # Get date value
                 date_val = self.data.iloc[x_snapped][self.date_column]
-
-                if isinstance(date_val, (pd.Timestamp, np.datetime64, datetime)):
-                    if isinstance(date_val, np.datetime64):
-                        date_val = pd.Timestamp(date_val)
-
-                    if self.current_timeframe in INTRADAY_TIMEFRAMES:
-                        date_str = date_val.strftime('%Y-%m-%d %H:%M')
+                
+                # Format date based on current view range (≤1D shows time)
+                if pd.notna(date_val):
+                    if self._range_is_intraday():
+                        date_str = safe_strftime(date_val, '%m-%d-%Y %H:%M:%S', 'N/A')
                     else:
-                        date_str = date_val.strftime('%Y-%m-%d')
+                        date_str = safe_strftime(date_val, '%m-%d-%Y', 'N/A')
                 else:
-                    date_str = str(date_val)[:16] if pd.notna(date_val) else ""
+                    date_str = "N/A"
+                
+                # Hybrid snap: prefer nearest series (OHLC + indicators) within pixel tolerance,
+                # else snap to nearest grid level, else free-float cursor Y
+                PIX_TOL = 8  # pixels
 
-                if mousePoint.y() < 10:
-                    price_str = f"${mousePoint.y():.3f}"
-                elif mousePoint.y() < 1000:
-                    price_str = f"${mousePoint.y():.2f}"
+                def _y_to_pixel(y_val: float) -> float:
+                    vb_local = self.main_plot.getViewBox()
+                    return vb_local.mapViewToScene(QPointF(0, y_val)).y()
+
+                y_cursor = float(mousePoint.y())
+
+                # Collect candidate series values at current x
+                candidates = []
+                # OHLC series
+                for col in ['Open', 'High', 'Low', 'Close']:
+                    if col in self.data.columns and col in self.active_lines:
+                        val_raw = self.data.iloc[x_snapped][col]
+                        val_num = pd.to_numeric(val_raw, errors='coerce')
+                        if pd.notna(val_num) and np.isfinite(val_num):
+                            candidates.append(float(val_num))
+                # Indicator overlays
+                for item in self.indicator_overlays.values():
+                    try:
+                        x_arr, y_arr = item.getData()
+                        if x_arr is None or y_arr is None or len(x_arr) == 0:
+                            continue
+                        ix = int(np.clip(np.searchsorted(x_arr, x_snapped), 0, len(x_arr) - 1))
+                        yv_raw = y_arr[ix]
+                        yv_num = pd.to_numeric(yv_raw, errors='coerce')
+                        if pd.notna(yv_num) and np.isfinite(yv_num):
+                            candidates.append(float(yv_num))
+                    except Exception:
+                        pass
+
+                snap_series = None
+                if candidates:
+                    y_cursor_px = _y_to_pixel(y_cursor)
+                    best = min(candidates, key=lambda v: abs(_y_to_pixel(v) - y_cursor_px))
+                    if abs(_y_to_pixel(best) - y_cursor_px) <= PIX_TOL:
+                        snap_series = best
+
+                if snap_series is not None:
+                    y_display = snap_series
                 else:
-                    price_str = f"${mousePoint.y():,.2f}"
+                    # Try grid snap
+                    vb_local = self.main_plot.getViewBox()
+                    _, (y_min, y_max) = vb_local.viewRange()
+                    price_range = max(0.01, y_max - max(0, y_min))
+                    interval = self._get_price_interval(price_range)
+                    grid_snap = round(y_cursor / interval) * interval
+                    y_display = grid_snap if abs(_y_to_pixel(grid_snap) - _y_to_pixel(y_cursor)) <= PIX_TOL else y_cursor
 
+                # Set crosshair and label at snapped value (or free-float fallback)
+                self.hLine.setPos(y_display)
+                price_str = f"${y_display:.3f}" if y_display < 10 else (f"${y_display:.2f}" if y_display < 1000 else f"${y_display:,.2f}")
                 self.value_label.setText(f"{date_str}\n{price_str}")
-                self.value_label.setPos(x_snapped, mousePoint.y())
-
+                self.value_label.setPos(x_snapped, y_display)
+            
+    def _emit_viewport_changed(self):
+        """Emit viewport changed signal"""
+        if self.data is None:
+            return
+            
+        vb = self.main_plot.getViewBox()
+        x_min, x_max = vb.viewRange()[0]
+        
+        start_local = int(max(0, round(x_min)))
+        end_local = int(min(len(self.data), round(x_max)))
+        
+        start_global = self._global_start_index + start_local
+        end_global = self._global_start_index + end_local
+        total = self.total_records if self.total_records else len(self.data)
+        
+        self.viewport_changed.emit(start_global, end_global, total)
+        
+    def _check_and_fetch_if_needed(self):
+        """Check if more data needs to be fetched"""
+        if not self.current_table_name or self.is_fetching or self.data is None:
+            return
+            
+        vb = self.main_plot.getViewBox()
+        x_min, _ = vb.viewRange()[0]
+        
+        # Fetch if near edge and more data available
+        NEAR_EDGE_THRESHOLD = 50
+        if int(round(x_min)) <= NEAR_EDGE_THRESHOLD and self._global_start_index > 0:
+            self._fetch_older_data()
+            
+    def _fetch_older_data(self):
+        """Fetch older data with optimization and update viewport limits"""
+        if self.is_fetching:
+            return
+            
+        try:
+            self.is_fetching = True
+            self.data_loading.emit()
+            
+            # Calculate chunk to fetch
+            fetch_size = self._initial_chunk_size
+            older_end = self._global_start_index
+            older_start = max(0, older_end - fetch_size)
+            
+            if stock_service:
+                df = stock_service.get_chart_data_chunk(
+                    self.current_table_name, 
+                    older_start, 
+                    older_end
+                )
+                
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    # Store current view position
+                    vb = self.main_plot.getViewBox()
+                    x_min, x_max = vb.viewRange()[0]
+                    prepend_len = len(df)
+                    
+                    # Update data
+                    self._global_start_index = older_start
+                    self.original_data = pd.concat([df, self.original_data], ignore_index=True)
+                    
+                    # Reprocess
+                    self._process_timeframe_optimized()
+                    
+                    # Update viewport limits with new data
+                    self._update_viewport_limits()
+                    
+                    self._display_ohlc_optimized()
+                    
+                    # Restore view position adjusted for prepend
+                    new_x_min = int(round(x_min + prepend_len))
+                    new_x_max = int(round(x_max + prepend_len))
+                    new_x_min = max(0, min(new_x_min, len(self.data) - 1))
+                    new_x_max = max(0, min(new_x_max, len(self.data)))
+                    vb.setXRange(new_x_min, new_x_max, padding=0)
+                    self.auto_scale_y_for_visible_data()
+                    self._emit_viewport_changed()
+                    
+        except Exception as e:
+            k2_logger.error(f"Failed to fetch older data: {e}", "CHART")
+        finally:
+            self.is_fetching = False
+            self.data_loaded.emit()
+            
+    # Drawing methods (unchanged from original)
     def set_drawing_mode(self, mode):
         """Set drawing mode"""
         if self.drawing_mode == mode:
@@ -1191,14 +1795,15 @@ class ChartWidget(QWidget):
         if self.temp_drawing:
             self.main_plot.removeItem(self.temp_drawing)
             self.temp_drawing = None
-
+            
     def on_mouse_clicked(self, evt):
-        """Handle mouse click"""
+        """Handle mouse click for drawing"""
         if self.drawing_mode is None:
             return
 
         pos = evt.scenePos()
 
+        # Check if click is on axes
         if hasattr(self, 'y_axis'):
             y_axis_rect = QRectF(self.y_axis.pos(),
                                  QPointF(self.y_axis.pos().x() + self.y_axis._width,
@@ -1218,45 +1823,49 @@ class ChartWidget(QWidget):
             mousePoint = vb.mapSceneToView(pos)
 
             if self.drawing_mode in ['horizontal', 'vertical']:
-                self.create_single_click_drawing(mousePoint)
+                self._create_single_click_drawing(mousePoint)
             else:
                 if self.drawing_start_point is None:
                     self.drawing_start_point = mousePoint
-                    self.create_temp_drawing(mousePoint)
+                    self._create_temp_drawing(mousePoint)
                 else:
-                    self.complete_two_click_drawing(mousePoint)
-
+                    self._complete_two_click_drawing(mousePoint)
+                    
     def on_mouse_moved(self, pos):
-        """Handle mouse movement"""
+        """Handle mouse movement for drawing"""
         if self.drawing_mode and self.drawing_start_point and self.temp_drawing:
             if self.main_plot.sceneBoundingRect().contains(pos):
                 vb = self.main_plot.getViewBox()
                 mousePoint = vb.mapSceneToView(pos)
-                self.update_temp_drawing(mousePoint)
-
-    def create_single_click_drawing(self, point):
+                self._update_temp_drawing(mousePoint)
+                
+    def _create_single_click_drawing(self, point):
         """Create single-click drawing"""
+        config = DrawingConfig()
+        
         if self.drawing_mode == 'horizontal':
+            _, _, color = config.horizontal
             line = pg.InfiniteLine(
                 pos=point.y(),
                 angle=0,
-                pen=pg.mkPen('#ffff00', width=2),
+                pen=pg.mkPen(color, width=2),
                 movable=True
             )
             self.main_plot.addItem(line)
             self.drawings.append(('horizontal', line))
 
         elif self.drawing_mode == 'vertical':
+            _, _, color = config.vertical
             line = pg.InfiniteLine(
                 pos=point.x(),
                 angle=90,
-                pen=pg.mkPen('#00ffff', width=2),
+                pen=pg.mkPen(color, width=2),
                 movable=True
             )
             self.main_plot.addItem(line)
             self.drawings.append(('vertical', line))
-
-    def create_temp_drawing(self, start_point):
+            
+    def _create_temp_drawing(self, start_point):
         """Create temporary drawing"""
         if self.drawing_mode in ['trend', 'ray', 'extended']:
             self.temp_drawing = pg.PlotDataItem(
@@ -1265,16 +1874,16 @@ class ChartWidget(QWidget):
                 pen=pg.mkPen('#ffffff', width=1, style=Qt.PenStyle.DashLine)
             )
             self.main_plot.addItem(self.temp_drawing)
-
-    def update_temp_drawing(self, end_point):
+            
+    def _update_temp_drawing(self, end_point):
         """Update temporary drawing"""
         if self.temp_drawing and self.drawing_start_point:
             self.temp_drawing.setData(
                 [self.drawing_start_point.x(), end_point.x()],
                 [self.drawing_start_point.y(), end_point.y()]
             )
-
-    def complete_two_click_drawing(self, end_point):
+            
+    def _complete_two_click_drawing(self, end_point):
         """Complete two-click drawing"""
         if self.temp_drawing:
             self.main_plot.removeItem(self.temp_drawing)
@@ -1296,7 +1905,6 @@ class ChartWidget(QWidget):
             _, _, color = config.ray
             dx = end_point.x() - self.drawing_start_point.x()
             dy = end_point.y() - self.drawing_start_point.y()
-
             extend_factor = 100
             extended_x = self.drawing_start_point.x() + dx * extend_factor
             extended_y = self.drawing_start_point.y() + dy * extend_factor
@@ -1313,7 +1921,6 @@ class ChartWidget(QWidget):
             _, _, color = config.extended
             dx = end_point.x() - self.drawing_start_point.x()
             dy = end_point.y() - self.drawing_start_point.y()
-
             extend_factor = 100
             x1 = self.drawing_start_point.x() - dx * extend_factor
             y1 = self.drawing_start_point.y() - dy * extend_factor
@@ -1329,131 +1936,110 @@ class ChartWidget(QWidget):
             self.drawings.append(('extended', line))
 
         self.drawing_start_point = None
-
+        
     def clear_all_drawings(self):
         """Clear all drawings"""
         for drawing_type, item in self.drawings:
             self.main_plot.removeItem(item)
         self.drawings.clear()
         k2_logger.info("Cleared all drawings", "CHART")
+        
+    # OHLC and UI methods
+    def toggle_ohlc_line(self, column_name, visible=None):
+        """Toggle OHLC line visibility"""
+        if visible is None:
+            visible = self.ohlc_buttons[column_name].isChecked()
+            
+        if visible and column_name not in self.active_lines:
+            self._add_ohlc_line_optimized(column_name)
+        elif not visible and column_name in self.active_lines:
+            item = self.active_lines.pop(column_name)
+            self.main_plot.removeItem(item)
+            
+    def change_timeframe(self, timeframe):
+        """Change timeframe with optimization and boundary updates"""
+        if self.current_timeframe == timeframe:
+            return
+            
+        self.current_timeframe = timeframe
+        self.timeframe_changed.emit(timeframe)
+        
+        if self.original_data is not None:
+            self._process_timeframe_optimized()
+            self._update_viewport_limits()  # Update boundaries for new timeframe
+            self._display_ohlc_optimized()
+            self._apply_view_range()
+            try:
+                allowed = [vr.value for vr in self._compute_allowed_view_ranges()]
+                self.allowed_view_ranges_changed.emit(allowed)
+            except Exception:
+                pass
+            
+            self.update_axis_geometry()
+            QTimer.singleShot(0, self.update_axis_labels_and_grid)
+            
+            k2_logger.info(f"Timeframe changed to {timeframe}", "CHART")
+            
+    # Navigation methods with proper boundaries
+    def pan_left(self, points: int = 200):
+        """Pan left with boundary constraints"""
+        if self.data is None:
+            return
+        vb = self.main_plot.getViewBox()
+        x_min, x_max = vb.viewRange()[0]
+        x_width = x_max - x_min
+        
+        # Enforce left boundary - can't go below 0
+        new_x_min = max(0, int(round(x_min - points)))
+        new_x_max = int(round(new_x_min + x_width))
+        
+        # Ensure we have valid range
+        if new_x_max - new_x_min < 10:  # Minimum 10 points visible
+            return
+            
+        vb.setXRange(new_x_min, new_x_max, padding=0)
+        self.auto_scale_y_for_visible_data()
+        if self.current_table_name:
+            self.viewport_update_timer.start()
+        self._emit_viewport_changed()
+        
+    def pan_right(self, points: int = 200):
+        """Pan right with boundary constraints"""
+        if self.data is None:
+            return
 
-    def clear_all(self):
-        """Clear all lines and indicators"""
-        for line in self.active_lines.values():
-            self.main_plot.removeItem(line)
-        self.active_lines.clear()
+        vb = self.main_plot.getViewBox()
+        x_min, x_max = vb.viewRange()[0]
+        x_width = x_max - x_min
 
-        for overlay in self.indicator_overlays.values():
-            self.main_plot.removeItem(overlay)
-        self.indicator_overlays.clear()
-
-        for indicator_name in list(self.indicator_panes.keys()):
-            self.remove_indicator_pane(indicator_name)
-
-    def add_indicator(self, indicator_name, indicator_data, color='#ffff00'):
-        """Add indicator overlay"""
-        if indicator_name in self.indicator_overlays:
-            self.remove_indicator(indicator_name)
-
-        if self.x_values is None:
-            self.x_values = np.arange(len(indicator_data), dtype=np.float64)
-
-        y_values = indicator_data.values.astype(np.float64) if isinstance(indicator_data, pd.Series) else np.array(indicator_data, dtype=np.float64)
-
-        y_values = np.clip(y_values, -1e6, 1e6)
-        y_values[np.isinf(y_values)] = np.nan
-
-        plot_item = pg.PlotDataItem(
-            x=self.x_values[:len(y_values)],
-            y=y_values,
-            pen=pg.mkPen(color=color, width=2, style=Qt.PenStyle.DashLine),
-            connect='finite'
-        )
-        plot_item.curve.setBrush(None)
-        plot_item.curve.setFillLevel(None)
-
-        self.main_plot.addItem(plot_item)
-        self.indicator_overlays[indicator_name] = plot_item
-        k2_logger.info(f"Added indicator overlay: {indicator_name}", "CHART")
-
-    def remove_indicator(self, indicator_name):
-        """Remove indicator"""
-        if indicator_name in self.indicator_overlays:
-            self.main_plot.removeItem(self.indicator_overlays[indicator_name])
-            del self.indicator_overlays[indicator_name]
-            k2_logger.info(f"Removed indicator: {indicator_name}", "CHART")
-
-    def add_indicator_pane(self, indicator_name, data, chart_type='line'):
-        """Add indicator pane"""
-        if indicator_name in self.indicator_panes:
-            self.remove_indicator_pane(indicator_name)
-
-        indicator_plot = pg.PlotWidget()
-        indicator_plot.setMaximumHeight(150)
-        indicator_plot.showGrid(x=True, y=True, alpha=0.3)
-        indicator_plot.setLabel('left', indicator_name)
-        indicator_plot.setBackground('#0a0a0a')
-
-        indicator_plot.getAxis('left').setPen(pg.mkPen(color='#666'))
-        indicator_plot.getAxis('left').setTextPen(pg.mkPen(color='#999'))
-        indicator_plot.getAxis('bottom').setPen(pg.mkPen(color='#666'))
-        indicator_plot.getAxis('bottom').setTextPen(pg.mkPen(color='#999'))
-
-        indicator_plot.setXLink(self.main_plot)
-
-        y_values = data.values.astype(np.float64) if isinstance(data, pd.Series) else np.array(data, dtype=np.float64)
-        y_values = np.clip(y_values, -1e6, 1e6)
-        y_values[np.isinf(y_values)] = np.nan
-
-        if chart_type == 'line':
-            plot_item = pg.PlotDataItem(
-                x=self.x_values[:len(y_values)],
-                y=y_values,
-                pen=pg.mkPen(color='#4a4', width=2),
-                connect='finite'
-            )
-            plot_item.curve.setBrush(None)
-            plot_item.curve.setFillLevel(None)
-            indicator_plot.addItem(plot_item)
-
-        elif chart_type == 'bar':
-            bargraph = pg.BarGraphItem(
-                x=self.x_values[:len(y_values)],
-                height=y_values,
-                width=0.8,
-                brush='#4a4'
-            )
-            indicator_plot.addItem(bargraph)
-
-        self.indicator_container.addWidget(indicator_plot)
-        self.indicator_panes[indicator_name] = indicator_plot
-
-        k2_logger.info(f"Added indicator pane: {indicator_name}", "CHART")
-
-    def remove_indicator_pane(self, indicator_name):
-        """Remove indicator pane"""
-        if indicator_name in self.indicator_panes:
-            widget = self.indicator_panes[indicator_name]
-            self.indicator_container.removeWidget(widget)
-            widget.deleteLater()
-            del self.indicator_panes[indicator_name]
-            k2_logger.info(f"Removed indicator pane: {indicator_name}", "CHART")
-
-    def reset_zoom(self):
-        """Reset zoom"""
-        if self.last_5_days_range:
-            x_range, y_range = self.last_5_days_range
-            self.main_plot.setXRange(x_range[0], x_range[1], padding=0)
-            self.main_plot.setYRange(y_range[0], y_range[1], padding=0)
-        else:
-            self.set_default_view()
-
-    def auto_range(self):
-        """Auto-range all plots"""
-        self.set_default_view()
-        for plot in self.indicator_panes.values():
-            plot.autoRange()
-
+        max_points = len(self.data)
+        # Allow small buffer past end
+        buffer = min(50, int(x_width * 0.1))
+        
+        new_x_min = int(round(min(max_points - x_width + buffer, x_min + points)))
+        new_x_max = int(round(new_x_min + x_width))
+        
+        # Ensure we don't exceed reasonable limits
+        new_x_max = min(new_x_max, max_points + buffer)
+        
+        vb.setXRange(new_x_min, new_x_max, padding=0)
+        self.auto_scale_y_for_visible_data()
+        self._emit_viewport_changed()
+        
+    def jump_to_end(self):
+        """Jump to latest data"""
+        if self.data is None:
+            return
+        config = TIMEFRAME_CONFIG.get(self.current_timeframe, {})
+        points_per_day = config.get('points_per_day', 1)
+        points_for_5_days = int(5 * points_per_day)
+        points_for_5_days = max(20, min(points_for_5_days, len(self.data)))
+        x_max = len(self.data) - 1 + min(50, int(points_for_5_days * 0.1))
+        x_min = max(0, len(self.data) - 1 - points_for_5_days)
+        self.main_plot.setXRange(int(round(x_min)), int(round(x_max)), padding=0)
+        self._auto_scale_y_range(x_min, min(len(self.data) - 1, x_max))
+        self._emit_viewport_changed()
+        
     def auto_scale_y_for_visible_data(self):
         """Auto-scale Y for visible data"""
         if self.data is None or len(self.data) == 0:
@@ -1465,7 +2051,194 @@ class ChartWidget(QWidget):
 
         if x_min < len(self.data) and x_max < len(self.data) and x_min <= x_max:
             self._auto_scale_y_range(x_min, x_max)
+            
+    def reset_zoom(self):
+        """Reset zoom"""
+        if self.last_5_days_range:
+            x_range, y_range = self.last_5_days_range
+            self.main_plot.setXRange(x_range[0], x_range[1], padding=0)
+            self.main_plot.setYRange(y_range[0], y_range[1], padding=0)
+        else:
+            self.set_default_view()
+            
+    def zoom(self, factor):
+        """Zoom in/out by factor with boundary constraints"""
+        if self.data is None or len(self.data) == 0:
+            return
+            
+        vb = self.main_plot.getViewBox()
+        x_range, y_range = vb.viewRange()
+        
+        # Calculate center points
+        x_center = (x_range[0] + x_range[1]) / 2
+        y_center = (y_range[0] + y_range[1]) / 2
+        
+        # Calculate new ranges
+        x_width = (x_range[1] - x_range[0]) / factor
+        y_height = (y_range[1] - y_range[0]) / factor
+        
+        # Apply zoom
+        new_x_min = int(round(x_center - x_width / 2))
+        new_x_max = int(round(x_center + x_width / 2))
+        
+        # Enforce X boundaries
+        new_x_min = max(0, new_x_min)  # Can't go before first data point
+        buffer = min(50, int(x_width * 0.1))  # Small buffer
+        new_x_max = min(len(self.data) + buffer, new_x_max)
+        
+        # Minimum 10 points visible
+        if new_x_max - new_x_min < 10:
+            return
+        
+        # Calculate Y range with boundaries
+        new_y_min = y_center - y_height / 2
+        new_y_max = y_center + y_height / 2
+        
+        # Enforce Y boundaries - prices can't be negative
+        new_y_min = max(0, new_y_min)
+        new_y_max = max(new_y_min + 0.01, new_y_max)  # Ensure some range
+            
+        self.main_plot.setXRange(new_x_min, new_x_max, padding=0)
+        self.main_plot.setYRange(new_y_min, new_y_max, padding=0)
+        self._emit_viewport_changed()
+            
+    # View Range API
+    def set_view_range(self, view_range_key: str):
+        """Set the visible time duration window without changing aggregation."""
+        try:
+            vr = ViewRange(view_range_key) if not isinstance(view_range_key, ViewRange) else view_range_key
+        except Exception:
+            vr = ViewRange.D5
+        self.current_view_range = vr
+        self._apply_view_range()
+        self.view_range_changed.emit(vr.value)
 
+    def _apply_view_range(self):
+        """Apply the current view range to the viewport, enforcing min points."""
+        if self.data is None or len(self.data) == 0 or not self.date_column:
+            return
+
+        dt_series = self._get_datetime_series()
+        if dt_series is None or dt_series.empty:
+            return
+
+        end_dt = dt_series.iloc[-1]
+        start_dt = self._compute_start_datetime(end_dt, self.current_view_range, dt_series)
+
+        # Map datetimes to indices
+        try:
+            start_idx = int(dt_series.searchsorted(start_dt, side='left'))
+        except Exception:
+            start_idx = max(0, len(dt_series) - 200)
+        end_idx = len(dt_series) - 1
+
+        # Enforce minimum visible points
+        visible = end_idx - start_idx + 1
+        if visible < self.min_visible_points:
+            start_idx = max(0, end_idx - (self.min_visible_points - 1))
+
+        buffer = min(50, max(5, visible // 10))
+        self.main_plot.setXRange(start_idx, end_idx + buffer, padding=0)
+        self._auto_scale_y_range(start_idx, end_idx)
+
+    def _get_datetime_series(self):
+        try:
+            s = pd.to_datetime(self.data[self.date_column], errors='coerce')
+            return s.dropna()
+        except Exception:
+            return None
+
+    def _compute_start_datetime(self, end_dt, view_range: 'ViewRange', dt_series: pd.Series):
+        cfg = VIEW_RANGE_CONFIG.get(view_range, {"kind": "timedelta", "days": 5})
+        kind = cfg.get("kind")
+
+        if kind == "timedelta":
+            delta = timedelta(
+                minutes=cfg.get("minutes", 0),
+                hours=cfg.get("hours", 0),
+                days=cfg.get("days", 0)
+            )
+            return end_dt - delta
+
+        if kind == "months":
+            months = cfg.get("months", 1)
+            year = end_dt.year + (end_dt.month - months - 1) // 12
+            month = (end_dt.month - months - 1) % 12 + 1
+            day = min(getattr(end_dt, 'day', 1), 28)
+            try:
+                return end_dt.replace(year=year, month=month, day=day)
+            except Exception:
+                return end_dt - timedelta(days=30 * months)
+
+        if kind == "years":
+            years = cfg.get("years", 1)
+            try:
+                return end_dt.replace(year=end_dt.year - years)
+            except Exception:
+                return end_dt - timedelta(days=365 * years)
+
+        if kind == "ytd":
+            return end_dt.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+
+        if kind == "all":
+            return dt_series.iloc[0]
+
+        return end_dt - timedelta(days=5)
+
+    def _range_is_intraday(self) -> bool:
+        """Return True when the selected view range is ≤ 1D."""
+        return self.current_view_range in {ViewRange.M15, ViewRange.M30, ViewRange.H1, ViewRange.H4, ViewRange.D1}
+
+    def _get_timeframe_interval_minutes(self, timeframe: str) -> int:
+        cfg = TIMEFRAME_CONFIG.get(timeframe or self.current_timeframe)
+        return int(cfg.get('interval_minutes', 1440)) if cfg else 1440
+
+    def _get_view_range_duration_minutes(self, view_range: 'ViewRange', dt_series: pd.Series) -> int:
+        cfg = VIEW_RANGE_CONFIG.get(view_range, {"kind": "timedelta", "days": 5})
+        kind = cfg.get("kind")
+        if kind == "timedelta":
+            minutes = cfg.get("minutes", 0) + 60 * cfg.get("hours", 0) + 1440 * cfg.get("days", 0)
+            return int(minutes)
+        if kind == "months":
+            return int(30 * 1440 * cfg.get("months", 1))
+        if kind == "years":
+            return int(365 * 1440 * cfg.get("years", 1))
+        if kind == "ytd":
+            if dt_series is not None and not dt_series.empty:
+                end_dt = dt_series.iloc[-1]
+                start_year = end_dt.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+                delta = end_dt - start_year
+                return int(delta.total_seconds() // 60)
+            return 365 * 1440
+        if kind == "all":
+            if dt_series is not None and not dt_series.empty:
+                delta = dt_series.iloc[-1] - dt_series.iloc[0]
+                return max(1, int(delta.total_seconds() // 60))
+            return 365 * 1440
+        return 5 * 1440
+
+    def _compute_allowed_view_ranges(self) -> list:
+        if self.data is None or not self.date_column:
+            return [vr for vr in ViewRange]
+        dt_series = self._get_datetime_series()
+        if dt_series is None or dt_series.empty:
+            return [vr for vr in ViewRange]
+        interval = self._get_timeframe_interval_minutes(self.current_timeframe)
+        dmin = 10 * interval
+        allowed = []
+        for vr in ViewRange:
+            dur = self._get_view_range_duration_minutes(vr, dt_series)
+            if dur >= dmin or vr == ViewRange.ALL:
+                allowed.append(vr)
+        return allowed
+
+    def auto_range(self):
+        """Auto-range all plots"""
+        self.set_default_view()
+        for plot in self.indicator_panes.values():
+            plot.autoRange()
+            
+    # Event filter for axis dragging
     def eventFilter(self, source, event):
         """Event filter for axis interactions"""
         if not hasattr(self, 'y_axis') or not hasattr(self, 'x_axis'):
@@ -1504,8 +2277,12 @@ class ChartWidget(QWidget):
 
                     y_range = np.clip(y_range, 0.01, 1e6)
 
-                    new_y_min = max(0, y_center - y_range / 2)
+                    new_y_min = y_center - y_range / 2
                     new_y_max = y_center + y_range / 2
+                    
+                    # Enforce Y boundaries - prices can't be negative
+                    new_y_min = max(0, new_y_min)
+                    new_y_max = max(new_y_min + 0.01, new_y_max)  # Ensure some range
 
                     self.main_plot.setYRange(new_y_min, new_y_max, padding=0)
 
@@ -1519,16 +2296,26 @@ class ChartWidget(QWidget):
                     x_range = (x_max - x_min) * scale_factor
 
                     min_points = 10
-                    max_points = len(self.data) * 1.5 if self.data is not None else 1000
+                    max_points = len(self.data) if self.data is not None else 1000
 
-                    x_range = np.clip(x_range, min_points, min(max_points, 1e6))
+                    x_range = np.clip(x_range, min_points, max_points * 1.2)
 
                     new_x_min = int(round(x_center - x_range / 2))
                     new_x_max = int(round(x_center + x_range / 2))
 
-                    if new_x_min < 0:
-                        new_x_min = 0
+                    # Enforce boundaries
+                    new_x_min = max(0, new_x_min)  # Can't go before first data point
+                    
+                    # Allow small buffer past end
+                    if self.data is not None:
+                        buffer = min(50, int((new_x_max - new_x_min) * 0.1))
+                        new_x_max = min(len(self.data) + buffer, new_x_max)
+                    
+                    # Adjust if we hit boundaries
+                    if new_x_min == 0 and new_x_max > x_range:
                         new_x_max = int(x_range)
+                    elif self.data is not None and new_x_max >= len(self.data):
+                        new_x_min = max(0, new_x_max - int(x_range))
 
                     self.main_plot.setXRange(new_x_min, new_x_max, padding=0)
 
@@ -1585,48 +2372,173 @@ class ChartWidget(QWidget):
                     return True
 
         return super().eventFilter(source, event)
-
+        
     def setup_chart_style(self):
         """Setup chart style"""
         if hasattr(self, 'main_plot'):
             self.main_plot.getViewBox().setBackgroundColor('#0a0a0a')
+            
+    def clear_all(self):
+        """Clear all chart elements efficiently"""
+        # Remove plot items
+        for line in self.active_lines.values():
+            if line.scene():  # Check if still in scene
+                self.main_plot.removeItem(line)
+        self.active_lines.clear()
+        
+        # Remove overlays
+        for overlay in self.indicator_overlays.values():
+            if overlay.scene():
+                self.main_plot.removeItem(overlay)
+        self.indicator_overlays.clear()
+        
+        # Remove indicator panes
+        for indicator_name in list(self.indicator_panes.keys()):
+            self.remove_indicator_pane(indicator_name)
+        
+        # Clear caches
+        self._format_cache.clear()
+        self._label_cache.clear()
+        self._viewport_cache = None
+        if hasattr(self, '_method_cache'):
+            self._method_cache.clear()
+            
+    def add_indicator(self, indicator_name, indicator_data, color='#ffff00'):
+        """Add indicator overlay"""
+        if indicator_name in self.indicator_overlays:
+            self.remove_indicator(indicator_name)
 
+        if self.x_values is None:
+            self.x_values = np.arange(len(indicator_data), dtype=np.float32)
+
+        y_values = indicator_data.values.astype(np.float32) if isinstance(indicator_data, pd.Series) else np.array(indicator_data, dtype=np.float32)
+
+        y_values = np.clip(y_values, -1e6, 1e6)
+        y_values[np.isinf(y_values)] = np.nan
+
+        plot_item = OptimizedPlotDataItem(
+            x=self.x_values[:len(y_values)],
+            y=y_values,
+            pen=pg.mkPen(color=color, width=2, style=Qt.PenStyle.DashLine),
+            connect='finite'
+        )
+
+        self.main_plot.addItem(plot_item)
+        self.indicator_overlays[indicator_name] = plot_item
+        k2_logger.info(f"Added indicator overlay: {indicator_name}", "CHART")
+
+    def remove_indicator(self, indicator_name):
+        """Remove indicator"""
+        if indicator_name in self.indicator_overlays:
+            self.main_plot.removeItem(self.indicator_overlays[indicator_name])
+            del self.indicator_overlays[indicator_name]
+            k2_logger.info(f"Removed indicator: {indicator_name}", "CHART")
+            
+    def add_indicator_pane(self, indicator_name, data, chart_type='line'):
+        """Add indicator pane"""
+        if indicator_name in self.indicator_panes:
+            self.remove_indicator_pane(indicator_name)
+
+        indicator_plot = pg.PlotWidget()
+        indicator_plot.setMaximumHeight(150)
+        indicator_plot.showGrid(x=True, y=True, alpha=0.3)
+        indicator_plot.setLabel('left', indicator_name)
+        indicator_plot.setBackground('#0a0a0a')
+
+        indicator_plot.getAxis('left').setPen(pg.mkPen(color='#666'))
+        indicator_plot.getAxis('left').setTextPen(pg.mkPen(color='#999'))
+        indicator_plot.getAxis('bottom').setPen(pg.mkPen(color='#666'))
+        indicator_plot.getAxis('bottom').setTextPen(pg.mkPen(color='#999'))
+
+        indicator_plot.setXLink(self.main_plot)
+
+        y_values = data.values.astype(np.float32) if isinstance(data, pd.Series) else np.array(data, dtype=np.float32)
+        y_values = np.clip(y_values, -1e6, 1e6)
+        y_values[np.isinf(y_values)] = np.nan
+
+        if chart_type == 'line':
+            plot_item = OptimizedPlotDataItem(
+                x=self.x_values[:len(y_values)],
+                y=y_values,
+                pen=pg.mkPen(color='#4a4', width=2),
+                connect='finite'
+            )
+            indicator_plot.addItem(plot_item)
+
+        elif chart_type == 'bar':
+            bargraph = pg.BarGraphItem(
+                x=self.x_values[:len(y_values)],
+                height=y_values,
+                width=0.8,
+                brush='#4a4'
+            )
+            indicator_plot.addItem(bargraph)
+
+        self.indicator_container.addWidget(indicator_plot)
+        self.indicator_panes[indicator_name] = indicator_plot
+
+        k2_logger.info(f"Added indicator pane: {indicator_name}", "CHART")
+        
+    def remove_indicator_pane(self, indicator_name):
+        """Remove indicator pane"""
+        if indicator_name in self.indicator_panes:
+            widget = self.indicator_panes[indicator_name]
+            self.indicator_container.removeWidget(widget)
+            widget.deleteLater()
+            del self.indicator_panes[indicator_name]
+            k2_logger.info(f"Removed indicator pane: {indicator_name}", "CHART")
+        
     def cleanup(self):
         """Cleanup resources"""
-        if hasattr(self, 'axis_update_timer'):
-            self.axis_update_timer.stop()
-        if hasattr(self, 'range_update_timer'):
-            self.range_update_timer.stop()
-
+        # Stop timers
+        for timer_name in ['axis_update_timer', 'range_update_timer', 'viewport_update_timer']:
+            if hasattr(self, timer_name):
+                timer = getattr(self, timer_name)
+                timer.stop()
+                
+        # Stop debounce timers
+        if hasattr(self, '_debounce_timers'):
+            for timer in self._debounce_timers.values():
+                timer.stop()
+            self._debounce_timers.clear()
+                
+        # Clear data
         self.clear_all()
         self.clear_all_drawings()
-
+        
+        # Clear references
+        self.data = None
+        self.original_data = None
+        
+        # Clear grid pool
+        for line in self._grid_pool['v']:
+            if line.scene():
+                self.main_plot.removeItem(line)
+        for line in self._grid_pool['h']:
+            if line.scene():
+                self.main_plot.removeItem(line)
+        self._grid_pool['v'].clear()
+        self._grid_pool['h'].clear()
+        
+        # Remove axes
+        for attr in ['y_axis', 'x_axis']:
+            if hasattr(self, attr):
+                item = getattr(self, attr)
+                if item and item.scene():
+                    item.scene().removeItem(item)
+                setattr(self, attr, None)
+        
+        # Remove crosshair
+        for attr in ['vLine', 'hLine', 'value_label']:
+            if hasattr(self, attr):
+                item = getattr(self, attr)
+                if item and item.scene():
+                    self.main_plot.removeItem(item)
+                setattr(self, attr, None)
+        
+        # Clear proxy
         if hasattr(self, 'proxy'):
             self.proxy = None
-
-        for attr in ['vLine', 'hLine', 'value_label']:
-            item = getattr(self, attr, None)
-            if item and item.scene():
-                self.main_plot.removeItem(item)
-            setattr(self, attr, None)
-
-        for attr in ['y_axis', 'x_axis']:
-            item = getattr(self, attr, None)
-            if item and item.scene():
-                item.scene().removeItem(item)
-            setattr(self, attr, None)
-
-        for line in self.v_grid_lines:
-            if line.scene():
-                self.main_plot.removeItem(line)
-        for line in self.h_grid_lines:
-            if line.scene():
-                self.main_plot.removeItem(line)
-        self.v_grid_lines.clear()
-        self.h_grid_lines.clear()
-
-        self._label_cache.clear()
-        self._data_cache.clear()
-        self._grid_cache.clear()
-
+        
+        # Force garbage collection
         gc.collect()

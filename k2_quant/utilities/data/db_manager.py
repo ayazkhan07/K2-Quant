@@ -1,7 +1,7 @@
 """PostgreSQL Database Manager (relocated)"""
 
 import os
-from datetime import datetime
+from datetime import datetime, time
 from typing import List, Dict, Optional, Tuple, Generator
 import psycopg2
 from psycopg2.extras import execute_values, RealDictCursor
@@ -105,13 +105,16 @@ class DatabaseManager:
         return market_dt.replace(tzinfo=None)
 
     @log_performance
-    def bulk_insert_stock_data(self, table_name: str, data: List[Dict]) -> int:
+    def bulk_insert_stock_data(self, table_name: str, data: List[Dict], market_hours_only: bool = False) -> int:
         records = []
         for item in data:
             if 'timestamp' in item:
                 market_datetime = self.convert_to_market_time(item['timestamp'])
                 market_date = market_datetime.date()
                 market_time = market_datetime.time()
+                # Filter at write time if requested
+                if market_hours_only and not (time(9, 30) <= market_time < time(16, 0)):
+                    continue
                 records.append((
                     item['timestamp'],
                     market_datetime,
@@ -129,6 +132,9 @@ class DatabaseManager:
                 market_datetime = self.convert_to_market_time(item['t'])
                 market_date = market_datetime.date()
                 market_time = market_datetime.time()
+                # Filter at write time if requested
+                if market_hours_only and not (time(9, 30) <= market_time < time(16, 0)):
+                    continue
                 records.append((
                     item['t'],
                     market_datetime,
@@ -205,9 +211,9 @@ class DatabaseManager:
                 conn.autocommit = False
 
     @log_performance
-    def store_stock_data(self, symbol: str, timespan: str, range_val: str, data: List[Dict]) -> str:
+    def store_stock_data(self, symbol: str, timespan: str, range_val: str, data: List[Dict], market_hours_only: bool = False) -> str:
         table_name = self.create_stock_table(symbol, timespan, range_val)
-        self.bulk_insert_stock_data(table_name, data)
+        self.bulk_insert_stock_data(table_name, data, market_hours_only=market_hours_only)
         self.convert_to_logged_table(table_name)
         self.create_indexes(table_name)
         return table_name

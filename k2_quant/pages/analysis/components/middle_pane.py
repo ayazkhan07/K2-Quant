@@ -59,14 +59,15 @@ class MiddlePaneWidget(QFrame):
         layout.setSpacing(0)
         self.setLayout(layout)
         
-        # Create empty state placeholder
+        # Create empty state placeholder (do not add to final layout to avoid occupying space)
         self.empty_placeholder = QLabel("Select a model to view data")
         self.empty_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.empty_placeholder.setObjectName("emptyPlaceholder")
+        self.empty_placeholder.hide()
         layout.addWidget(self.empty_placeholder)
     
     def create_controls_bar(self) -> QWidget:
-        """Create top controls bar"""
+        """Create top controls bar with simplified navigation"""
         controls = QWidget()
         controls.setFixedHeight(40)
         controls.setObjectName("chartControls")
@@ -82,6 +83,16 @@ class MiddlePaneWidget(QFrame):
         self.view_selector.setCurrentText("Both")
         self.view_selector.currentTextChanged.connect(self.change_view)
         layout.addWidget(self.view_selector)
+
+        # View Range control
+        layout.addWidget(QLabel("RANGE:"))
+        self.view_range_combo = QComboBox()
+        self.view_range_combo.addItems(["15m", "30m", "1h", "4h", "1D", "5D", "1M", "3M", "YTD", "1Y", "All"])
+        self.view_range_combo.setCurrentText("5D")
+        self.view_range_combo.currentTextChanged.connect(
+            lambda key: (self.chart_widget.set_view_range(key) if self.chart_widget else None)
+        )
+        layout.addWidget(self.view_range_combo)
         
         # Viewport/status label
         self.status_label = QLabel("")
@@ -90,34 +101,9 @@ class MiddlePaneWidget(QFrame):
         
         layout.addStretch()
         
-        # Navigation controls
-        prev_btn = QPushButton("◀")
-        prev_btn.setFixedSize(30, 30)
-        prev_btn.setToolTip("Previous")
-        prev_btn.clicked.connect(self.navigate_prev)
-        layout.addWidget(prev_btn)
-        
-        next_btn = QPushButton("▶")
-        next_btn.setFixedSize(30, 30)
-        next_btn.setToolTip("Next")
-        next_btn.clicked.connect(self.navigate_next)
-        layout.addWidget(next_btn)
-        
-        layout.addWidget(QLabel(" | "))
-        
-        # Zoom controls
-        zoom_in_btn = QPushButton("+")
-        zoom_in_btn.setFixedSize(30, 30)
-        zoom_in_btn.clicked.connect(lambda: self.chart_widget.zoom(0.8) if self.chart_widget else None)
-        layout.addWidget(zoom_in_btn)
-        
-        zoom_out_btn = QPushButton("−")
-        zoom_out_btn.setFixedSize(30, 30)
-        zoom_out_btn.clicked.connect(lambda: self.chart_widget.zoom(1.25) if self.chart_widget else None)
-        layout.addWidget(zoom_out_btn)
-        
+        # Only keep the working Reset and End buttons
         reset_btn = QPushButton("Reset")
-        reset_btn.setToolTip("Reset view")
+        reset_btn.setToolTip("Reset view to last 5 days")
         reset_btn.clicked.connect(lambda: self.chart_widget.reset_zoom() if self.chart_widget else None)
         layout.addWidget(reset_btn)
         
@@ -130,14 +116,12 @@ class MiddlePaneWidget(QFrame):
     
     def create_data_interface(self):
         """Create the chart and table interface (called when data is first loaded)"""
-        # Remove placeholder
-        if self.empty_placeholder:
-            self.empty_placeholder.setParent(None)
-            self.empty_placeholder.deleteLater()
-            self.empty_placeholder = None
-        
         # Get main layout
         layout = self.layout()
+        
+        # Hide placeholder if present
+        if self.empty_placeholder and self.empty_placeholder.isVisible():
+            self.empty_placeholder.hide()
         
         # Controls bar
         if not self.controls_bar:
@@ -166,6 +150,8 @@ class MiddlePaneWidget(QFrame):
             self.chart_widget.data_loading.connect(self.on_data_loading)
             self.chart_widget.data_loaded.connect(self.on_data_loaded)
             self.chart_widget.viewport_changed.connect(self.on_viewport_changed)
+            self.chart_widget.timeframe_changed.connect(lambda tf: self.update_view_range_combo())
+            self.chart_widget.allowed_view_ranges_changed.connect(self._apply_allowed_view_ranges)
             
             self.splitter.addWidget(self.chart_widget)
             
@@ -179,6 +165,7 @@ class MiddlePaneWidget(QFrame):
             self.splitter.setSizes([360, 240])
             
             layout.addWidget(self.splitter)
+            self.update_view_range_combo()
     
     def change_view(self, view_type: str):
         """Change the middle pane view"""
@@ -218,7 +205,12 @@ class MiddlePaneWidget(QFrame):
             k2_logger.error("Invalid data format", "MIDDLE_PANE")
             return
         
-        # Create UI
+        # Ensure the empty placeholder is hidden before (re)using the interface
+        layout = self.layout()
+        if self.empty_placeholder and self.empty_placeholder.isVisible():
+            self.empty_placeholder.hide()
+
+        # Create UI if first time
         if not self.chart_widget:
             self.create_data_interface()
         
@@ -303,21 +295,14 @@ class MiddlePaneWidget(QFrame):
                 del self.active_indicators[indicator_name]
             k2_logger.info(f"Removed indicator: {indicator_name}", "MIDDLE_PANE")
     
-    # Navigation helpers
-    def navigate_prev(self):
-        if self.chart_widget:
-            self.chart_widget.pan_left()
-    
-    def navigate_next(self):
-        if self.chart_widget:
-            self.chart_widget.pan_right()
-    
     def jump_to_end(self):
+        """Jump to the latest data in the chart"""
         if self.chart_widget:
             self.chart_widget.jump_to_end()
     
     # Chart signal handlers
     def on_viewport_changed(self, start_idx: int, end_idx: int, total: int):
+        """Update status label when viewport changes"""
         if self.status_label and total > 0:
             shown = max(0, end_idx - start_idx)
             percent = (shown / total) * 100 if total else 0
@@ -326,13 +311,43 @@ class MiddlePaneWidget(QFrame):
             )
     
     def on_data_loading(self):
+        """Show loading bar when data is loading"""
         if self.loading_bar:
             self.loading_bar.show()
             self.loading_bar.setRange(0, 0)
     
     def on_data_loaded(self):
+        """Hide loading bar when data is loaded"""
         if self.loading_bar:
             self.loading_bar.hide()
+        # Re-apply allowed ranges after (re)load
+        self.update_view_range_combo()
+
+    def update_view_range_combo(self):
+        """Refresh enabled/disabled state of View Range options based on current aggregation."""
+        if not self.chart_widget or not hasattr(self, 'view_range_combo') or not self.view_range_combo:
+            return
+        try:
+            allowed = [vr.value for vr in self.chart_widget._compute_allowed_view_ranges()]
+            self._apply_allowed_view_ranges(allowed)
+        except Exception:
+            pass
+
+    def _apply_allowed_view_ranges(self, allowed_keys: list):
+        if not hasattr(self, 'view_range_combo') or not self.view_range_combo:
+            return
+        current = self.view_range_combo.currentText()
+        first_allowed = None
+        for i in range(self.view_range_combo.count()):
+            key = self.view_range_combo.itemText(i)
+            is_allowed = key in allowed_keys
+            item = self.view_range_combo.model().item(i)
+            if item is not None:
+                item.setEnabled(is_allowed)
+            if is_allowed and first_allowed is None:
+                first_allowed = key
+        if current not in allowed_keys and first_allowed:
+            self.view_range_combo.setCurrentText(first_allowed)
     
     def apply_quick_indicator(self, indicator_type: str):
         """Apply a quick indicator with default parameters"""
@@ -351,6 +366,9 @@ class MiddlePaneWidget(QFrame):
     
     def clear_data(self):
         """Clear all data and reset to empty state"""
+        # Get layout before clearing widgets
+        layout = self.layout()
+        
         # Clean up chart
         if self.chart_widget:
             self.chart_widget.cleanup()
@@ -367,16 +385,19 @@ class MiddlePaneWidget(QFrame):
         
         # Clean up controls and splitter
         if self.controls_bar:
+            layout.removeWidget(self.controls_bar)  # Remove from layout
             self.controls_bar.setParent(None)
             self.controls_bar.deleteLater()
             self.controls_bar = None
         
         if self.loading_bar:
+            layout.removeWidget(self.loading_bar)  # Remove from layout
             self.loading_bar.setParent(None)
             self.loading_bar.deleteLater()
             self.loading_bar = None
         
         if self.splitter:
+            layout.removeWidget(self.splitter)  # Remove from layout
             self.splitter.setParent(None)
             self.splitter.deleteLater()
             self.splitter = None
@@ -388,13 +409,7 @@ class MiddlePaneWidget(QFrame):
         self.total_records = 0
         self.active_indicators.clear()
         
-        # Show empty placeholder again
-        if not self.empty_placeholder:
-            layout = self.layout()
-            self.empty_placeholder = QLabel("Select a model to view data")
-            self.empty_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.empty_placeholder.setObjectName("emptyPlaceholder")
-            layout.addWidget(self.empty_placeholder)
+        # Note: Do not re-add the empty placeholder to avoid blank top region
     
     def setup_styling(self):
         """Apply styling to the pane"""
@@ -415,6 +430,12 @@ class MiddlePaneWidget(QFrame):
                 border-bottom: 1px solid #1a1a1a;
             }
             
+            #chartControls QLabel {
+                background-color: transparent;
+                color: #999;
+                padding: 0px 5px;
+            }
+            
             QPushButton {
                 background-color: #1a1a1a;
                 color: #fff;
@@ -433,6 +454,19 @@ class MiddlePaneWidget(QFrame):
                 border: 1px solid #2a2a2a;
                 padding: 5px;
                 border-radius: 3px;
+                min-width: 100px;
+            }
+            
+            QComboBox::drop-down {
+                border: none;
+            }
+            
+            QComboBox::down-arrow {
+                image: none;
+                border-left: 5px solid transparent;
+                border-right: 5px solid transparent;
+                border-top: 5px solid #999;
+                margin-right: 5px;
             }
             
             QTableWidget {

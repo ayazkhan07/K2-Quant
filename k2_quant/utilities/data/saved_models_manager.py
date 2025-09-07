@@ -136,7 +136,31 @@ class SavedModelsManager:
 
 			result: List[Dict[str, Any]] = []
 			for r in rows:
-				display_name = r.get("custom_name") or f"{r['symbol']} - {str(r['range_val']).upper()}"
+				# Build human-readable name: "TICKER-FREQUENCY-RANGE-MM/DD"
+				today = datetime.now().strftime("%m/%d")
+				symbol = str(r.get("symbol", "")).upper()
+				timespan_raw = str(r.get("timespan", ""))
+				range_val = str(r.get("range_val", "")).upper()
+				freq_raw = str(r.get("frequency", "")).strip()
+
+				# Derive frequency token (e.g., 1MIN, 5MIN, 3MIN). Fallback to timespan upper if unknown.
+				ts = timespan_raw.lower()
+				freq_token = ""
+				if ts.startswith("min"):
+					# Extract numeric portion safely (supports "5", "5min", etc.)
+					digits = "".join(ch for ch in freq_raw if ch.isdigit()) or "1"
+					freq_token = f"{digits}MIN"
+				elif ts.startswith("hour"):
+					digits = "".join(ch for ch in freq_raw if ch.isdigit()) or "1"
+					freq_token = f"{digits}H"
+				elif ts.startswith("day"):
+					digits = "".join(ch for ch in freq_raw if ch.isdigit()) or "1"
+					freq_token = f"{digits}D"
+				else:
+					freq_token = timespan_raw.upper() if timespan_raw else ""
+
+				parts = [p for p in [symbol, freq_token, range_val, today] if p]
+				display_name = r.get("custom_name") or "-".join(parts)
 				result.append({
 					"table_name": r["table_name"],
 					"display_name": display_name,

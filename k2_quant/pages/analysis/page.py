@@ -230,11 +230,35 @@ class AnalysisPageWidget(QWidget):
                 # Restore model state if available
                 try:
                     state = saved_models_manager.get_model_state(table_name)
-                    if state:
+                    if state and self.middle_pane.chart_widget:
                         k2_logger.info(f"Model state available for {table_name}", "ANALYSIS")
-                        # Could restore indicators/strategies here if needed
+                        # Restore aggregation and view range if present
+                        cw = self.middle_pane.chart_widget
+                        agg = state.get('aggregation') if isinstance(state, dict) else None
+                        vr  = state.get('view_range') if isinstance(state, dict) else None
+                        if vr:
+                            cw.set_view_range(vr)
+                        if agg:
+                            cw.change_timeframe(agg)
                 except Exception as e:
                     k2_logger.debug(f"No model state available: {e}", "ANALYSIS")
+
+                # Wire persistence of aggregation and view range
+                try:
+                    if self.middle_pane.chart_widget:
+                        cw = self.middle_pane.chart_widget
+                        cw.timeframe_changed.connect(
+                            lambda tf, tn=table_name: saved_models_manager.set_model_state(
+                                tn, indicators=None, active_strategy=None, chart_range=None
+                            )
+                        )
+                        cw.view_range_changed.connect(
+                            lambda vr, tn=table_name: saved_models_manager.set_model_state(
+                                tn, indicators=None, active_strategy=None, chart_range=None
+                            )
+                        )
+                except Exception:
+                    pass
                     
         except Exception as e:
             k2_logger.error(f"Failed to load model: {str(e)}", "ANALYSIS")

@@ -60,7 +60,7 @@ class StockService:
         return self.polygon.validate_symbol(symbol)
 
     @log_performance
-    def fetch_and_store_stock_data(self, symbol: str, time_range: str, frequency: str) -> Dict:
+    def fetch_and_store_stock_data(self, symbol: str, time_range: str, frequency: str, market_hours_only: bool = False) -> Dict:
         start_time = datetime.now()
         k2_logger.step(1, 6, "Converting parameters")
         timespan, start_date, end_date, multiplier = self.convert_ui_parameters(time_range, frequency)
@@ -72,7 +72,7 @@ class StockService:
         if not all_results:
             raise ValueError(f"No data available for {symbol}")
         k2_logger.step(4, 6, "Storing data in database")
-        table_name = self.db.store_stock_data(symbol, timespan, time_range.lower(), all_results)
+        table_name = self.db.store_stock_data(symbol, timespan, time_range.lower(), all_results, market_hours_only=market_hours_only)
         execution_time = (datetime.now() - start_time).total_seconds()
         records_per_sec = int(len(all_results) / execution_time) if execution_time > 0 else 0
         k2_logger.step(5, 6, "Calculating metrics")
@@ -179,6 +179,63 @@ class StockService:
         except Exception as e:
             k2_logger.error(f"Streaming export failed: {str(e)}", "EXPORT")
             raise
+
+    def create_filtered_table(self, source_table: str, target_table: str, market_hours_only: bool = True) -> bool:
+        """
+        Create a new table that contains filtered data from the source table.
+
+        If market_hours_only is True, only rows within 09:30:00-16:00:00 are copied.
+        Uses market_time column if present; otherwise falls back to CAST(date_time_market AS TIME).
+        """
+        try:
+            with self.db.get_connection() as conn:
+                with self.db.get_cursor(conn) as cur:
+                    # Drop target if exists
+                    cur.execute(f"DROP TABLE IF EXISTS {target_table}")
+
+                    # Create target with the same structure; keep UNLOGGED for speed (matches ingestion tables)
+                    cur.execute(
+                        f"""
+                        CREATE UNLOGGED TABLE {target_table} (LIKE {source_table} INCLUDING ALL)
+                        """
+                    )
+
+                    if market_hours_only:
+                        # Prefer market_time if available; otherwise fallback to extracting time from date_time_market
+                        try:
+                            cur.execute(
+                                f"""
+                                INSERT INTO {target_table}
+                                SELECT * FROM {source_table}
+                                WHERE market_time BETWEEN TIME '09:30:00' AND TIME '16:00:00'
+                                """
+                            )
+                        except Exception:
+                            cur.execute(
+                                f"""
+                                INSERT INTO {target_table}
+                                SELECT * FROM {source_table}
+                                WHERE CAST(date_time_market AS TIME) BETWEEN TIME '09:30:00' AND TIME '16:00:00'
+                                """
+                            )
+                    else:
+                        cur.execute(f"INSERT INTO {target_table} SELECT * FROM {source_table}")
+
+                    conn.commit()
+
+                    # Log counts
+                    cur.execute(f"SELECT COUNT(*) FROM {source_table}")
+                    source_count = cur.fetchone()[0]
+                    cur.execute(f"SELECT COUNT(*) FROM {target_table}")
+                    target_count = cur.fetchone()[0]
+                    k2_logger.info(
+                        f"Created filtered table: {target_table} with {target_count:,} records (from {source_count:,})",
+                        "STOCK_SERVICE",
+                    )
+                    return True
+        except Exception as e:
+            k2_logger.error(f"Failed to create filtered table: {e}", "STOCK_SERVICE")
+            return False
 
     # Minimal chart helpers (no DB manager changes needed)
     def get_chart_data_chunk(self, table_name: str, start_idx: int, end_idx: int) -> pd.DataFrame:

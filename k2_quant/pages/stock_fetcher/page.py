@@ -429,7 +429,7 @@ class StockFetcherWidget(QMainWindow):
             table_parts = self.current_table.split('_')
             timespan = table_parts[2] if len(table_parts) > 2 else 'day'
             
-            # Prepare model data
+            # Prepare model data (current table already reflects filtered/unfiltered dataset)
             model_data = {
                 'table_name': self.current_table,
                 'symbol': self.current_data['symbol'],
@@ -568,7 +568,7 @@ class StockFetcherWidget(QMainWindow):
 
         # Execute synchronously (workers removed for portability in refactor)
         try:
-            result = stock_service.fetch_and_store_stock_data(symbol, self.active_range, self.active_frequency)
+            result = stock_service.fetch_and_store_stock_data(symbol, self.active_range, self.active_frequency, market_hours_only=self.market_hours_only)
             self.display_stock_data(result)
         except Exception as e:
             k2_logger.error(f"Worker error: {str(e)}", "WORKER")
@@ -710,24 +710,48 @@ class StockFetcherWidget(QMainWindow):
                 f"{self.current_data['symbol']}_{self.current_data['range']}_{self.current_data['frequency']}{market_suffix}.csv"
             )
 
-            # Streaming export
+            # Streaming export with splitting into 1M-row parts
             import csv
-            with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
-                writer = csv.writer(csvfile)
-                market_tz = os.getenv('MARKET_TIMEZONE', 'US/Eastern').split('/')[-1]
-                writer.writerow([f'Date ({market_tz})', f'Time ({market_tz})', 'Open', 'High', 'Low', 'Close', 'Volume', 'VWAP'])
+            MAX_ROWS_PER_FILE = 1_000_000
 
-                total = 0
+            base_name = f"{self.current_data['symbol']}_{self.current_data['range']}_{self.current_data['frequency']}{market_suffix}"
+            def open_part(part_idx: int):
+                part_path = os.path.join(downloads_dir, f"{base_name}_part{part_idx:02d}.csv")
+                f = open(part_path, 'w', newline='', encoding='utf-8')
+                w = csv.writer(f)
+                market_tz_local = os.getenv('MARKET_TIMEZONE', 'US/Eastern').split('/')[-1]
+                w.writerow([f'Date ({market_tz_local})', f'Time ({market_tz_local})', 'Open', 'High', 'Low', 'Close', 'Volume', 'VWAP'])
+                return f, w, part_path
+
+            part = 1
+            rows_in_part = 0
+            file_handle, writer, filename = open_part(part)
+
+            try:
                 for batch in stock_service.get_export_data_streaming(self.current_table, market_hours_only=self.market_hours_only):
                     for row in batch:
-                        dt = row[0]
-                        writer.writerow([
-                            dt.strftime('%Y-%m-%d'),
-                            dt.strftime('%H:%M:%S'),
-                            f"{float(row[1]):.2f}", f"{float(row[2]):.2f}", f"{float(row[3]):.2f}", f"{float(row[4]):.2f}", int(row[5]), f"{float(row[6]):.2f}"
-                        ])
-                        total += 1
+                        # Row layout: (market_date, market_time, open, high, low, close, volume, vwap)
+                        md, mt = row[0], row[1]
+                        date_str = md.strftime('%Y-%m-%d') if hasattr(md, 'strftime') else str(md)
+                        time_str = mt.strftime('%H:%M:%S') if hasattr(mt, 'strftime') else str(mt)
+                        o = float(row[2]); h = float(row[3]); l = float(row[4]); c = float(row[5])
+                        vol = int(row[6]); vw = float(row[7])
+
+                        writer.writerow([date_str, time_str, f"{o:.2f}", f"{h:.2f}", f"{l:.2f}", f"{c:.2f}", vol, f"{vw:.2f}"])
+                        rows_in_part += 1
+
+                        if rows_in_part >= MAX_ROWS_PER_FILE:
+                            file_handle.close()
+                            part += 1
+                            rows_in_part = 0
+                            file_handle, writer, filename = open_part(part)
+
                     dlg.setValue(min(99, dlg.value() + 5))
+            finally:
+                try:
+                    file_handle.close()
+                except Exception:
+                    pass
 
             dlg.setValue(100)
             reply = show_question(
