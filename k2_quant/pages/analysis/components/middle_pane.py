@@ -16,6 +16,9 @@ from PyQt6.QtCore import Qt, pyqtSignal
 
 from k2_quant.utilities.logger import k2_logger
 
+# Updated import path for ChartWidget facade
+from k2_quant.pages.analysis.widgets.chart import ChartWidget
+
 
 class MiddlePaneWidget(QFrame):
     """Middle pane with chart and data table"""
@@ -143,7 +146,6 @@ class MiddlePaneWidget(QFrame):
             self.splitter.setObjectName("dataSplitter")
             
             # Import and create chart widget
-            from k2_quant.pages.analysis.widgets.chart_widget import ChartWidget
             self.chart_widget = ChartWidget()
             
             # Connect chart signals
