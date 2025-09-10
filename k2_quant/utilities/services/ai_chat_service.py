@@ -1,229 +1,412 @@
-"""
-Stock Data Service Layer
+from __future__ import annotations
 
-Orchestrates data fetching from Polygon API and storage in database.
-Supports range parameter in table naming, CSV export, and market hours filter.
-"""
+import time
+import traceback
+from typing import Dict, List, Optional, Generator, Any
+from datetime import datetime
 
-from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Optional, Generator
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import requests
+# Optional SDKs (graceful if missing)
+try:
+    from anthropic import Anthropic
+except Exception:
+    Anthropic = None  # type: ignore
 
-from k2_quant.utilities.services.polygon_client import polygon_client
-from k2_quant.utilities.data.db_manager import db_manager
-from k2_quant.utilities.logger import k2_logger, log_performance
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None  # type: ignore
+
+# Optional tokenizers (accurate counting if present)
+try:
+    import tiktoken  # OpenAI tokenizer
+except Exception:
+    tiktoken = None  # type: ignore
+
 from k2_quant.utilities.config.api_config import api_config
+from k2_quant.utilities.logger import k2_logger
 
 
-class StockService:
-    """Service layer for stock data operations"""
+class AIChatService:
+    """
+    Provider-agnostic, streaming AI chat service for K2 Quant.
 
-    MAX_WORKERS = 50
-    CHUNK_SIZE_DAYS = {
-        'minute': 7,
-        'hour': 90,
-        'day': 365,
-        'week': 1825,
-        'month': 7300,
+    UI contract:
+      - set_provider(str)
+      - set_model(str)
+      - set_system_context(str)
+      - set_dataset_context(meta: dict, columns: list[str], recent_rows: list[dict], quick_stats: dict | None = None, exchange: str = "NYSE", tz: str = "US/Eastern")
+      - get_streaming_response(message: str) -> Generator[str, None, None]
+      - clear_history()
+      - get_available_providers() -> list[str]
+      - export_conversation() -> list[dict]
+    """
+
+    # Rolling history and token window management
+    MAX_HISTORY_TURNS = 8  # keep recent turns compact
+    DEFAULT_PROVIDER = "anthropic"
+    DEFAULT_ANTHROPIC_MODEL = "claude-3-5-sonnet-20241022"
+    DEFAULT_OPENAI_MODEL = "gpt-4-turbo-preview"
+
+    # Model context windows (approx tokens)
+    CONTEXT_WINDOWS = {
+        "anthropic": 200000,  # Claude 3 family large windows
+        "openai": 128000,     # GPT-4 Turbo
     }
 
-    EXPORT_BATCH_SIZE = 100000
+    def __init__(self) -> None:
+        # Provider/model
+        self.provider: str = self.DEFAULT_PROVIDER
+        self.model: str = self.DEFAULT_ANTHROPIC_MODEL
 
-    def __init__(self):
-        self.polygon = polygon_client
-        self.db = db_manager
-        self.api_key = api_config.polygon_api_key
+        # Persona/system prompt and dataset card
+        self.system_prompt: str = self._default_system_prompt()
+        self.dataset_context: Dict[str, Any] = {}
+        self.environment_card: str = ""
 
-    def convert_ui_parameters(self, time_range: str, frequency: str) -> Tuple[str, str, str, int]:
-        end_date = datetime.now()
-        range_days = {
-            '1D': 1, '1W': 7, '1M': 30, '3M': 90,
-            '6M': 180, '1Y': 365, '2Y': 730, '5Y': 1825,
-            '10Y': 3650, '20Y': 7300,
+        # Conversation memory
+        self.history: List[Dict[str, str]] = []  # [{role, content}]
+        self.summary_memory: str = ""  # summarized older turns
+
+        # Token accounting
+        self.total_tokens: int = 0
+        self.refresh_threshold: float = 0.8
+
+        # Clients
+        self._anthropic: Optional[Any] = None
+        self._openai_client: Optional[Any] = None
+        self._initialize_clients()
+
+        # Build initial environment card
+        self._rebuild_environment_card()
+
+    # ---------- Public API ----------
+
+    def set_provider(self, provider: str) -> None:
+        val = (provider or "").strip().lower()
+        if val not in {"anthropic", "openai", "local"}:
+            val = "anthropic"
+        self.provider = val
+
+        # Ensure the selected model matches the provider family
+        if self.provider == "openai":
+            if not self.model or "claude" in (self.model or "").lower():
+                self.model = self.DEFAULT_OPENAI_MODEL
+            if self._openai_client is None:
+                self._init_openai()
+        elif self.provider == "anthropic":
+            if not self.model or (self.model or "").lower().startswith("gpt"):
+                self.model = self.DEFAULT_ANTHROPIC_MODEL
+            if self._anthropic is None:
+                self._init_anthropic()
+
+        k2_logger.info(f"Provider: {self.provider}, Model: {self.model}", "AI_CHAT")
+
+    def set_model(self, model: str) -> None:
+        self.model = (model or "").strip()
+        k2_logger.info(f"AI model set to {self.model}", "AI_CHAT")
+
+    def set_system_context(self, text: str) -> None:
+        self.system_prompt = text or ""
+        self._rebuild_environment_card()
+
+    def set_dataset_context(
+        self,
+        meta: Dict[str, Any],
+        columns: List[str],
+        recent_rows: List[Dict[str, Any]],
+        quick_stats: Optional[Dict[str, Any]] = None,
+        exchange: str = "NYSE",
+        tz: str = "US/Eastern",
+    ) -> None:
+        # Compact recent sample (<= 10 rows, key fields if available)
+        sample = recent_rows or []
+        if len(sample) > 10:
+            sample = sample[-10:]
+
+        self.dataset_context = {
+            "metadata": meta or {},
+            "columns": columns or [],
+            "recent_sample": sample,
+            "quick_stats": quick_stats or {},
+            "exchange": exchange,
+            "timezone": tz,
+            "last_updated": datetime.now().isoformat(),
         }
-        days = range_days.get(time_range, 30)
-        start_date = end_date - timedelta(days=days)
-        freq_map = {
-            '1min': 'minute', '5min': 'minute', '15min': 'minute',
-            '30min': 'minute', '1H': 'hour', 'D': 'day',
-            'W': 'week', 'M': 'month',
-        }
-        timespan = freq_map.get(frequency, 'day')
-        multiplier = 1
-        if frequency in ['5min', '15min', '30min']:
-            multiplier = int(frequency.replace('min', ''))
-        return timespan, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'), multiplier
+        self._rebuild_environment_card()
+        k2_logger.info(
+            f"Dataset context set: {meta.get('symbol', 'UNKNOWN')} "
+            f"rows={meta.get('total_records')} range={meta.get('date_range')}",
+            "AI_CHAT",
+        )
 
-    def validate_symbol(self, symbol: str) -> bool:
-        return self.polygon.validate_symbol(symbol)
+    def get_streaming_response(self, message: str) -> Generator[str, None, None]:
+        """
+        Stream a response in chunks. Handles provider selection, token management,
+        and appends to history on completion.
+        """
+        user_msg = (message or "").strip()
+        if not user_msg:
+            return
 
-    @log_performance
-    def fetch_and_store_stock_data(self, symbol: str, time_range: str, frequency: str) -> Dict:
-        start_time = datetime.now()
-        k2_logger.step(1, 6, "Converting parameters")
-        timespan, start_date, end_date, multiplier = self.convert_ui_parameters(time_range, frequency)
-        k2_logger.step(2, 6, f"Validating symbol {symbol}")
-        if not self.validate_symbol(symbol):
-            raise ValueError(f"Invalid symbol: {symbol}")
-        k2_logger.step(3, 6, "Fetching data from Polygon API")
-        all_results = self._parallel_fetch_data(symbol, timespan, start_date, end_date, multiplier)
-        if not all_results:
-            raise ValueError(f"No data available for {symbol}")
-        k2_logger.step(4, 6, "Storing data in database")
-        table_name = self.db.store_stock_data(symbol, timespan, time_range.lower(), all_results)
-        execution_time = (datetime.now() - start_time).total_seconds()
-        records_per_sec = int(len(all_results) / execution_time) if execution_time > 0 else 0
-        k2_logger.step(5, 6, "Calculating metrics")
-        k2_logger.performance_metric("Total execution time", execution_time, "seconds")
-        k2_logger.performance_metric("Records processed", len(all_results), "records")
-        k2_logger.performance_metric("Processing speed", records_per_sec, "records/second")
-        result = {
-            'symbol': symbol,
-            'range': time_range,
-            'frequency': frequency,
-            'table_name': table_name,
-            'total_records': len(all_results),
-            'execution_time': execution_time,
-            'records_per_second': records_per_sec,
-        }
-        k2_logger.step(6, 6, "Process complete")
-        return result
-
-    def _parallel_fetch_data(self, symbol: str, timespan: str, start_date: str, end_date: str, multiplier: int) -> List[Dict]:
-        chunks = self._generate_date_chunks(timespan, start_date, end_date)
-        k2_logger.api_operation("Parallel fetch plan", f"{len(chunks)} chunks with {self.MAX_WORKERS} workers")
-        all_results: List[Dict] = []
-        failed_chunks = []
-        completed_chunks = 0
-        with ThreadPoolExecutor(max_workers=self.MAX_WORKERS) as executor:
-            future_to_chunk = {
-                executor.submit(self._fetch_chunk, symbol, timespan, multiplier, chunk[0], chunk[1]): chunk
-                for chunk in chunks
-            }
-            for future in as_completed(future_to_chunk):
-                chunk = future_to_chunk[future]
-                completed_chunks += 1
-                try:
-                    results = future.result()
-                    if results:
-                        all_results.extend(results)
-                        k2_logger.api_operation("Chunk completed", f"{chunk[0]} to {chunk[1]}: {len(results)} records ({completed_chunks}/{len(chunks)})")
-                except Exception as e:
-                    failed_chunks.append(chunk)
-                    k2_logger.error(f"Chunk failed {chunk[0]} to {chunk[1]}: {str(e)}", "API")
-        all_results.sort(key=lambda x: x['t'])
-        return all_results
-
-    def _generate_date_chunks(self, timespan: str, start_date: str, end_date: str) -> List[Tuple[str, str]]:
-        chunk_days = self.CHUNK_SIZE_DAYS.get(timespan, 30)
-        chunks = []
-        current_start = datetime.strptime(start_date, '%Y-%m-%d')
-        end_dt = datetime.strptime(end_date, '%Y-%m-%d')
-        while current_start < end_dt:
-            chunk_end = min(current_start + timedelta(days=chunk_days), end_dt)
-            chunks.append((current_start.strftime('%Y-%m-%d'), chunk_end.strftime('%Y-%m-%d')))
-            current_start = chunk_end + timedelta(days=1)
-        return chunks
-
-    def _fetch_chunk(self, symbol: str, timespan: str, multiplier: int, start: str, end: str) -> List[Dict]:
+        start_time = time.time()
         try:
-            base_url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range"
-            url = f"{base_url}/{multiplier}/{timespan}/{start}/{end}"
-            params = {
-                'apiKey': self.polygon.api_key,
-                'adjusted': 'true',
-                'sort': 'asc',
-                'limit': 50000,
-            }
-            response = requests.get(url, params=params, timeout=30)
-            response.raise_for_status()
-            data = response.json()
-            if data.get('status') == 'OK' and 'results' in data:
-                return data['results']
-            return []
+            sys_prompt = self.environment_card or self.system_prompt
+            messages = self._build_messages(user_msg)
+
+            # Pre-send token check (approx)
+            self._maybe_refresh_context(sys_prompt, messages)
+
+            if self.provider == "anthropic" and self._anthropic is not None:
+                yield from self._stream_anthropic(messages, sys_prompt)
+            elif self.provider == "openai" and self._openai_client is not None:
+                yield from self._stream_openai(messages, sys_prompt)
+            else:
+                warn = "[LOCAL] AI service not configured. Please set API keys."
+                k2_logger.warning(warn, "AI_CHAT")
+                yield warn
+
         except Exception as e:
-            k2_logger.error(f"Chunk fetch failed: {str(e)}", "API")
-            return []
+            err = f"[ERROR] {type(e).__name__}: {str(e)}"
+            k2_logger.error(f"{err}\n{traceback.format_exc()}", "AI_CHAT")
+            yield err
+        finally:
+            self._append_history("user", user_msg)
+            elapsed = round(time.time() - start_time, 3)
+            k2_logger.performance_metric("AI response time", elapsed, "seconds")
 
-    def get_display_data(self, table_name: str, limit: int = 1000, market_hours_only: bool = False) -> Tuple[List[Tuple], int]:
-        return self.db.fetch_display_data(table_name, limit, market_hours_only)
+    def clear_history(self) -> None:
+        self.history.clear()
+        self.summary_memory = ""
+        k2_logger.info("AI chat history cleared", "AI_CHAT")
 
-    def get_export_data(self, table_name: str, offset: int, limit: int, market_hours_only: bool = False) -> List[Tuple]:
-        try:
-            k2_logger.database_operation(
-                f"Fetching export data from {table_name}",
-                f"Offset: {offset}, Limit: {limit}, Market hours filter: {market_hours_only}")
-            rows = self.db.fetch_export_data(table_name, offset, limit, market_hours_only)
-            k2_logger.database_operation("Export data fetched", f"Retrieved {len(rows)} records")
-            return rows
-        except Exception as e:
-            k2_logger.error(f"Failed to fetch export data: {str(e)}", "EXPORT")
-            raise
+    def get_available_providers(self) -> List[str]:
+        available = []
+        if self._anthropic is not None:
+            available.append("anthropic")
+        if self._openai_client is not None:
+            available.append("openai")
+        if not available:
+            available.append("local")
+        return available
 
-    def get_export_data_streaming(self, table_name: str, batch_size: int = None, market_hours_only: bool = False) -> Generator[List[Tuple], None, None]:
-        if batch_size is None:
-            batch_size = self.EXPORT_BATCH_SIZE
-        try:
-            _, total_count = self.get_display_data(table_name, limit=1, market_hours_only=market_hours_only)
-            offset = 0
-            while offset < total_count:
-                batch = self.get_export_data(table_name, offset, batch_size, market_hours_only)
-                if not batch:
-                    break
-                yield batch
-                offset += len(batch)
-                progress_pct = (offset / total_count) * 100
-                k2_logger.database_operation("Export progress", f"{offset:,}/{total_count:,} records ({progress_pct:.1f}%)")
-        except Exception as e:
-            k2_logger.error(f"Streaming export failed: {str(e)}", "EXPORT")
-            raise
+    def export_conversation(self) -> List[Dict[str, str]]:
+        return self.history.copy()
 
-    def get_table_info(self, table_name: str) -> Dict:
-        try:
-            _, total_records = self.get_display_data(table_name, limit=1)
-            parts = table_name.split('_')
-            symbol = parts[1] if len(parts) > 1 else 'UNKNOWN'
-            timespan = parts[2] if len(parts) > 2 else 'unknown'
-            range_val = parts[3] if len(parts) > 3 else 'unknown'
-            date_range = self.db.get_date_range(table_name)
-            return {
-                'table_name': table_name,
-                'symbol': symbol.upper(),
-                'timespan': timespan,
-                'range': range_val,
-                'total_records': total_records,
-                'date_range': date_range,
-                'version': parts[-1] if len(parts) > 4 and parts[-1].isdigit() else '1',
-            }
-        except Exception as e:
-            k2_logger.error(f"Failed to get table info: {str(e)}", "INFO")
-            return {}
+    # ---------- Internals ----------
 
-    def validate_export_size(self, table_name: str, max_size_gb: float = 10.0) -> Tuple[bool, str]:
-        try:
-            _, total_records = self.get_display_data(table_name, limit=1)
-            estimated_bytes = total_records * 100
-            estimated_gb = estimated_bytes / (1024 ** 3)
-            if estimated_gb > max_size_gb:
-                return False, f"Export size (~{estimated_gb:.1f} GB) exceeds limit of {max_size_gb} GB"
-            return True, f"Export size approximately {estimated_gb:.2f} GB"
-        except Exception as e:
-            return False, f"Failed to validate export size: {str(e)}"
+    def _initialize_clients(self) -> None:
+        self._init_anthropic()
+        self._init_openai()
 
-    def get_all_stock_tables(self) -> List[Tuple[str, str]]:
-        return self.db.get_stock_tables()
+    def _init_anthropic(self) -> None:
+        if Anthropic is None or not api_config.anthropic_api_key:
+            self._anthropic = None
+            return
+        self._anthropic = Anthropic(api_key=api_config.anthropic_api_key)
 
-    def delete_table(self, table_name: str):
-        self.db.drop_table(table_name)
+    def _init_openai(self) -> None:
+        if OpenAI is None or not api_config.openai_api_key:
+            self._openai_client = None
+            return
+        self._openai_client = OpenAI(api_key=api_config.openai_api_key)
 
-    def delete_all_tables(self) -> int:
-        return self.db.drop_all_stock_tables()
+    def _default_system_prompt(self) -> str:
+        return (
+            "You are K2 Quant's conversational strategy development partner.\n"
+            "Style: explore → refine → design → confirm → create; ask at most two clarifying questions before proposing a plan.\n"
+            "Use tags as the first token: [DIRECT] | [QUERY] | [STRATEGY] | [DECLINE].\n"
+            "Rules: no synthetic timestamps; use exchange trading sessions (default NYSE). Default OHLC aggregation uses close.\n"
+            "No file/network/OS access; produce a single ```python block``` when outputting code.\n"
+            "QUERY: small data lookups (≤1000 rows), auto-run by app. Return dict for single points or a small table for ranges.\n"
+            "STRATEGY: projections/patterns; include projection_mid/low/high and is_projection=True; code only after confirmation.\n"
+        )
 
-    def get_tables_for_ticker(self, symbol: str, timespan: str = None, range_val: str = None) -> List[str]:
-        return self.db.get_tables_for_ticker(symbol, timespan, range_val)
+    def _rebuild_environment_card(self) -> None:
+        ctx = self.dataset_context or {}
+        meta = ctx.get("metadata", {})
+        cols = ctx.get("columns", [])
+        sample = ctx.get("recent_sample", [])
+        qstats = ctx.get("quick_stats", {})
+        exchange = ctx.get("exchange", "NYSE")
+        tz = ctx.get("timezone", "US/Eastern")
+
+        parts: List[str] = []
+        if self.system_prompt:
+            parts.append(self.system_prompt.strip())
+
+        if meta or cols or sample:
+            parts.append("ENVIRONMENT CARD:")
+            if meta:
+                parts.append(
+                    f"- Symbol: {meta.get('symbol', 'UNKNOWN')} | "
+                    f"Records: {meta.get('total_records', 'UNKNOWN')} | "
+                    f"Date range: {meta.get('date_range', 'UNKNOWN')}"
+                )
+            if cols:
+                parts.append(f"- Columns: {', '.join(cols)}")
+            if qstats:
+                parts.append(f"- Quick stats: {qstats}")
+            parts.append(f"- Exchange: {exchange} | Timezone: {tz}")
+            if sample:
+                parts.append(f"- Recent sample (last {len(sample)} rows): {sample}")
+
+        # Compact summary memory if present
+        if self.summary_memory:
+            parts.append("CONVERSATION SUMMARY:")
+            parts.append(self.summary_memory)
+
+        # Operating rules (concise, reasserted)
+        parts.append(
+            "OPERATING RULES:\n"
+            "- Tags: [DIRECT] | [QUERY] | [STRATEGY] | [DECLINE]\n"
+            "- No synthetic timestamps; default NYSE calendar; default aggregation uses close\n"
+            "- No file/network/OS access; one ```python block``` when coding\n"
+            "- QUERY ≤1000 rows; STRATEGY ≤10000 rows; suggest narrowing if limits exceeded\n"
+            "- Projections: projection_mid/low/high + is_projection=True"
+        )
+
+        self.environment_card = "\n".join(parts)
+
+    def _build_messages(self, new_user_message: str) -> List[Dict[str, str]]:
+        trimmed = self.history[-self.MAX_HISTORY_TURNS :]
+        return trimmed + [{"role": "user", "content": new_user_message}]
+
+    # ---------- Token management ----------
+
+    def _maybe_refresh_context(self, sys_prompt: str, messages: List[Dict[str, str]]) -> None:
+        approx_tokens = self._estimate_tokens(sys_prompt) + sum(self._estimate_tokens(m["content"]) for m in messages)
+        self.total_tokens += approx_tokens
+        if self._should_refresh_context():
+            self._summarize_history()
+            self.total_tokens = approx_tokens  # reset to current context size
+
+    def _should_refresh_context(self) -> bool:
+        window = self.CONTEXT_WINDOWS.get(self.provider, 100000)
+        return self.total_tokens > window * self.refresh_threshold
+
+    def _estimate_tokens(self, text: str) -> int:
+        # Prefer tiktoken for OpenAI
+        if tiktoken and self.provider == "openai":
+            try:
+                enc = tiktoken.get_encoding("cl100k_base")
+                return len(enc.encode(text))
+            except Exception:
+                pass
+        # Fallback rough estimate: ~4 chars/token
+        return max(1, len(text) // 4)
+
+    def _summarize_history(self) -> None:
+        # Simple compaction: keep last 2 turns and summarize the rest into 1 paragraph
+        old = self.history[:-2]
+        if not old:
+            return
+        points = []
+        for turn in old:
+            role = turn.get("role", "user")
+            content = turn.get("content", "")
+            if content:
+                points.append(f"{role}: {content[:200]}{'...' if len(content) > 200 else ''}")
+        self.summary_memory = " | ".join(points[:10])  # compact
+        self.history = self.history[-2:]
+        self._rebuild_environment_card()
+        k2_logger.info("Conversation summarized to maintain token budget", "AI_CHAT")
+
+    # ---------- Provider streams ----------
+
+    def _stream_anthropic(self, messages: List[Dict[str, str]], system_prompt: str) -> Generator[str, None, None]:
+        # Anthropic expects a list of dicts with roles and content. Send rolling window.
+        assistant_accum: List[str] = []
+
+        # Retry-once for rate limits/transients
+        for attempt in range(2):
+            try:
+                with self._anthropic.messages.stream(  # type: ignore[attr-defined]
+                    model=self.model or self.DEFAULT_ANTHROPIC_MODEL,
+                    system=system_prompt,
+                    messages=[{"role": m["role"], "content": m["content"]} for m in messages],
+                    max_tokens=4000,
+                ) as stream:
+                    for delta in stream.text_stream:
+                        assistant_accum.append(delta)
+                        yield delta
+                break
+            except Exception as e:
+                if "rate" in str(e).lower() and attempt == 0:
+                    msg = "[INFO] Rate limited. Retrying in 5s..."
+                    k2_logger.warning(msg, "AI_CHAT")
+                    yield msg
+                    time.sleep(5)
+                    continue
+                raise
+
+        final_text = "".join(assistant_accum)
+        self._append_history("assistant", final_text)
+
+    def _stream_openai(self, messages: List[Dict[str, str]], system_prompt: str) -> Generator[str, None, None]:
+        if self._openai_client is None:
+            yield "[LOCAL] OpenAI client not initialized."
+            return
+
+        chat_messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+        chat_messages.extend(messages)
+
+        assistant_accum: List[str] = []
+
+        # Retry-once policy
+        for attempt in range(2):
+            try:
+                stream = self._openai_client.chat.completions.create(
+                    model=self.model or self.DEFAULT_OPENAI_MODEL,
+                    messages=chat_messages,
+                    stream=True,
+                )
+                for chunk in stream:
+                    delta = getattr(chunk.choices[0].delta, "content", None)
+                    if delta:
+                        assistant_accum.append(delta)
+                        yield delta
+                break
+            except Exception as e:
+                if "rate" in str(e).lower() and attempt == 0:
+                    msg = "[INFO] Rate limited. Retrying in 5s..."
+                    k2_logger.warning(msg, "AI_CHAT")
+                    yield msg
+                    time.sleep(5)
+                    continue
+                raise
+
+        final_text = "".join(assistant_accum)
+        self._append_history("assistant", final_text)
+
+    # ---------- Validation helpers (used by caller when needed) ----------
+
+    @staticmethod
+    def validate_code_security(code: str) -> List[str]:
+        """Static scan for disallowed operations."""
+        banned = ["exec(", "eval(", "__import__", "open(", "os.", "subprocess.", "socket.", "requests.", "httpx."]
+        hits = [kw for kw in banned if kw in (code or "")]
+        return hits
+
+    @staticmethod
+    def validate_strategy_output(code: str) -> (bool, str):
+        """Ensure strategy code intends to produce required columns."""
+        required = ["projection_mid", "projection_low", "projection_high", "is_projection"]
+        for req in required:
+            if req not in (code or ""):
+                return False, f"Strategy must include '{req}' column"
+        return True, ""
+
+    # ---------- History helpers ----------
+
+    def _append_history(self, role: str, content: str) -> None:
+        if not content:
+            return
+        self.history.append({"role": role, "content": content})
+        if len(self.history) > self.MAX_HISTORY_TURNS:
+            self.history = self.history[-self.MAX_HISTORY_TURNS :]
 
 
-stock_service = StockService()
+# Singleton instance
+ai_chat_service = AIChatService()
 
 

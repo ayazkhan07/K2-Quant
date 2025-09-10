@@ -161,6 +161,8 @@ class MiddlePaneWidget(QFrame):
             self.data_table = QTableWidget()
             self.data_table.setAlternatingRowColors(True)
             self.data_table.horizontalHeader().setStretchLastSection(True)
+            # Ensure table remains visible when panes grow
+            self.data_table.setMinimumHeight(160)
             self.splitter.addWidget(self.data_table)
             
             # Set initial sizes (60/40 split)
@@ -198,6 +200,15 @@ class MiddlePaneWidget(QFrame):
         
         # Convert to DataFrame if needed (limited data for table)
         if isinstance(data, list) and len(data) > 0:
+            # DIAGNOSTIC: table build header/row counts
+            _base_headers = ['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'VWAP']
+            try:
+                row_len = len(data[0])
+                k2_logger.debug(f"TABLE_BUILD: base_headers={len(_base_headers)} row_len={row_len}", "MIDDLE_PANE")
+                if row_len != len(_base_headers):
+                    k2_logger.error(f"TABLE_BUILD_MISMATCH: expected={len(_base_headers)} got={row_len}. First row={data[0]}", "MIDDLE_PANE")
+            except Exception as ex:
+                k2_logger.error(f"TABLE_BUILD diagnostics failed: {ex}", "MIDDLE_PANE")
             columns = ['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'VWAP']
             df = pd.DataFrame(data, columns=columns[:len(data[0])])
             self.current_data = df
@@ -251,11 +262,20 @@ class MiddlePaneWidget(QFrame):
         
         # Handle both DataFrame and list formats
         if isinstance(data, pd.DataFrame):
+            try:
+                k2_logger.debug(f"TABLE_RENDER: rows={len(data)} columns={list(data.columns)}", "MIDDLE_PANE")
+            except Exception:
+                pass
             rows = data.values.tolist()
             columns = list(data.columns)
         elif isinstance(data, list):
+            try:
+                k2_logger.debug(f"TABLE_RENDER: rows={len(data)} columns=fixed_base", "MIDDLE_PANE")
+            except Exception:
+                pass
             rows = data
-            columns = ['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'VWAP']
+            # Correct base headers to include Volume and guard mismatches
+            columns = ['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'VWAP']
         else:
             return
         
@@ -266,7 +286,10 @@ class MiddlePaneWidget(QFrame):
         
         # Populate table
         for i, row in enumerate(rows):
-            for j, value in enumerate(row):
+            # Guard against header/row length mismatch
+            max_cols = min(len(columns), len(row))
+            for j in range(max_cols):
+                value = row[j]
                 if columns[j] in ['Open', 'High', 'Low', 'Close', 'VWAP']:
                     try:
                         text = f"{float(value):.2f}"
@@ -282,20 +305,100 @@ class MiddlePaneWidget(QFrame):
                 
                 self.data_table.setItem(i, j, QTableWidgetItem(text))
     
-    def add_indicator(self, indicator_name: str, indicator_data: pd.Series, color: str = '#ffff00'):
-        """Add indicator to chart"""
-        if self.chart_widget:
-            self.chart_widget.add_indicator(indicator_name, indicator_data, color=color)
-            self.active_indicators[indicator_name] = indicator_data
-            k2_logger.info(f"Added indicator: {indicator_name}", "MIDDLE_PANE")
-    
-    def remove_indicator(self, indicator_name: str):
-        """Remove indicator from chart"""
-        if self.chart_widget:
-            self.chart_widget.remove_indicator(indicator_name)
-            if indicator_name in self.active_indicators:
-                del self.active_indicators[indicator_name]
-            k2_logger.info(f"Removed indicator: {indicator_name}", "MIDDLE_PANE")
+
+    # ---------------- Indicator Routing Bridge (overlays vs sub-panes) ----------------
+
+    def add_indicator_overlay(self, indicator_name: str, series: pd.Series, cid: str | None = None):
+        """Add overlay to main pane (dotted white via ChartWidget)."""
+        if not self.chart_widget:
+            return
+        try:
+            self.chart_widget.add_indicator_overlay(indicator_name, series, cid=cid)
+        except TypeError:
+            # Backward compatibility if chart method signature differs
+            self.chart_widget.add_indicator_overlay(indicator_name, series)
+        self.active_indicators[indicator_name] = {"pane": "main", "outputs": ["line"]}
+        k2_logger.info(f"Added overlay indicator: {indicator_name}", "MIDDLE_PANE")
+        self.data_updated.emit()
+
+    def add_indicator_to_pane(self, pane_key: str, series_map: Dict[str, pd.Series], family: str, cid: str | None = None):
+        """
+        Create/update a shared sub-pane keyed by family (e.g., 'RSI', 'MACD').
+        Enforces a maximum of 3 sub-panes.
+        """
+        if not self.chart_widget:
+            return
+
+        # Cap at 3 panes (only if creating a new pane)
+        if pane_key not in self.chart_widget.indicator_panes and len(self.chart_widget.indicator_panes) >= 3:
+            try:
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.warning(self, "Limit Reached", "Maximum 3 sub-panes. Remove an indicator first.")
+            except Exception:
+                pass
+            return
+
+        fam = (family or pane_key).upper()
+        if fam in ("RSI", "STOCH", "ADX", "MFI"):
+            y_mode = "bounded_0_100"
+        elif fam in ("MACD", "CCI"):
+            y_mode = "symmetric_0"
+        elif fam in ("ATR", "VOLUME"):
+            y_mode = "auto_positive"
+        else:
+            y_mode = "auto"
+
+        for label, s in series_map.items():
+            try:
+                self.chart_widget.add_or_update_indicator_pane(
+                    pane_key=pane_key,
+                    series_label=label,
+                    series=s,
+                    y_mode=y_mode,
+                    cid=cid
+                )
+            except TypeError:
+                self.chart_widget.add_or_update_indicator_pane(
+                    pane_key=pane_key,
+                    series_label=label,
+                    series=s,
+                    y_mode=y_mode
+                )
+
+        self.active_indicators[pane_key] = {"pane": "separate", "outputs": list(series_map.keys())}
+        # Reassert splitter sizes so table doesn't collapse
+        try:
+            if self.splitter and self.data_table:
+                sizes = self.splitter.sizes()
+                top = max(sizes[0] if sizes else 360, 360)
+                bottom = max(self.data_table.minimumHeight(), 220)
+                self.splitter.setStretchFactor(0, 3)
+                self.splitter.setStretchFactor(1, 2)
+                self.splitter.setSizes([top, bottom])
+        except Exception:
+            pass
+        self.data_updated.emit()
+
+    def remove_indicator(self, indicator_name: str, family: str = None, cid: str | None = None):
+        """
+        Remove overlay or a single series from a family pane. If a pane becomes empty
+        after removal, it is auto-removed by the chart.
+        """
+        if not self.chart_widget:
+            return
+        # Remove overlay if present
+        self.chart_widget.remove_indicator(indicator_name)
+        # Remove the series from its shared pane
+        if family:
+            pane_key = family.upper()
+            try:
+                self.chart_widget.remove_series_from_pane(pane_key, indicator_name, cid=cid)
+            except TypeError:
+                self.chart_widget.remove_series_from_pane(pane_key, indicator_name)
+        if indicator_name in self.active_indicators:
+            del self.active_indicators[indicator_name]
+        k2_logger.info(f"Removed indicator: {indicator_name}", "MIDDLE_PANE")
+        self.data_updated.emit()
     
     def jump_to_end(self):
         """Jump to the latest data in the chart"""

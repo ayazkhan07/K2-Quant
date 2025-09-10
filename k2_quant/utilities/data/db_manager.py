@@ -277,6 +277,33 @@ class DatabaseManager:
                 cur.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS {column_name} {sql_type}")
                 conn.commit()
 
+    # ADD: discover indicator columns (non-base)
+    def get_indicator_columns(self, table_name: str) -> List[str]:
+        """Return columns considered indicators (exclude base schema)."""
+        base_cols = {
+            'timestamp', 'date_time_market', 'market_date', 'market_time',
+            'open', 'high', 'low', 'close', 'volume', 'vwap', 'transactions',
+            'is_projection', 'projection_source'
+        }
+        with self.get_connection() as conn:
+            with self.get_cursor(conn) as cur:
+                cur.execute(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_name = %s
+                    ORDER BY ordinal_position
+                    """,
+                    (table_name,),
+                )
+                cols = [row[0] for row in cur.fetchall()]
+        indicators = [c for c in cols if c not in base_cols]
+        try:
+            k2_logger.database_operation("Indicator columns discovered", f"table={table_name} count={len(indicators)} cols={indicators}")
+        except Exception:
+            pass
+        return indicators
+
     def bulk_update_column_by_timestamp(self, table_name: str, column_name: str, ts_series: pd.Series, val_series: pd.Series) -> int:
         """Efficiently update a numeric indicator column by joining on timestamp."""
         pairs = [(int(ts), None if pd.isna(val) else float(val)) for ts, val in zip(ts_series.values, val_series.values)]
@@ -285,7 +312,7 @@ class DatabaseManager:
                 # Use VALUES to batch update
                 execute_values(
                     cur,
-                    f"UPDATE {table_name} AS t SET {column_name} = v.val FROM (VALUES %s) AS v(ts, val) WHERE t.timestamp = v.ts",
+                    f"UPDATE {table_name} AS t SET {column_name} = (v.val)::numeric FROM (VALUES %s) AS v(ts, val) WHERE t.timestamp = v.ts",
                     pairs,
                 )
                 affected = cur.rowcount or 0
@@ -419,6 +446,15 @@ class DatabaseManager:
                             )
                             ORDER BY 1, 2
                         """
+                # DIAGNOSTIC: log select clause/flags
+                try:
+                    k2_logger.database_operation(
+                        "Display SELECT",
+                        f"table={table_name} has_new_columns={has_new_columns} select_cols={select_clause.replace('\n', ' ').strip()}"
+                    )
+                except Exception:
+                    pass
+
                 cur.execute(query)
                 rows = cur.fetchall()
                 return rows, total_count
@@ -457,6 +493,94 @@ class DatabaseManager:
                 k2_logger.database_operation(f"Export fetch from {table_name}", 
                     f"Retrieved {len(rows)} records (offset: {offset}, limit: {limit}, market_hours_only: {market_hours_only})")
                 return rows
+
+    # ADD: drop indicator column helper
+    def drop_indicator_column(self, table_name: str, column_name: str) -> bool:
+        """Drop an indicator column from the table, if it exists."""
+        try:
+            # Safety: never drop base columns
+            base = { 'timestamp','date_time_market','market_date','market_time',
+                     'open','high','low','close','volume','vwap','transactions',
+                     'is_projection','projection_source' }
+            if column_name.lower() in base:
+                k2_logger.warning(f"Refusing to drop base column {column_name}", "DB")
+                return False
+            with self.get_connection() as conn:
+                with self.get_cursor(conn) as cur:
+                    cur.execute(f"ALTER TABLE {table_name} DROP COLUMN IF EXISTS {column_name}")
+                    conn.commit()
+                    k2_logger.database_operation(f"Dropped column {column_name}", table_name)
+                    return True
+        except Exception as e:
+            k2_logger.error(f"Failed to drop column {column_name}: {e}", "DB")
+            return False
+
+    # ADD: with-indicators display fetch (split-friendly)
+    def fetch_display_data_with_indicators(self, table_name: str, limit: int = 1000) -> Tuple[List[Tuple], int]:
+        indicator_cols = self.get_indicator_columns(table_name)
+
+        if self._check_column_exists(table_name, 'market_date'):
+            base_parts = ['market_date', 'market_time', 'open', 'high', 'low', 'close', 'volume', 'vwap']
+        else:
+            base_parts = [
+                'DATE(date_time_market) AS market_date',
+                'CAST(date_time_market AS TIME) AS market_time',
+                'open', 'high', 'low', 'close', 'volume', 'vwap'
+            ]
+
+        all_parts = base_parts + indicator_cols
+        select_clause = ', '.join(all_parts)
+
+        with self.get_connection() as conn:
+            with self.get_cursor(conn) as cur:
+                total = self.get_record_count(table_name, market_hours_only=False)
+
+                if total <= limit:
+                    query = f"""
+                        SELECT {select_clause}
+                        FROM {table_name}
+                        ORDER BY timestamp
+                        LIMIT %s
+                    """
+                    cur.execute(query, (limit,))
+                else:
+                    query = f"""
+                        (
+                            SELECT {select_clause}
+                            FROM {table_name}
+                            ORDER BY timestamp ASC
+                            LIMIT %s
+                        )
+                        UNION ALL
+                        (
+                            SELECT {select_clause}
+                            FROM {table_name}
+                            ORDER BY timestamp DESC
+                            LIMIT %s
+                        )
+                        ORDER BY 1, 2
+                    """
+                    cur.execute(query, (limit // 2, limit // 2))
+
+                rows = cur.fetchall()
+
+                try:
+                    k2_logger.database_operation(
+                        "Display SELECT (+indicators)",
+                        f"table={table_name} rows={len(rows)} indicators={len(indicator_cols)}"
+                    )
+                except Exception:
+                    pass
+
+                return rows, total
+
+    # ADD: ensure base columns exist (repair helper)
+    def ensure_base_columns(self, table_name: str) -> None:
+        with self.get_connection() as conn:
+            with self.get_cursor(conn) as cur:
+                cur.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS volume BIGINT")
+                cur.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS vwap NUMERIC(12,4)")
+                conn.commit()
 
     def fetch_time_window_df(self, table_name: str, start_dt: datetime, end_dt: datetime) -> pd.DataFrame:
         """Fetch data within a time window"""

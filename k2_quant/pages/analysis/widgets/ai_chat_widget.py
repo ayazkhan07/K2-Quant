@@ -6,16 +6,19 @@ Save as: k2_quant/pages/analysis/widgets/ai_chat_widget.py
 """
 
 import json
+import re
 from typing import Dict, Any, Optional, List, Generator
 from datetime import datetime
 
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QTextEdit,
                              QLineEdit, QPushButton, QLabel, QComboBox,
-                             QProgressBar)
+                             QProgressBar, QCheckBox)
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer
 from PyQt6.QtGui import QTextCursor, QFont, QTextCharFormat, QColor
 
 from k2_quant.utilities.logger import k2_logger
+from k2_quant.utilities.services import OllamaService, OllamaConfig
+from k2_quant.utilities.data.db_manager import db_manager
 
 
 class AIStreamThread(QThread):
@@ -62,6 +65,11 @@ class AIChatWidget(QWidget):
     code_generated = pyqtSignal(str, str)
     strategy_saved = pyqtSignal(str, str)
     message_sent = pyqtSignal(str)
+    # Emitted when a [QUERY] response provides executable lookup code
+    query_generated = pyqtSignal(str)
+    # New: SQL preview and mutation request
+    sql_generated = pyqtSignal(list)
+    schema_change_requested = pyqtSignal(list, str)
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -70,6 +78,7 @@ class AIChatWidget(QWidget):
         self.conversation_history = []
         self.ai_thread = None
         self.current_code_block = ""
+        self.current_ai_text = ""
         self.is_streaming = False
         
         self.init_ui()
@@ -83,13 +92,28 @@ class AIChatWidget(QWidget):
         layout.setSpacing(10)
         self.setLayout(layout)
         
-        # Header
-        header = self.create_header()
-        layout.addWidget(header)
-        
         # Provider and Model selector
         model_selector = self.create_model_selector()
         layout.addWidget(model_selector)
+
+        # NEW: DB table selector + mutation toggle row
+        top_controls = QWidget()
+        top_layout = QHBoxLayout()
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_controls.setLayout(top_layout)
+
+        top_layout.addWidget(QLabel("Target Table:"))
+        self.table_selector = QComboBox(self)
+        self.table_selector.addItem("(loading...)")
+        top_layout.addWidget(self.table_selector)
+
+        self.enable_mutations_checkbox = QCheckBox("Enable Schema/Data Modifications", self)
+        self.enable_mutations_checkbox.setChecked(False)
+        self.enable_mutations_checkbox.stateChanged.connect(self._on_mutation_toggle)
+        top_layout.addWidget(self.enable_mutations_checkbox)
+
+        top_layout.addStretch()
+        layout.addWidget(top_controls)
         
         # Chat display area
         self.chat_display = QTextEdit()
@@ -105,37 +129,11 @@ class AIChatWidget(QWidget):
         self.streaming_indicator.hide()
         layout.addWidget(self.streaming_indicator)
         
-        # Quick actions
-        quick_actions = self.create_quick_actions()
-        layout.addWidget(quick_actions)
-        
         # Input area
         input_widget = self.create_input_area()
         layout.addWidget(input_widget)
     
-    def create_header(self):
-        """Create header widget"""
-        header = QWidget()
-        header.setFixedHeight(30)
-        
-        layout = QHBoxLayout()
-        layout.setContentsMargins(0, 0, 0, 0)
-        header.setLayout(layout)
-        
-        label = QLabel("AI ASSISTANT")
-        label.setObjectName("headerLabel")
-        layout.addWidget(label)
-        
-        layout.addStretch()
-        
-        # Clear chat button
-        clear_btn = QPushButton("Clear")
-        clear_btn.setFixedWidth(50)
-        clear_btn.clicked.connect(self.clear_chat)
-        clear_btn.setObjectName("clearChatBtn")
-        layout.addWidget(clear_btn)
-        
-        return header
+    
     
     def create_model_selector(self):
         """Create model selector widget"""
@@ -148,7 +146,7 @@ class AIChatWidget(QWidget):
         layout.addWidget(QLabel("Provider:"))
         
         self.provider_selector = QComboBox()
-        self.provider_selector.addItems(["OpenAI", "Anthropic", "Local"])
+        self.provider_selector.addItems(["Anthropic", "OpenAI", "Local"])
         self.provider_selector.currentTextChanged.connect(self.on_provider_changed)
         self.provider_selector.setObjectName("providerSelector")
         layout.addWidget(self.provider_selector)
@@ -163,40 +161,17 @@ class AIChatWidget(QWidget):
         self.model_selector.currentTextChanged.connect(self.on_model_changed)
         self.model_selector.setObjectName("modelSelector")
         layout.addWidget(self.model_selector)
-        
+
+        # Move Clear button here (from removed header)
         layout.addStretch()
+        clear_btn = QPushButton("Clear")
+        clear_btn.setFixedWidth(50)
+        clear_btn.clicked.connect(self.clear_chat)
+        clear_btn.setObjectName("clearChatBtn")
+        layout.addWidget(clear_btn)
         
         return widget
     
-    def create_quick_actions(self):
-        """Create quick action buttons"""
-        widget = QWidget()
-        layout = QHBoxLayout()
-        layout.setContentsMargins(0, 0, 0, 5)
-        widget.setLayout(layout)
-        
-        # Quick prompts
-        elasticity_btn = QPushButton("📊 Elasticity")
-        elasticity_btn.setToolTip("Generate elasticity strategy")
-        elasticity_btn.clicked.connect(lambda: self.send_quick_prompt("elasticity"))
-        elasticity_btn.setObjectName("quickBtn")
-        layout.addWidget(elasticity_btn)
-        
-        projection_btn = QPushButton("📈 Projection")
-        projection_btn.setToolTip("Create price projections")
-        projection_btn.clicked.connect(lambda: self.send_quick_prompt("projection"))
-        projection_btn.setObjectName("quickBtn")
-        layout.addWidget(projection_btn)
-        
-        pattern_btn = QPushButton("🔍 Pattern")
-        pattern_btn.setToolTip("Find pattern matches")
-        pattern_btn.clicked.connect(lambda: self.send_quick_prompt("pattern"))
-        pattern_btn.setObjectName("quickBtn")
-        layout.addWidget(pattern_btn)
-        
-        layout.addStretch()
-        
-        return widget
     
     def create_input_area(self):
         """Create input area widget"""
@@ -224,9 +199,13 @@ class AIChatWidget(QWidget):
         provider = self.provider_selector.currentText().lower()
         
         if provider == "openai":
-            models = ["gpt-4", "gpt-4-turbo-preview", "gpt-3.5-turbo"]
+            models = ["gpt-4-turbo-preview", "gpt-4o", "gpt-3.5-turbo"]
         elif provider == "anthropic":
-            models = ["claude-3-opus-20240229", "claude-3-sonnet-20240229"]
+            models = [
+                "claude-3-5-sonnet-20241022",
+                "claude-3-opus-20240229",
+                "claude-3-haiku-20240307"
+            ]
         elif provider == "local":
             models = ["No models (simulated)"]
         else:
@@ -239,12 +218,18 @@ class AIChatWidget(QWidget):
         """Handle provider change"""
         self.update_model_list()
         
-        # Try to set provider in AI service
+        # Force select first model for new provider
+        if self.model_selector.count() > 0:
+            self.model_selector.setCurrentIndex(0)
+        
+        # Try to set provider and current model in AI service
         try:
             from k2_quant.utilities.services.ai_chat_service import ai_chat_service
             if ai_chat_service:
                 ai_chat_service.set_provider(provider.lower())
-                k2_logger.info(f"AI provider changed to {provider}", "AI_CHAT")
+                if self.model_selector.currentText():
+                    ai_chat_service.set_model(self.model_selector.currentText())
+                k2_logger.info(f"Provider changed: {provider}/{self.model_selector.currentText()}", "AI_CHAT")
         except ImportError:
             k2_logger.debug("AI service not available", "AI_CHAT")
     
@@ -273,16 +258,44 @@ class AIChatWidget(QWidget):
         </div>"""
         
         self.chat_display.setHtml(welcome)
+
+        # Initialize Ollama service (mutations off by default) and populate tables
+        try:
+            self.ollama = OllamaService(
+                db=db_manager,
+                config=OllamaConfig(
+                    allow_schema_changes=False,
+                    allow_data_modifications=False,
+                    auto_backup_before_changes=False,
+                    create_audit_tables=False,
+                ),
+            )
+        except Exception as e:
+            k2_logger.error(f"Failed to initialize OllamaService: {e}", "AI_CHAT")
+            self.ollama = None
+        QTimer.singleShot(0, self._load_table_selector)
     
     def set_data_context(self, data, metadata):
-        """Set the data context for AI"""
+        """Set the data context for AI and pass dataset awareness"""
         self.current_context = {
             'metadata': metadata,
             'data_shape': data.shape if hasattr(data, 'shape') else len(data),
             'columns': list(data.columns) if hasattr(data, 'columns') else None
         }
         
-        # Update AI service context
+        # Build compact recent sample and quick stats for grounding
+        recent_sample = []
+        quick_stats = {}
+        try:
+            if hasattr(data, "columns") and hasattr(data, "tail"):
+                sample_cols = [c for c in ['date_time', 'open', 'high', 'low', 'close', 'volume'] if c in data.columns]
+                if sample_cols:
+                    recent_sample = data.tail(10)[sample_cols].to_dict(orient='records')
+                quick_stats = self._calculate_quick_stats(data)
+        except Exception:
+            pass
+        
+        # Update AI service context (system + dataset)
         try:
             from k2_quant.utilities.services.ai_chat_service import ai_chat_service
             if ai_chat_service:
@@ -293,6 +306,14 @@ class AIChatWidget(QWidget):
                 - Columns: {', '.join(self.current_context['columns']) if self.current_context['columns'] else 'Unknown'}
                 """
                 ai_chat_service.set_system_context(context)
+                ai_chat_service.set_dataset_context(
+                    metadata,
+                    list(data.columns) if hasattr(data, "columns") else [],
+                    recent_sample,
+                    quick_stats,
+                    exchange="NYSE",
+                    tz="US/Eastern"
+                )
         except ImportError:
             pass
         
@@ -300,40 +321,41 @@ class AIChatWidget(QWidget):
         records = self.current_context['data_shape'][0] if isinstance(self.current_context['data_shape'], tuple) else self.current_context['data_shape']
         self.add_system_message(f"📊 Loaded {metadata.get('symbol', 'Unknown')} data with {records} records")
     
-    def send_quick_prompt(self, prompt_type):
-        """Send a quick prompt based on type"""
-        prompts = {
-            'elasticity': "Create an elasticity strategy that calculates (high-low)/low*100, finds patterns within 5% tolerance, and projects 10 days forward",
-            'projection': "Generate a 30-day price projection based on historical patterns and trends",
-            'pattern': "Find repeating patterns in the price data and identify similar historical movements"
-        }
-        
-        if prompt_type in prompts:
-            self.input_field.setText(prompts[prompt_type])
-            self.send_message()
     
     def send_message(self):
-        """Send message to AI"""
+        """Send message to AI (auto-mutation + auto-reload flow)."""
         message = self.input_field.text().strip()
         if not message or self.is_streaming:
             return
-        
-        # Add user message to display
+
+        # Show user message and start streaming assistant text
         self.add_user_message(message)
-        
-        # Clear input
         self.input_field.clear()
-        
-        # Emit signal
         self.message_sent.emit(message)
-        
-        # Start streaming
         self.start_streaming(message)
+
+        # Auto-apply default elasticity formula when ambiguous
+        m_lower = message.lower()
+        if "elasticity" in m_lower and self._formula_is_ambiguous(message):
+            message = f"{message} using formula ((high - low) / low) * 100"
+
+        # Dispatch background work
+        try:
+            if self._is_mutation_intent(message):
+                # If mutations are disabled, enable them for this action
+                if hasattr(self, "enable_mutations_checkbox") and not self.enable_mutations_checkbox.isChecked():
+                    self.enable_mutations_checkbox.setChecked(True)
+                self._start_schema_generation(message)  # generate → execute (no preview)
+            else:
+                self._start_read_query(message)
+        except Exception as e:
+            k2_logger.error(f"Dispatch error: {e}", "AI_CHAT")
     
     def start_streaming(self, message):
         """Start streaming AI response"""
         self.is_streaming = True
         self.current_code_block = ""
+        self.current_ai_text = ""
         
         # Disable input
         self.input_field.setEnabled(False)
@@ -345,7 +367,7 @@ class AIChatWidget(QWidget):
         # Add AI message placeholder
         self.add_ai_message("")
         
-        # Start thread
+        # Start thread (legacy local AIStreamThread kept for compatibility)
         self.ai_thread = AIStreamThread(message)
         self.ai_thread.text_chunk.connect(self.append_ai_text)
         self.ai_thread.complete.connect(self.streaming_complete)
@@ -356,6 +378,9 @@ class AIChatWidget(QWidget):
         """Append streamed text to AI message"""
         cursor = self.chat_display.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
+        
+        # Accumulate full AI text for tag parsing
+        self.current_ai_text += chunk
         
         # Check for code blocks
         if "```python" in chunk or "```" in chunk:
@@ -378,10 +403,7 @@ class AIChatWidget(QWidget):
         # Hide streaming indicator
         self.streaming_indicator.hide()
         
-        # Process any code blocks
-        if self.current_code_block:
-            self.process_code_block(self.current_code_block)
-        
+        # Legacy [QUERY]/[DIRECT] flow removed; we handle in background threads now
         k2_logger.info("AI streaming complete", "AI_CHAT")
     
     def streaming_error(self, error):
@@ -401,23 +423,42 @@ class AIChatWidget(QWidget):
     
     def process_code_block(self, text):
         """Process code block from AI response"""
-        # Extract Python code
+        code = self._extract_python_code(text)
+        if not code:
+            return
+        
+        # Show code in formatted block
+        self.add_code_block(code)
+        
+        # Ask if user wants to execute
+        self.add_system_message("📝 Code generated. Click 'Execute' to run this strategy.")
+        
+        # Store for execution
+        self.current_code_block = code
+        
+        # Emit signal
+        self.code_generated.emit(code, "AI Generated Strategy")
+
+    def _extract_python_code(self, text: str) -> Optional[str]:
+        """Extract Python code from a markdown fenced block"""
         if "```python" in text:
             parts = text.split("```python")
             if len(parts) > 1:
                 code = parts[1].split("```")[0].strip()
-                
-                # Show code in formatted block
-                self.add_code_block(code)
-                
-                # Ask if user wants to execute
-                self.add_system_message("📝 Code generated. Click 'Execute' to run this strategy.")
-                
-                # Store for execution
-                self.current_code_block = code
-                
-                # Emit signal
-                self.code_generated.emit(code, "AI Generated Strategy")
+                return code
+        return None
+
+    def _parse_tag(self, text: str) -> (Optional[str], str):
+        """Parse leading tag like [DIRECT]/[QUERY]/[STRATEGY]/[DECLINE]"""
+        try:
+            m = re.match(r'^\s*\[(DIRECT|QUERY|STRATEGY|DECLINE)\]\s*', text, re.IGNORECASE)
+            if m:
+                tag = m.group(1).upper()
+                remainder = text[m.end():]
+                return tag, remainder
+        except Exception:
+            pass
+        return None, text
     
     def add_user_message(self, message):
         """Add user message to chat"""
@@ -539,14 +580,6 @@ class AIChatWidget(QWidget):
     def setup_styling(self):
         """Apply styling to the widget"""
         self.setStyleSheet("""
-            #headerLabel {
-                font-size: 11px;
-                text-transform: uppercase;
-                letter-spacing: 1px;
-                color: #999;
-                font-weight: 600;
-            }
-            
             #chatDisplay {
                 background-color: #0a0a0a;
                 color: #ccc;
@@ -605,20 +638,6 @@ class AIChatWidget(QWidget):
                 color: #999;
             }
             
-            #quickBtn {
-                background-color: #1a1a1a;
-                color: #888;
-                border: 1px solid #2a2a2a;
-                padding: 4px 8px;
-                border-radius: 3px;
-                font-size: 11px;
-            }
-            
-            #quickBtn:hover {
-                background-color: #2a2a2a;
-                color: #fff;
-            }
-            
             #providerSelector, #modelSelector {
                 background-color: #1a1a1a;
                 color: #fff;
@@ -662,3 +681,155 @@ class AIChatWidget(QWidget):
         if self.ai_thread and self.ai_thread.isRunning():
             self.ai_thread.terminate()
             self.ai_thread.wait()
+
+    # -------- Helpers ----------
+
+    def _calculate_quick_stats(self, df) -> dict:
+        """Compute small set of quick stats for grounding."""
+        stats = {}
+        try:
+            if df is not None and hasattr(df, "columns") and len(df) > 0:
+                if 'high' in df.columns:
+                    stats['week_high'] = float(df['high'].tail(25).max())
+                if 'low' in df.columns:
+                    stats['week_low'] = float(df['low'].tail(25).min())
+                if 'close' in df.columns:
+                    stats['last_close'] = float(df['close'].iloc[-1])
+                if 'volume' in df.columns:
+                    stats['avg_volume'] = float(df['volume'].tail(20).mean())
+        except Exception:
+            pass
+        return stats
+
+    # =================== NEW: Ollama integration helpers ===================
+
+    def _on_mutation_toggle(self, state):
+        try:
+            if not self.ollama:
+                return
+            enabled = bool(state)
+            self.ollama.config.allow_schema_changes = enabled
+            self.ollama.config.allow_data_modifications = enabled
+            self.add_system_message("Schema/Data modifications " + ("ENABLED" if enabled else "DISABLED"))
+        except Exception:
+            pass
+
+    def _load_table_selector(self):
+        if not getattr(self, 'ollama', None):
+            return
+        try:
+            schema = self.ollama.introspect_schema()
+            stock_tables = [t for t in schema.keys() if t.startswith('stock_')]
+            self.table_selector.clear()
+            if stock_tables:
+                self.table_selector.addItems(stock_tables)
+            else:
+                self.table_selector.addItem("(no stock_* tables)")
+        except Exception as exc:
+            self.table_selector.clear()
+            self.table_selector.addItem(f"(schema error: {exc})")
+
+    def _is_mutation_intent(self, text: str) -> bool:
+        t = text.lower()
+        return any(kw in t for kw in ["add column", "alter table", "delete rows", "update set", "remove outlier", "modify column"])
+
+    def _start_schema_generation(self, request_text: str):
+        if not getattr(self, 'ollama', None):
+            return
+        # Run only if mutations might be intended; clarification handled in chat flow by user
+        self.setCursor(Qt.CursorShape.WaitCursor)
+        self._gen_thread = SchemaGenThread(self.ollama, request_text)
+        self._gen_thread.generated.connect(self._on_ops_generated)
+        self._gen_thread.error.connect(lambda e: self.add_system_message(f"Schema generation error: {e}"))
+        self._gen_thread.finished.connect(lambda: self.setCursor(Qt.CursorShape.ArrowCursor))
+        self._gen_thread.start()
+
+    def _start_read_query(self, prompt: str):
+        if not getattr(self, 'ollama', None):
+            return
+        self.setCursor(Qt.CursorShape.WaitCursor)
+        self._read_thread = ReadQueryThread(self.ollama, prompt)
+        self._read_thread.succeeded.connect(self._render_read_result)
+        self._read_thread.error.connect(lambda e: self.add_system_message(f"Query error: {e}"))
+        self._read_thread.finished.connect(lambda: self.setCursor(Qt.CursorShape.ArrowCursor))
+        self._read_thread.start()
+
+    def _on_ops_generated(self, operations: List[str], rationale: str):
+        if not operations:
+            self.add_system_message("No SQL operations were generated.")
+            return
+
+        table_hint = self.table_selector.currentText() if hasattr(self, 'table_selector') else None
+        if not table_hint or table_hint.startswith("("):
+            self.add_system_message("⚠️ No valid table selected")
+            return
+
+        try:
+            if not db_manager.validate_table_exists(table_hint):
+                self.add_system_message(f"⚠️ Table does not exist: {table_hint}")
+                return
+        except Exception:
+            pass
+
+        # Log and execute immediately (skip preview/confirm)
+        self.add_system_message(f"Executing {len(operations)} operation(s) on {table_hint}...")
+        self._execute_operations(operations, table_hint)
+
+    def _execute_operations(self, operations: List[str], table_hint: str):
+        if not getattr(self, 'ollama', None):
+            return
+        self.setCursor(Qt.CursorShape.WaitCursor)
+        self._exec_thread = SchemaExecThread(self.ollama, operations, table_hint, request_text=None)
+        self._exec_thread.succeeded.connect(self._on_mutation_complete)
+        self._exec_thread.error.connect(lambda e: self.add_system_message(f"Execution error: {e}"))
+        self._exec_thread.finished.connect(lambda: self.setCursor(Qt.CursorShape.ArrowCursor))
+        self._exec_thread.start()
+
+    def _on_mutation_complete(self, result: Dict[str, Any]):
+        self.add_system_message("✓ Changes applied successfully.")
+        try:
+            if not hasattr(self, 'operation_history'):
+                self.operation_history = []
+            self.operation_history.append({
+                'timestamp': datetime.now(),
+                'operations': result.get('operations', []),
+                'snapshot': result.get('snapshot'),
+                'table': self.table_selector.currentText() if hasattr(self, 'table_selector') else None,
+            })
+        except Exception:
+            pass
+
+        # Auto-reload immediately
+        self._reload_current_table()
+
+    def _reload_current_table(self):
+        table_name = self.table_selector.currentText() if hasattr(self, 'table_selector') else None
+        if not table_name or table_name.startswith("("):
+            return
+        try:
+            rows, total = db_manager.fetch_display_data(table_name, limit=1000, market_hours_only=False)
+            import pandas as pd
+            df = pd.DataFrame(rows, columns=[
+                "market_date", "market_time", "open", "high", "low", "close", "volume", "vwap"
+            ])
+            # TODO: Replace with your real table widget integration
+            self.add_system_message(f"Reloaded {table_name} (showing {len(df)} rows, total {total}).")
+        except Exception as exc:
+            self.add_system_message(f"Reload failed: {exc}")
+
+    def _render_read_result(self, result: Dict[str, Any]):
+        table = result.get("table_update")
+        chart = result.get("chart_update")
+
+        if table:
+            import pandas as pd
+            rows = table.get("rows", [])
+            df = pd.DataFrame(rows)
+            # TODO: Replace with your real table widget integration
+            self.add_system_message(
+                f"Loaded {table.get('total_rows', len(rows))} rows (page {table.get('page', 1)})."
+            )
+
+        if chart:
+            # TODO: Map to chart widget
+            pass

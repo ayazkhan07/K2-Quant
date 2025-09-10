@@ -44,6 +44,30 @@ except ImportError:
     stock_service = None
 
 
+# Smart axis for units (e.g., Volume in thousands/millions)
+class SmartUnitAxisItem(pg.AxisItem):
+    def __init__(self, orientation='left', mode='volume', **kwargs):
+        super().__init__(orientation=orientation, **kwargs)
+        self.mode = mode
+
+    def tickStrings(self, values, scale, spacing):
+        if self.mode == 'volume':
+            out = []
+            for v in values:
+                av = abs(v)
+                if av >= 1_000_000:
+                    out.append(f"{v/1_000_000:.1f}M")
+                elif av >= 1_000:
+                    out.append(f"{v/1_000:.0f}T")
+                else:
+                    try:
+                        out.append(f"{int(v)}")
+                    except Exception:
+                        out.append(str(v))
+            return out
+        return super().tickStrings(values, scale, spacing)
+
+
 # Time span enumeration
 class TimeSpan(Enum):
     """Time span categories for adaptive formatting"""
@@ -299,103 +323,328 @@ class ViewportState:
 
 
 class TimeAxisManager:
-    """Manages intelligent time axis labeling and formatting"""
-    
-    def __init__(self):
+    """Manages intelligent time axis labeling and formatting with market-aware anchors."""
+
+    def __init__(self, market_open=(9, 30), market_close=(16, 0)):
         self.label_cache = {}
         self.format_cache = {}
         self.max_labels = 20
         self.min_label_spacing = 50  # pixels
-        
-    def calculate_time_labels(self, data, date_column, x_range, axis_width):
-        """
-        Calculate optimal time labels based on visible range and zoom level
-        """
-        if data is None or len(data) == 0 or date_column not in data.columns:
-            return []
-        
-        # Get visible data indices with strict bounds checking
+        self.market_open = market_open
+        self.market_close = market_close
+        self.anchor_tol_intraday_s = 180
+        self.anchor_tol_daily_s = 86400
+        self.anchor_drop_intraday_s = 6 * 3600
+        self.anchor_drop_daily_s = 3 * 86400
+
+    def _infer_granularity(self, data, date_column) -> str:
+        try:
+            ts = pd.to_datetime(data[date_column], errors='coerce').dropna()
+            if len(ts) < 3:
+                return 'daily'
+            deltas = ts.diff().dropna().astype('timedelta64[s]')
+            median_s = float(deltas.median())
+            return 'minute' if median_s < 60 * 60 * 20 else 'daily'
+        except Exception:
+            return 'daily'
+
+    def _visible_window(self, data, date_column, x_range):
         x_min = int(max(0, round(x_range[0])))
         x_max = int(min(len(data) - 1, round(x_range[1])))
-        
-        # Validate range
         if x_min >= len(data) or x_max < 0 or x_min > x_max:
+            return None, None, None
+        ts = pd.to_datetime(data[date_column], errors='coerce')
+        return x_min, x_max, (ts.iloc[x_min], ts.iloc[x_max])
+
+    def _market_open_close(self, dt):
+        ho, mo = self.market_open
+        hc, mc = self.market_close
+        return dt.replace(hour=ho, minute=mo, second=0, microsecond=0), dt.replace(hour=hc, minute=mc, second=0, microsecond=0)
+
+    def _round_to_quarter_hour(self, dt):
+        m = (dt.minute // 15) * 15
+        return dt.replace(minute=m, second=0, microsecond=0)
+
+    def _week_start(self, dt):
+        return (dt - timedelta(days=dt.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def _month_start(self, dt):
+        return dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    def _quarter_start(self, dt):
+        qm = ((dt.month - 1) // 3) * 3 + 1
+        return dt.replace(month=qm, day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    def _build_intraday_anchors(self, start_dt, end_dt, span_s):
+        anchors = []
+        d0 = start_dt.normalize(); d1 = end_dt.normalize()
+        day = d0
+        while day <= d1:
+            open_dt, close_dt = self._market_open_close(day)
+            if open_dt <= end_dt and close_dt >= start_dt:
+                if span_s <= 30 * 60:
+                    step = timedelta(minutes=1 if span_s <= 10 * 60 else 5)
+                    t = max(open_dt, self._round_to_quarter_hour(start_dt))
+                    while t <= min(close_dt, end_dt):
+                        anchors.append(t); t += step
+                elif span_s <= 3 * 60 * 60:
+                    t = max(open_dt, self._round_to_quarter_hour(start_dt))
+                    while t <= min(close_dt, end_dt):
+                        anchors.append(t); t += timedelta(minutes=15)
+                elif span_s <= 7 * 60 * 60:
+                    for hh, mm in [(9, 30), (10, 0), (11, 0), (12, 0), (14, 0), (15, 0), (16, 0)]:
+                        t = day.replace(hour=hh, minute=mm, second=0, microsecond=0)
+                        if start_dt <= t <= end_dt: anchors.append(t)
+                elif span_s <= 5 * 24 * 60 * 60:
+                    for t in [open_dt, day.replace(hour=12, minute=0, second=0, microsecond=0)]:
+                        if start_dt <= t <= end_dt: anchors.append(t)
+                else:
+                    if start_dt <= open_dt <= end_dt: anchors.append(open_dt)
+            day += timedelta(days=1)
+        return anchors
+
+    def _build_daily_anchors(self, start_dt, end_dt, span_d):
+        anchors = []
+        if span_d <= 10:
+            t = start_dt.normalize()
+            while t <= end_dt:
+                anchors.append(t); t += timedelta(days=1)
+        elif span_d <= 62:
+            t = self._week_start(start_dt)
+            while t <= end_dt:
+                anchors.append(t); t += timedelta(days=7)
+        elif span_d <= 190:
+            t = self._month_start(start_dt)
+            while t <= end_dt:
+                anchors.append(t)
+                y = t.year + (1 if t.month == 12 else 0)
+                m = 1 if t.month == 12 else t.month + 1
+                t = t.replace(year=y, month=m, day=1)
+        elif span_d <= 730:
+            t = self._quarter_start(start_dt)
+            while t <= end_dt:
+                anchors.append(t)
+                qm = ((t.month - 1) // 3) * 3 + 4
+                y = t.year + (1 if qm > 12 else 0)
+                m = 1 if qm > 12 else qm
+                t = t.replace(year=y, month=m, day=1)
+        else:
+            t = self._quarter_start(start_dt)
+            while t <= end_dt:
+                anchors.append(t)
+                y = t.year + (1 if t.month >= 10 else 0)
+                m = 1 if t.month >= 10 else t.month + 3
+                t = t.replace(year=y, month=m, day=1)
+        return anchors
+
+    def _format_label_for_plan(self, t, prev, first, granularity, span_s, span_d, crosses_day=False, is_last=False):
+        if granularity == 'minute':
+            if span_s <= 7 * 60 * 60:
+                if first:
+                    return safe_strftime(t, "%b %d\n%H:%M", "")
+                if crosses_day:
+                    return safe_strftime(t, "%b %d\n%H:%M", "")
+                if is_last and prev and t.date() != prev.date():
+                    return safe_strftime(t, "%H:%M\n%b %d", "")
+                return safe_strftime(t, "%H:%M", "")
+            if span_s <= 5 * 24 * 60 * 60:
+                if first or crosses_day:
+                    return safe_strftime(t, "%b %d\n%H:%M", "")
+                return safe_strftime(t, "%H:%M", "")
+            return safe_strftime(t, "%b %d", "")
+        if span_d <= 10:
+            txt = safe_strftime(t, "%b %d", "")
+            if first and (not prev or t.year != prev.year):
+                return f"{txt}\n{safe_strftime(t, '%Y', '')}"
+            return txt
+        if span_d <= 62:
+            return safe_strftime(t, "%b %d", "")
+        if span_d <= 190:
+            txt = safe_strftime(t, "%b", "")
+            if first and (not prev or t.year != prev.year):
+                return f"{txt}\n{safe_strftime(t, '%Y', '')}"
+            return txt
+        if span_d <= 730:
+            q = (t.month - 1) // 3 + 1
+            return f"Q{q} {t.year}" if first else f"Q{q}"
+        return safe_strftime(t, "%Y", "")
+
+    def calculate_time_labels(self, data, date_column, x_range, axis_width):
+        if data is None or len(data) == 0 or date_column not in data.columns:
+            try: k2_logger.debug("XAXIS: early return - data/date_column issue", "CHART")
+            except Exception: pass
             return []
-        
-        # Additional check for minimum visible points
-        if x_max - x_min < 1:  # Need at least 2 points to show labels
+        x_min, x_max, window = self._visible_window(data, date_column, x_range)
+        if window is None:
+            try: k2_logger.debug("XAXIS: no visible window", "CHART")
+            except Exception: pass
             return []
-        
-        # Get date range
+        start_dt, end_dt = window
+        if pd.isna(start_dt) or pd.isna(end_dt):
+            try: k2_logger.debug("XAXIS: NaT window", "CHART")
+            except Exception: pass
+            return []
+
+        granularity = self._infer_granularity(data, date_column)
+        duration_s = (end_dt - start_dt).total_seconds()
+        duration_d = (end_dt - start_dt).days + 1e-6
+
         try:
-            start_date = pd.to_datetime(data.iloc[x_min][date_column])
-            end_date = pd.to_datetime(data.iloc[x_max][date_column])
-        except:
-            return []
-        
-        if pd.isna(start_date) or pd.isna(end_date):
-            return []
-        
-        # Determine time span and get format config
-        time_span, duration_seconds = get_time_span(start_date, end_date)
-        format_config = TIME_FORMATS[time_span]
-        
-        # Calculate interval
-        interval = format_config['interval_func'](duration_seconds)
-        
-        # Calculate maximum number of labels that fit
-        max_labels_for_width = int(axis_width / self.min_label_spacing)
-        num_labels = min(self.max_labels, max_labels_for_width)
-        
-        # Generate label positions
-        labels = []
-        
-        # Find first label position (snapped to boundary)
-        current_time = snap_to_time_boundary(start_date, time_span)
-        if current_time < start_date:
-            current_time += interval
-        
-        # Generate labels at intervals
-        last_x_pos = -self.min_label_spacing
-        prev_formatted = ""
-        context_shown = False
-        
-        while current_time <= end_date and len(labels) < num_labels:
-            # Find the data point closest to this time
-            time_diffs = np.abs((data[date_column] - current_time).dt.total_seconds())
-            
-            # Skip if no valid time differences
-            if time_diffs.isna().all():
-                current_time += interval
+            k2_logger.debug(str({
+                'event': 'xaxis_plan',
+                'granularity': granularity,
+                'start_dt': str(start_dt),
+                'end_dt': str(end_dt),
+                'duration_s': int(duration_s),
+                'axis_width_px': int(axis_width)
+            }), "CHART")
+        except Exception:
+            pass
+
+        anchors = self._build_intraday_anchors(start_dt, end_dt, duration_s) if granularity == 'minute' \
+                  else self._build_daily_anchors(start_dt, end_dt, duration_d)
+
+        ts = pd.to_datetime(data[date_column], errors='coerce')
+
+        snapped = []
+        for t in anchors:
+            diffs = np.abs((ts - t).dt.total_seconds())
+            if diffs.isna().all():
                 continue
-                
-            closest_idx = time_diffs.idxmin()
-            
-            if pd.notna(closest_idx) and x_min <= closest_idx <= x_max:
-                # Calculate pixel position
-                x_pos = axis_width * ((closest_idx - x_range[0]) / (x_range[1] - x_range[0]))
-                
-                # Check minimum spacing
-                if x_pos - last_x_pos >= self.min_label_spacing:
-                    # Format label
-                    label_text = self._format_time_label(
-                        current_time, time_span, format_config, 
-                        prev_formatted, context_shown
-                    )
-                    
-                    if label_text:
-                        labels.append((label_text, x_pos))
-                        last_x_pos = x_pos
-                        prev_formatted = label_text
-                        
-                        # Check if we showed context (year change, etc.)
-                        if format_config.get('context') and not context_shown:
-                            if self._should_show_context(current_time, start_date, time_span):
-                                context_shown = True
-            
-            current_time += interval
-        
+            i = int(diffs.idxmin())
+            if not (x_min <= i <= x_max):
+                continue
+            actual_t = ts.iloc[i]
+            delta_s = abs((actual_t - t).total_seconds())
+            if granularity == 'minute' and delta_s > self.anchor_drop_intraday_s:
+                continue
+            if granularity == 'daily' and delta_s > self.anchor_drop_daily_s:
+                continue
+            if granularity == 'minute':
+                label_time = t if delta_s <= self.anchor_tol_intraday_s else actual_t
+            else:
+                label_time = t if delta_s <= self.anchor_tol_daily_s else actual_t
+            snapped.append((t, i, label_time))
+
+        try:
+            k2_logger.debug(str({
+                'event': 'xaxis_counts',
+                'anchors': int(len(anchors)),
+                'snapped': int(len(snapped))
+            }), "CHART")
+        except Exception:
+            pass
+
+        if not snapped:
+            return []
+
+        def build_labels(min_spacing_px: int):
+            labels = []
+            last_x = -min_spacing_px
+            prev_label_time = None
+            first = True
+            total = len(snapped)
+            for idx, (anchor_t, i, label_time) in enumerate(snapped):
+                if x_range[1] <= x_range[0] or axis_width <= 0:
+                    continue
+                x_pos = axis_width * ((i - x_range[0]) / (x_range[1] - x_range[0]))
+                if x_pos - last_x < min_spacing_px:
+                    continue
+                crosses_day = bool(prev_label_time and prev_label_time.date() != label_time.date())
+                is_last = (idx == total - 1)
+                text = self._format_label_for_plan(
+                    t=label_time, prev=prev_label_time, first=first,
+                    granularity=granularity, span_s=duration_s, span_d=duration_d,
+                    crosses_day=crosses_day, is_last=is_last
+                )
+                if text:
+                    labels.append((text, x_pos))
+                    last_x = x_pos
+                    prev_label_time = label_time
+                    first = False
+            return labels
+
+        labels = build_labels(self.min_label_spacing)
+        if not labels and axis_width > 0:
+            fallback_spacing = max(20, int(self.min_label_spacing * 0.7))
+            labels = build_labels(fallback_spacing)
+
+        try:
+            k2_logger.debug(str({
+                'event': 'xaxis_labels',
+                'returned': int(len(labels))
+            }), "CHART")
+        except Exception:
+            pass
+
         return labels
+
+    def calculate_grid_positions(self, data, date_column, x_range, interval_type=None):
+        if data is None or len(data) == 0:
+            return []
+        x_min, x_max, window = self._visible_window(data, date_column, x_range)
+        if window is None or x_min >= x_max:
+            return []
+        start_dt, end_dt = window
+
+        granularity = self._infer_granularity(data, date_column)
+        duration_s = (end_dt - start_dt).total_seconds()
+        duration_d = (end_dt - start_dt).days + 1e-6
+
+        candidates = []
+        if granularity == 'minute':
+            step = None
+            if duration_s <= 30 * 60:
+                step = timedelta(minutes=1)
+            elif duration_s <= 3 * 60 * 60:
+                step = timedelta(minutes=5)
+            elif duration_s <= 7 * 60 * 60:
+                step = timedelta(minutes=15)
+            elif duration_s <= 5 * 24 * 60 * 60:
+                t = start_dt.normalize()
+                while t <= end_dt:
+                    o, c = self._market_open_close(t)
+                    h = max(o, start_dt)
+                    while h <= min(c, end_dt):
+                        candidates.append(h); h += timedelta(hours=1)
+                    t += timedelta(days=1)
+            else:
+                t = start_dt.normalize()
+                while t <= end_dt:
+                    o, _ = self._market_open_close(t)
+                    candidates.append(o); t += timedelta(days=1)
+
+            if step is not None:
+                t = max(start_dt, self._round_to_quarter_hour(start_dt))
+                while t <= end_dt:
+                    candidates.append(t); t += step
+        else:
+            if duration_d <= 10:
+                t = start_dt.normalize()
+                while t <= end_dt:
+                    candidates.append(t); t += timedelta(days=1)
+            elif duration_d <= 62:
+                t = self._week_start(start_dt)
+                while t <= end_dt:
+                    candidates.append(t); t += timedelta(days=7)
+            else:
+                t = self._month_start(start_dt)
+                while t <= end_dt:
+                    candidates.append(t)
+                    y = t.year + (1 if t.month == 12 else 0)
+                    m = 1 if t.month == 12 else t.month + 1
+                    t = t.replace(year=y, month=m, day=1)
+
+        ts = pd.to_datetime(data[date_column], errors='coerce')
+        positions = []
+        for t in candidates:
+            diffs = np.abs((ts - t).dt.total_seconds())
+            if diffs.isna().all():
+                continue
+            i = int(diffs.idxmin())
+            if x_min <= i <= x_max:
+                positions.append(i)
+        return sorted(set(positions))
     
     def _format_time_label(self, dt, time_span, format_config, prev_label, context_shown):
         """
@@ -800,6 +1049,69 @@ class ChartWidget(QWidget):
         # Chart container
         chart_widget = self._create_chart_container()
         main_layout.addWidget(chart_widget)
+
+        # Autoload control flags (prevent pane flashing on immediate reloads)
+        self._autoload_suspended = False
+        self._last_ui_mutation_ms = 0
+
+        # Caches for sub-pane series data and modes so we can reapply after reloads
+        self._series_data = {}
+        self._series_y_mode = {}
+
+        # Axis retry gate to avoid repeated reschedules before layout settles
+        self._axis_retry_pending = False
+
+    # --- Autoload guards ----------------------------------------------------
+    def _suspend_autoload(self):
+        self._autoload_suspended = True
+        try:
+            if hasattr(self, 'viewport_update_timer') and self.viewport_update_timer is not None:
+                self.viewport_update_timer.stop()
+        except Exception:
+            pass
+
+    def _resume_autoload(self):
+        self._autoload_suspended = False
+
+    def _mark_ui_mutation(self):
+        try:
+            import time as _t
+            self._last_ui_mutation_ms = int(_t.time() * 1000)
+        except Exception:
+            self._last_ui_mutation_ms = 0
+
+    def _recent_ui_mutation(self, window_ms: int = 250) -> bool:
+        try:
+            import time as _t
+            return int(_t.time() * 1000) - int(getattr(self, '_last_ui_mutation_ms', 0)) < window_ms
+        except Exception:
+            return False
+
+    # --- Re-apply cached indicator panes after data reload ------------------
+    def _reapply_indicator_panes(self):
+        if not hasattr(self, 'x_values') or self.x_values is None:
+            return
+        if not hasattr(self, '_series_data') or not self._series_data:
+            return
+        for (pane_key, series_label), series in list(self._series_data.items()):
+            try:
+                y_values = series.values.astype(np.float32) if isinstance(series, pd.Series) else np.asarray(series, dtype=np.float32)
+                y_values = np.clip(y_values, -1e6, 1e6)
+                y_values[np.isinf(y_values)] = np.nan
+                n = int(min(len(self.x_values), len(y_values)))
+                if n <= 0:
+                    continue
+                x_tail = self.x_values[-n:]
+                y_tail = y_values[-n:]
+                if hasattr(self, 'pane_series_map') and pane_key in self.pane_series_map and series_label in self.pane_series_map[pane_key]:
+                    item = self.pane_series_map[pane_key][series_label]
+                    if isinstance(item, OptimizedPlotDataItem):
+                        item.setData(x=x_tail, y=y_tail)
+                else:
+                    y_mode = self._series_y_mode.get((pane_key, series_label), 'auto') if hasattr(self, '_series_y_mode') else 'auto'
+                    self.add_or_update_indicator_pane(pane_key=pane_key, series_label=series_label, series=series, y_mode=y_mode)
+            except Exception:
+                continue
         
     def _create_chart_container(self):
         """Create optimized chart container"""
@@ -1078,8 +1390,52 @@ class ChartWidget(QWidget):
         vb = self.main_plot.getViewBox()
         x_range, y_range = vb.viewRange()
 
+        # DIAGNOSTIC: surface current view and data state
+        try:
+            k2_logger.debug(str({
+                'event': 'xaxis_update',
+                'x_range': (float(x_range[0]), float(x_range[1])),
+                'axis_width_px': int(getattr(self.x_axis, '_width', 0)),
+                'date_column': self.date_column,
+                'data_rows': int(len(self.data) if self.data is not None else 0)
+            }), "CHART")
+        except Exception:
+            pass
+
+        # NEW: gate until axis has width and datetime is ready; retry once
+        try:
+            axis_width_px = int(getattr(self.x_axis, '_width', 0))
+        except Exception:
+            axis_width_px = 0
+
+        date_ready = False
+        try:
+            date_ready = (
+                self.data is not None and
+                isinstance(self.date_column, str) and
+                self.date_column in self.data.columns and
+                self.data[self.date_column].notna().any()
+            )
+        except Exception:
+            date_ready = False
+
+        if axis_width_px <= 0 or not date_ready:
+            if not getattr(self, '_axis_retry_pending', False):
+                self._axis_retry_pending = True
+                def _retry_axis_update():
+                    self._axis_retry_pending = False
+                    self.update_axis_labels_and_grid()
+                QTimer.singleShot(40, _retry_axis_update)
+            return
+
         self._update_y_axis_and_grid(y_range)
         self._update_x_axis_and_grid_intelligent(x_range)
+
+        # Also ensure sub-pane series stay aligned when the view changes after reload
+        try:
+            self._reapply_indicator_panes()
+        except Exception:
+            pass
         
     def _update_y_axis_and_grid(self, y_range):
         """Update Y-axis labels and horizontal grid lines"""
@@ -1296,6 +1652,15 @@ class ChartWidget(QWidget):
         self.update_axis_geometry()
         QTimer.singleShot(0, self.update_axis_labels_and_grid)
         
+        # NEW: post-layout nudge to avoid blank top panel if first pass had axis_width=0
+        QTimer.singleShot(40, self.update_axis_labels_and_grid)
+        
+        # Re-apply any cached indicator panes/series now that X has been rebuilt
+        try:
+            self._reapply_indicator_panes()
+        except Exception:
+            pass
+        
         k2_logger.info(f"Data loaded: {len(self.data)} records", "CHART")
         
     def _update_viewport_limits(self):
@@ -1456,8 +1821,8 @@ class ChartWidget(QWidget):
             # No resampling paths for removed timeframes
             pass
             
-        # Create x values
-        self.clear_all()
+        # Create x values (preserve panes across reload)
+        self.clear_all(preserve_indicator_panes=True)
         self.x_values = np.arange(len(self.data), dtype=np.float32)
         
     def _resample_data_optimized(self):
@@ -1715,6 +2080,11 @@ class ChartWidget(QWidget):
     def _check_and_fetch_if_needed(self):
         """Check if more data needs to be fetched"""
         if not self.current_table_name or self.is_fetching or self.data is None:
+            return
+        # Guard: avoid immediate auto fetch right after UI pane/overlay mutations
+        if getattr(self, '_autoload_suspended', False):
+            return
+        if self._recent_ui_mutation(250):
             return
             
         vb = self.main_plot.getViewBox()
@@ -2378,8 +2748,10 @@ class ChartWidget(QWidget):
         if hasattr(self, 'main_plot'):
             self.main_plot.getViewBox().setBackgroundColor('#0a0a0a')
             
-    def clear_all(self):
-        """Clear all chart elements efficiently"""
+    def clear_all(self, preserve_indicator_panes: bool = False):
+        """Clear chart elements efficiently.
+        If preserve_indicator_panes=True, keep sub-panes across price-data reloads.
+        """
         # Remove plot items
         for line in self.active_lines.values():
             if line.scene():  # Check if still in scene
@@ -2392,9 +2764,10 @@ class ChartWidget(QWidget):
                 self.main_plot.removeItem(overlay)
         self.indicator_overlays.clear()
         
-        # Remove indicator panes
-        for indicator_name in list(self.indicator_panes.keys()):
-            self.remove_indicator_pane(indicator_name)
+        # Remove indicator panes only if not preserving
+        if not preserve_indicator_panes:
+            for indicator_name in list(self.indicator_panes.keys()):
+                self.remove_indicator_pane(indicator_name)
         
         # Clear caches
         self._format_cache.clear()
@@ -2403,29 +2776,55 @@ class ChartWidget(QWidget):
         if hasattr(self, '_method_cache'):
             self._method_cache.clear()
             
-    def add_indicator(self, indicator_name, indicator_data, color='#ffff00'):
-        """Add indicator overlay"""
+    def add_indicator_overlay(self, indicator_name: str, series: pd.Series, cid: str | None = None):
+        """Render overlay as dotted white on main plot (ignores caller color)."""
+        self._suspend_autoload()
         if indicator_name in self.indicator_overlays:
             self.remove_indicator(indicator_name)
 
         if self.x_values is None:
-            self.x_values = np.arange(len(indicator_data), dtype=np.float32)
+            self.x_values = np.arange(len(series), dtype=np.float32)
 
-        y_values = indicator_data.values.astype(np.float32) if isinstance(indicator_data, pd.Series) else np.array(indicator_data, dtype=np.float32)
+        y_values = series.values.astype(np.float32) if isinstance(series, pd.Series) else np.array(series, dtype=np.float32)
 
         y_values = np.clip(y_values, -1e6, 1e6)
         y_values[np.isinf(y_values)] = np.nan
 
+        n = int(min(len(self.x_values), len(y_values)))
+        if len(y_values) != len(self.x_values):
+            try:
+                k2_logger.debug(f"Aligning arrays: chart_x={len(self.x_values)}, indicator_y={len(y_values)}, using last {n} points", "CHART")
+            except Exception:
+                pass
+        x_tail = self.x_values[-n:]
+        y_tail = y_values[-n:]
+
         plot_item = OptimizedPlotDataItem(
-            x=self.x_values[:len(y_values)],
-            y=y_values,
-            pen=pg.mkPen(color=color, width=2, style=Qt.PenStyle.DashLine),
+            x=x_tail,
+            y=y_tail,
+            pen=pg.mkPen(color='#ffffff', width=2, style=Qt.PenStyle.DotLine),
             connect='finite'
         )
 
         self.main_plot.addItem(plot_item)
         self.indicator_overlays[indicator_name] = plot_item
-        k2_logger.info(f"Added indicator overlay: {indicator_name}", "CHART")
+        try:
+            k2_logger.info(str({
+                'event': 'indicator_render_overlay',
+                'cid': cid,
+                'indicator': indicator_name,
+                'x_len': int(len(x_tail)),
+                'y_len': int(len(y_tail)),
+                'status': 'success'
+            }), "INDICATOR")
+        except Exception:
+            pass
+        # Debounce: allow fetches again after a short delay
+        try:
+            self._mark_ui_mutation()
+            QTimer.singleShot(250, self._resume_autoload)
+        except Exception:
+            self._resume_autoload()
 
     def remove_indicator(self, indicator_name):
         """Remove indicator"""
@@ -2434,59 +2833,219 @@ class ChartWidget(QWidget):
             del self.indicator_overlays[indicator_name]
             k2_logger.info(f"Removed indicator: {indicator_name}", "CHART")
             
-    def add_indicator_pane(self, indicator_name, data, chart_type='line'):
-        """Add indicator pane"""
-        if indicator_name in self.indicator_panes:
-            self.remove_indicator_pane(indicator_name)
+    def add_or_update_indicator_pane(self, pane_key: str, series_label: str, series: pd.Series, y_mode: str = "auto", cid: str | None = None):
+        """Create/update shared sub-pane with gridlines, guides, ticks, and stable styles."""
+        self._suspend_autoload()
+        if not hasattr(self, 'pane_series_map'):
+            self.pane_series_map = {}
+        if not hasattr(self, '_pane_guides'):
+            self._pane_guides = {}
+        if not hasattr(self, '_series_style'):
+            self._series_style = {}
 
-        indicator_plot = pg.PlotWidget()
-        indicator_plot.setMaximumHeight(150)
-        indicator_plot.showGrid(x=True, y=True, alpha=0.3)
-        indicator_plot.setLabel('left', indicator_name)
-        indicator_plot.setBackground('#0a0a0a')
+        pane_key = pane_key.upper()
 
-        indicator_plot.getAxis('left').setPen(pg.mkPen(color='#666'))
-        indicator_plot.getAxis('left').setTextPen(pg.mkPen(color='#999'))
-        indicator_plot.getAxis('bottom').setPen(pg.mkPen(color='#666'))
-        indicator_plot.getAxis('bottom').setTextPen(pg.mkPen(color='#999'))
+        created = False
+        if pane_key not in self.indicator_panes:
+            # Use smart axis for VOLUME pane
+            if pane_key == "VOLUME":
+                pane = pg.PlotWidget(axisItems={'left': SmartUnitAxisItem(orientation='left', mode='volume')})
+            else:
+                pane = pg.PlotWidget()
+            pane.setMaximumHeight(150)
+            pane.setBackground('#0a0a0a')
+            pane.getAxis('left').setPen(pg.mkPen('#666'))
+            pane.getAxis('left').setTextPen(pg.mkPen('#999'))
+            pane.getAxis('bottom').setPen(pg.mkPen('#666'))
+            pane.getAxis('bottom').setTextPen(pg.mkPen('#999'))
+            pane.setXLink(self.main_plot)
+            pane.showGrid(x=True, y=True, alpha=0.3)
 
-        indicator_plot.setXLink(self.main_plot)
+            # Sub-panes share the main x-axis; hide bottom axis labels in sub-panes
+            try:
+                pane.getPlotItem().showAxis('bottom', False)
+            except Exception:
+                pass
 
-        y_values = data.values.astype(np.float32) if isinstance(data, pd.Series) else np.array(data, dtype=np.float32)
+            self.indicator_container.addWidget(pane)
+            self.indicator_panes[pane_key] = pane
+            self.pane_series_map[pane_key] = {}
+            self._pane_guides[pane_key] = {}
+            created = True
+
+            if pane_key == "RSI":
+                oversold = pg.InfiniteLine(pos=30, angle=0, pen=pg.mkPen('#444', width=1, style=Qt.PenStyle.DashLine))
+                overbought = pg.InfiniteLine(pos=70, angle=0, pen=pg.mkPen('#444', width=1, style=Qt.PenStyle.DashLine))
+                pane.addItem(oversold); pane.addItem(overbought)
+                self._pane_guides[pane_key]['oversold'] = oversold
+                self._pane_guides[pane_key]['overbought'] = overbought
+            elif pane_key == "STOCH":
+                oversold = pg.InfiniteLine(pos=20, angle=0, pen=pg.mkPen('#444', width=1, style=Qt.PenStyle.DashLine))
+                overbought = pg.InfiniteLine(pos=80, angle=0, pen=pg.mkPen('#444', width=1, style=Qt.PenStyle.DashLine))
+                pane.addItem(oversold); pane.addItem(overbought)
+                self._pane_guides[pane_key]['oversold'] = oversold
+                self._pane_guides[pane_key]['overbought'] = overbought
+
+        pane = self.indicator_panes[pane_key]
+
+        if self.x_values is None:
+            self.x_values = np.arange(len(series), dtype=np.float32)
+
+        y_values = series.values.astype(np.float32) if isinstance(series, pd.Series) else np.array(series, dtype=np.float32)
         y_values = np.clip(y_values, -1e6, 1e6)
         y_values[np.isinf(y_values)] = np.nan
 
-        if chart_type == 'line':
-            plot_item = OptimizedPlotDataItem(
-                x=self.x_values[:len(y_values)],
-                y=y_values,
-                pen=pg.mkPen(color='#4a4', width=2),
+        n = int(min(len(self.x_values), len(y_values)))
+        if len(y_values) != len(self.x_values):
+            try:
+                k2_logger.debug(f"Aligning arrays: chart_x={len(self.x_values)}, indicator_y={len(y_values)}, using last {n} points", "CHART")
+            except Exception:
+                pass
+        x_tail = self.x_values[-n:]
+        y_tail = y_values[-n:]
+
+        key = (pane_key, series_label)
+        if key not in self._series_style:
+            palette = [
+                pg.mkPen('#ffffff', width=2, style=Qt.PenStyle.SolidLine),
+                pg.mkPen('#ffffff', width=2, style=Qt.PenStyle.DashLine),
+                pg.mkPen('#ffffff', width=2, style=Qt.PenStyle.DotLine),
+                pg.mkPen('#ffffff', width=2, style=Qt.PenStyle.DashDotLine),
+            ]
+            self._series_style[key] = palette[len(self.pane_series_map[pane_key]) % len(palette)]
+        pen = self._series_style[key]
+
+        if series_label in self.pane_series_map[pane_key]:
+            item = self.pane_series_map[pane_key][series_label]
+            if isinstance(item, OptimizedPlotDataItem):
+                item.setData(x=x_tail, y=y_tail, pen=pen)
+        else:
+            item = OptimizedPlotDataItem(
+                x=x_tail,
+                y=y_tail,
+                pen=pen,
                 connect='finite'
             )
-            indicator_plot.addItem(plot_item)
+            pane.addItem(item)
+            self.pane_series_map[pane_key][series_label] = item
 
-        elif chart_type == 'bar':
-            bargraph = pg.BarGraphItem(
-                x=self.x_values[:len(y_values)],
-                height=y_values,
-                width=0.8,
-                brush='#4a4'
-            )
-            indicator_plot.addItem(bargraph)
+        # Cache original series and y-mode so we can reapply after data reloads
+        try:
+            self._series_data[key] = series.copy() if isinstance(series, pd.Series) else pd.Series(y_values)
+        except Exception:
+            self._series_data[key] = pd.Series(y_values)
+        self._series_y_mode[key] = y_mode
 
-        self.indicator_container.addWidget(indicator_plot)
-        self.indicator_panes[indicator_name] = indicator_plot
+        try:
+            k2_logger.info(str({
+                'event': 'indicator_render_pane',
+                'cid': cid,
+                'pane_key': pane_key,
+                'series_label': series_label,
+                'y_mode': y_mode,
+                'action': 'created' if created else 'updated',
+                'status': 'success'
+            }), "INDICATOR")
+        except Exception:
+            pass
+        # Debounce: allow fetches again after a short delay
+        try:
+            self._mark_ui_mutation()
+            QTimer.singleShot(250, self._resume_autoload)
+        except Exception:
+            self._resume_autoload()
 
-        k2_logger.info(f"Added indicator pane: {indicator_name}", "CHART")
+        y_axis = pane.getAxis('left')
+        if y_mode == "bounded_0_100":
+            pane.setYRange(0, 100, padding=0)
+            if pane_key == "RSI":
+                y_axis.setTicks([[(0, '0'), (30, '30'), (70, '70'), (100, '100')]])
+            elif pane_key == "STOCH":
+                y_axis.setTicks([[(0, '0'), (20, '20'), (80, '80'), (100, '100')]])
+            elif pane_key == "MFI":
+                y_axis.setTicks([[(0, '0'), (30, '30'), (70, '70'), (100, '100')]])
+        elif y_mode == "symmetric_0":
+            finite_vals = np.nan_to_num(y_values)
+            max_abs = float(np.nanmax(np.abs(finite_vals))) if finite_vals.size else 1.0
+            if max_abs < 1.0:
+                max_abs = 1.0
+            pane.setYRange(-max_abs, max_abs, padding=0.1)
+            if pane_key == "CCI":
+                y_axis.setTicks([[(-200, '-200'), (-100, '-100'), (0, '0'), (100, '100'), (200, '200')]])
+            else:
+                y_axis.setTicks([[(-round(max_abs), f"-{int(round(max_abs))}"), (0, '0'), (round(max_abs), f"{int(round(max_abs))}")]])
+        elif y_mode == "auto_positive":
+            ymin = 0
+            ymax = max(np.nanmax(y_values), 1.0)
+            pane.setYRange(ymin, ymax, padding=0.1)
+            # ticks auto
         
-    def remove_indicator_pane(self, indicator_name):
-        """Remove indicator pane"""
+    def remove_indicator_pane(self, indicator_name, cid: str | None = None):
+        """Remove indicator pane and clean up guides."""
         if indicator_name in self.indicator_panes:
             widget = self.indicator_panes[indicator_name]
             self.indicator_container.removeWidget(widget)
             widget.deleteLater()
             del self.indicator_panes[indicator_name]
-            k2_logger.info(f"Removed indicator pane: {indicator_name}", "CHART")
+            if hasattr(self, '_pane_guides'):
+                self._pane_guides.pop(indicator_name, None)
+            # Remove cached series entries for this pane
+            try:
+                if hasattr(self, '_series_data'):
+                    for k in [k for k in list(self._series_data.keys()) if k[0] == indicator_name]:
+                        self._series_data.pop(k, None)
+                if hasattr(self, '_series_y_mode'):
+                    for k in [k for k in list(self._series_y_mode.keys()) if k[0] == indicator_name]:
+                        self._series_y_mode.pop(k, None)
+            except Exception:
+                pass
+            try:
+                k2_logger.info(str({
+                    'event': 'indicator_pane_removed',
+                    'cid': cid,
+                    'pane_key': indicator_name
+                }), "INDICATOR")
+            except Exception:
+                pass
+
+    def remove_series_from_pane(self, pane_key: str, series_label: str, cid: str | None = None):
+        """Remove a series from a pane; deletes the pane if it becomes empty."""
+        if not hasattr(self, 'pane_series_map'):
+            return
+        pane_key = pane_key.upper()
+        if pane_key not in self.pane_series_map:
+            return
+        if series_label in self.pane_series_map[pane_key]:
+            item = self.pane_series_map[pane_key][series_label]
+            pane = self.indicator_panes.get(pane_key)
+            if pane and item:
+                pane.removeItem(item)
+            del self.pane_series_map[pane_key][series_label]
+            if hasattr(self, '_series_style'):
+                self._series_style.pop((pane_key, series_label), None)
+            # Remove cached data for this series
+            if hasattr(self, '_series_data'):
+                self._series_data.pop((pane_key, series_label), None)
+            if hasattr(self, '_series_y_mode'):
+                self._series_y_mode.pop((pane_key, series_label), None)
+            try:
+                k2_logger.info(str({
+                    'event': 'indicator_pane_series_removed',
+                    'cid': cid,
+                    'pane_key': pane_key,
+                    'series_label': series_label
+                }), "INDICATOR")
+            except Exception:
+                pass
+
+        if pane_key in self.pane_series_map and len(self.pane_series_map[pane_key]) == 0:
+            self.remove_indicator_pane(pane_key)
+            if hasattr(self, '_pane_guides'):
+                self._pane_guides.pop(pane_key, None)
+            if hasattr(self, '_series_style'):
+                to_delete = [k for k in list(self._series_style.keys()) if k[0] == pane_key]
+                for k in to_delete:
+                    self._series_style.pop(k, None)
         
     def cleanup(self):
         """Cleanup resources"""

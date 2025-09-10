@@ -227,7 +227,8 @@ class LeftPaneWidget(QFrame):
             "Volume"
         ]
         
-        # Add indicator checkboxes
+        # Add indicator checkboxes and keep a map for gating
+        self._indicator_checkboxes = {}
         for indicator in indicators:
             checkbox = QCheckBox(indicator)
             checkbox.setObjectName("indicatorCheckbox")
@@ -235,11 +236,25 @@ class LeftPaneWidget(QFrame):
                 lambda state, ind=indicator: self.on_indicator_toggled(ind, state == Qt.CheckState.Checked.value)
             )
             self.indicator_layout.addWidget(checkbox)
+            self._indicator_checkboxes[indicator.split("(")[0].strip().upper()] = checkbox
         
         # Add spacing at end
         self.indicator_layout.addStretch()
         
         k2_logger.info(f"Populated {len(indicators)} indicators", "LEFT_PANE")
+
+    # NEW: enable/disable indicator by canonical name
+    def set_indicator_enabled(self, name: str, enabled: bool, reason: str | None = None):
+        try:
+            key = (name or "").split("(")[0].strip().upper()
+            chk = getattr(self, '_indicator_checkboxes', {}).get(key)
+            if not chk:
+                return
+            chk.setEnabled(enabled)
+            if reason:
+                chk.setToolTip(reason)
+        except Exception:
+            pass
     
     def clear_all_indicators(self):
         """Uncheck all indicators"""

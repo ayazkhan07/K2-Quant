@@ -18,6 +18,7 @@ except ImportError:
     print("WARNING: TA-Lib not installed. Install with: pip install TA-Lib")
 
 from k2_quant.utilities.logger import k2_logger
+import time
 
 
 @dataclass
@@ -214,8 +215,42 @@ class TechnicalAnalysisService:
                 if config.category == category]
     
     def get_indicator_info(self, indicator_name: str) -> Optional[IndicatorConfig]:
-        """Get information about an indicator"""
-        return self.indicators.get(indicator_name)
+        """Get information about an indicator (case-insensitive, alias-aware)."""
+        key = (indicator_name or "").strip().upper()
+        if key == "STOCHASTIC":
+            key = "STOCH"
+        if key == "BOLLINGER BANDS":
+            key = "BBANDS"
+        return self.indicators.get(key)
+
+    def alias_to_key(self, name: str) -> str:
+        key = (name or "").strip().upper()
+        if key == "STOCHASTIC":
+            key = "STOCH"
+        if key == "BOLLINGER BANDS":
+            key = "BBANDS"
+        return key
+
+    def required_lookback(self, name: str, params: Dict[str, Any]) -> int:
+        """Conservative required bars for an indicator based on params (for UI gating)."""
+        key = self.alias_to_key(name)
+        cfg = self.indicators.get(key)
+        base = cfg.parameters if cfg else {}
+        p = {**base, **(params or {})}
+
+        if key in ("SMA","EMA","WMA","TEMA","DEMA","KAMA","T3","RSI","CCI","ATR","TRIX","WILLR","MFI"):
+            return int(p.get("timeperiod", 20))
+        if key == "BBANDS":
+            return int(p.get("timeperiod", 20)) + 2
+        if key == "MACD":
+            slow = int(p.get("slowperiod", 26)); signal = int(p.get("signalperiod", 9))
+            return max(slow, signal) + 5
+        if key == "STOCH":
+            return max(int(p.get("fastk_period", 5)), int(p.get("slowk_period", 3)), int(p.get("slowd_period", 3))) + 5
+        # Low/none warmup indicators
+        if key in ("SAR","OBV","VWAP","ADX","DX","AROON","ULTOSC","PPO","MOM","ROC","CMO","BOP","HT_TRENDLINE"):
+            return 10
+        return 20
     
     def calculate_indicator(self, data: pd.DataFrame, indicator_name: str,
                           custom_params: Dict[str, Any] = None) -> pd.Series:
@@ -224,7 +259,11 @@ class TechnicalAnalysisService:
             k2_logger.error("TA-Lib not available", "TA")
             return pd.Series()
         
-        indicator_name = indicator_name.upper()
+        indicator_name = (indicator_name or "").strip().upper()
+        if indicator_name == "STOCHASTIC":
+            indicator_name = "STOCH"
+        if indicator_name == "BOLLINGER BANDS":
+            indicator_name = "BBANDS"
         if indicator_name not in self.indicators:
             k2_logger.error(f"Unknown indicator: {indicator_name}", "TA")
             return pd.Series()
@@ -245,18 +284,38 @@ class TechnicalAnalysisService:
             open_price = data['open'].values if 'open' in data.columns else None
             
             # Calculate based on indicator type
+            start = time.perf_counter()
             result = self._calculate_specific_indicator(
                 indicator_name, open_price, high, low, close, volume, params
             )
+            elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
             
-            # Convert to Series
-            if isinstance(result, tuple):
-                # For indicators that return multiple values (like BBANDS, MACD)
-                # Return the main line
-                result = result[0]
-            
-            if result is not None:
+            # Convert outputs
+            if isinstance(result, dict):
+                out = {k: pd.Series(v, index=data.index) for k, v in result.items()}
+                try:
+                    shapes = {k: (len(v) if hasattr(v, '__len__') else None) for k, v in result.items()}
+                    k2_logger.info(str({'event': 'ta_compute', 'indicator': indicator_name, 'elapsed_ms': elapsed_ms, 'outputs': shapes}), "INDICATOR")
+                except Exception:
+                    pass
+                k2_logger.info(f"Calculated {indicator_name}", "TA")
+                return out
+            elif isinstance(result, tuple):
+                # Legacy tuple returns: take first component
+                primary = result[0]
+                series = pd.Series(primary, index=data.index)
+                try:
+                    k2_logger.info(str({'event': 'ta_compute', 'indicator': indicator_name, 'elapsed_ms': elapsed_ms, 'len': len(primary)}), "INDICATOR")
+                except Exception:
+                    pass
+                k2_logger.info(f"Calculated {indicator_name}", "TA")
+                return series
+            elif result is not None:
                 series = pd.Series(result, index=data.index)
+                try:
+                    k2_logger.info(str({'event': 'ta_compute', 'indicator': indicator_name, 'elapsed_ms': elapsed_ms, 'len': len(result) if hasattr(result, '__len__') else None}), "INDICATOR")
+                except Exception:
+                    pass
                 k2_logger.info(f"Calculated {indicator_name}", "TA")
                 return series
             
@@ -291,13 +350,13 @@ class TechnicalAnalysisService:
             return talib.RSI(close, **params)
         elif name == 'MACD':
             macd, signal, hist = talib.MACD(close, **params)
-            return hist  # Return histogram for separate pane
+            return {'line': macd, 'signal': signal, 'hist': hist}
         elif name == 'STOCH':
             slowk, slowd = talib.STOCH(high, low, close, **params)
-            return slowk
+            return {'k': slowk, 'd': slowd}
         elif name == 'STOCHRSI':
             fastk, fastd = talib.STOCHRSI(close, **params)
-            return fastk
+            return {'k': fastk, 'd': fastd}
         elif name == 'MOM':
             return talib.MOM(close, **params)
         elif name == 'CMO':
@@ -322,11 +381,14 @@ class TechnicalAnalysisService:
             return talib.ATR(high, low, close, **params)
         elif name == 'BBANDS':
             upper, middle, lower = talib.BBANDS(close, **params)
-            return middle  # Return middle band for main display
+            return {'upper': upper, 'middle': middle, 'lower': lower}
         
         # Volume Indicators
         elif name == 'OBV':
-            return talib.OBV(close, volume)
+            # Ensure TA-Lib receives double arrays (pandas from PostgreSQL NUMERIC may be Decimal/object)
+            close_arr = np.asarray(close, dtype=np.float64) if close is not None else None
+            vol_arr = np.asarray(volume, dtype=np.float64) if volume is not None else None
+            return talib.OBV(close_arr, vol_arr)
         elif name == 'MFI':
             return talib.MFI(high, low, close, volume, **params)
         

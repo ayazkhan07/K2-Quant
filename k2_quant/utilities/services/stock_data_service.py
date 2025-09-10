@@ -148,7 +148,16 @@ class StockService:
             return []
 
     def get_display_data(self, table_name: str, limit: int = 1000, market_hours_only: bool = False) -> Tuple[List[Tuple], int]:
-        return self.db.fetch_display_data(table_name, limit, market_hours_only)
+        # DIAGNOSTIC: display fetch summary (base 8-col path)
+        try:
+            k2_logger.database_operation("Display fetch", f"table={table_name} limit={limit} market_hours_only={market_hours_only}")
+            rows, total = self.db.fetch_display_data(table_name, limit, market_hours_only)
+            if rows:
+                k2_logger.database_operation("Display fetch sample", f"first_row_cols={len(rows[0])} first_row_preview={rows[0]}")
+            return rows, total
+        except Exception as ex:
+            k2_logger.error(f"get_display_data failed: {ex}", "DB")
+            return [], 0
 
     def get_export_data(self, table_name: str, offset: int, limit: int, market_hours_only: bool = False) -> List[Tuple]:
         try:
@@ -351,6 +360,14 @@ class StockService:
             k2_logger.error(f"update_indicator_column failed: {str(e)}", "DB")
             raise
 
+    # ADD: drop indicator column wrapper
+    def drop_indicator_column(self, table_name: str, column_name: str) -> bool:
+        try:
+            return self.db.drop_indicator_column(table_name, column_name)
+        except Exception as e:
+            k2_logger.error(f"drop_indicator_column failed: {str(e)}", "DB")
+            return False
+
     def get_preset_range_df(self, table_name: str, preset: str) -> pd.DataFrame:
         days_map = {'5D': 5, '1M': 30, '3M': 90, '6M': 180, '1Y': 365, '5Y': 1825}
         if preset == 'All':
@@ -365,6 +382,82 @@ class StockService:
 
     def get_older_chunk_df(self, table_name: str, before_timestamp: int, limit: int = 5000) -> pd.DataFrame:
         return self.db.fetch_older_chunk_df(table_name, before_timestamp, limit)
+
+    # ADD: display fetch with indicators and pretty headers
+    def get_display_data_with_indicators(self, table_name: str, limit: int = 1000) -> Tuple[List[Tuple], List[str], int]:
+        """
+        Return (rows, columns, total) with nicely formatted headers for indicator columns.
+        Base headers: ['Date','Time','Open','High','Low','Close','Volume','VWAP'] + formatted indicators.
+        """
+        try:
+            indicator_cols = self.db.get_indicator_columns(table_name)
+            rows, total = self.db.fetch_display_data_with_indicators(table_name, limit)
+
+            base_cols = ["Date", "Time", "Open", "High", "Low", "Close", "Volume", "VWAP"]
+
+            # Pretty names for indicator headers
+            formatted = []
+            for col in indicator_cols:
+                if col.startswith('rsi_timeperiod_'):
+                    period = col.split('_')[-1]
+                    formatted.append(f"RSI({period})")
+                elif col.startswith('macd_'):
+                    if col.endswith('_line'):
+                        formatted.append("MACD Line")
+                    elif col.endswith('_signal'):
+                        formatted.append("MACD Signal")
+                    elif col.endswith('_hist'):
+                        formatted.append("MACD Hist")
+                    else:
+                        formatted.append(col.replace('_', ' ').title())
+                elif col.startswith('bbands_') or col.startswith('bollinger'):
+                    if col.endswith('_upper'):
+                        formatted.append("BB Upper")
+                    elif col.endswith('_middle'):
+                        formatted.append("BB Middle")
+                    elif col.endswith('_lower'):
+                        formatted.append("BB Lower")
+                    else:
+                        formatted.append("Bollinger")
+                elif col.startswith('stoch_'):
+                    if col.endswith('_k'):
+                        formatted.append("Stoch %K")
+                    elif col.endswith('_d'):
+                        formatted.append("Stoch %D")
+                    else:
+                        formatted.append("Stoch")
+                else:
+                    parts = col.split('_')
+                    if len(parts) >= 3 and parts[-1].isdigit():
+                        name = parts[0].upper()
+                        period = parts[-1]
+                        formatted.append(f"{name}({period})")
+                    else:
+                        formatted.append(col.replace('_', ' ').title())
+
+            columns = base_cols + formatted
+
+            k2_logger.database_operation(
+                "Display fetch (+indicators)",
+                f"table={table_name} cols={len(columns)} indicators={formatted}"
+            )
+            return rows, columns, total
+        except Exception as e:
+            k2_logger.error(f"get_display_data_with_indicators failed: {e}", "DB")
+            return [], [], 0
+
+    # ADD: expose repair/base helpers
+    def ensure_base_columns(self, table_name: str) -> None:
+        try:
+            self.db.ensure_base_columns(table_name)
+        except Exception as e:
+            k2_logger.error(f"ensure_base_columns failed: {e}", "DB")
+
+    def has_column(self, table_name: str, column_name: str) -> bool:
+        try:
+            return self.db._check_column_exists(table_name, column_name)
+        except Exception:
+            return False
 
 
 stock_service = StockService()

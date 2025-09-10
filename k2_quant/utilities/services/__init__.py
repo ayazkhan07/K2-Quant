@@ -45,3 +45,11 @@ __all__ = [
     'dpe_service',
     'strategy_service'
 ]
+
+# Guarded export for Ollama integration
+try:
+    from .ollama_service import OllamaService, OllamaConfig
+except Exception as e:
+    print(f"Warning: Could not import OllamaService: {e}")
+    OllamaService = None  # type: ignore
+    OllamaConfig = None   # type: ignore
