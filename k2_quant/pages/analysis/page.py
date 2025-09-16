@@ -159,8 +159,6 @@ class AnalysisPageWidget(QWidget):
         
         # Right pane connections
         self.right_pane.message_sent.connect(self.on_ai_message_sent)
-        self.right_pane.strategy_generated.connect(self.on_strategy_generated)
-        self.right_pane.projection_requested.connect(self.on_projection_requested_from_ai)
     
     def refresh_left_pane_data(self):
         """Refresh all data in the left pane"""
@@ -229,20 +227,13 @@ class AnalysisPageWidget(QWidget):
                 # Load into middle pane (chart uses limited data; table uses limited data)
                 self.middle_pane.load_data(rows, self.current_metadata)
                 
-                # Build a small DF sample for AI grounding
-                try:
-                    sample_rows, sample_cols, _ = stock_service.get_display_data_with_indicators(table_name, limit=50)
-                    df_sample = pd.DataFrame(sample_rows, columns=sample_cols)
-                except Exception:
-                    df_sample = None
-
-                # Update AI context (include df sample so the AI can see columns/recent rows)
+                # Update AI context (no sampling; rely on metadata only)
                 ctx = {
                     'symbol': self.current_metadata.get('symbol', table_name),
                     'records': total_count,
                     'table_name': table_name,
                     'date_range': date_range,
-                    'df': df_sample
+                    'df': None
                 }
                 self.right_pane.set_data_context(ctx)
                 
@@ -827,83 +818,6 @@ class AnalysisPageWidget(QWidget):
         """Handle AI message"""
         k2_logger.info(f"AI message: {message}", "ANALYSIS")
         # In full implementation, would process with AI service
-    
-    def on_strategy_generated(self, name: str, code: str):
-        """Handle strategy generation from AI"""
-        k2_logger.info(f"Strategy generated: {name}", "ANALYSIS")
-        # Could save strategy and apply it
-    
-    def on_projection_requested_from_ai(self, params: dict):
-        """Handle [QUERY] code emitted by the AI widget and return results to chat."""
-        k2_logger.info(f"Projection requested from AI: {params}", "ANALYSIS")
-
-        if not isinstance(params, dict) or params.get('type') != 'QUERY':
-            return
-
-        code = params.get('code') or ""
-        if not code:
-            try:
-                self.right_pane.chat.add_system_message("⚠️ No code provided for lookup.")
-            except Exception:
-                pass
-            return
-
-        if not self.current_model:
-            try:
-                self.right_pane.chat.add_system_message("⚠️ No model loaded.")
-            except Exception:
-                pass
-            return
-
-        # Build a DataFrame from current model (bounded for performance)
-        try:
-            rows, cols, _ = stock_service.get_display_data_with_indicators(self.current_model, limit=5000)
-            df = pd.DataFrame(rows, columns=cols)
-        except Exception as e:
-            k2_logger.error(f"Failed to prepare DF for QUERY: {e}", "ANALYSIS")
-            try:
-                self.right_pane.chat.add_system_message("⚠️ Could not prepare data for lookup.")
-            except Exception:
-                pass
-            return
-
-        # Wrap snippet to capture a result via query(df)
-        wrapper = f"""
-{code}
-
-try:
-    result = query(df)
-except Exception as _e:
-    result = {{"error": str(_e)}}
-""".strip()
-
-        out = dpe_service.execute_strategy(wrapper, df)
-        if not out.get('success'):
-            err = out.get('error') or "Lookup failed."
-            try:
-                self.right_pane.chat.add_system_message(f"❌ QUERY error: {err}")
-            except Exception:
-                pass
-            return
-
-        result = out.get('data')
-        # Format result back into chat
-        try:
-            if isinstance(result, pd.DataFrame):
-                head = result.head(20)
-                self.right_pane.chat.add_system_message(
-                    f"✅ Lookup returned {len(result)} rows. Showing first {len(head)}:\n{head.to_string(index=False)}"
-                )
-            elif isinstance(result, dict):
-                pretty = "\n".join([f"- {k}: {v}" for k, v in result.items()])
-                self.right_pane.chat.add_system_message(f"✅ Lookup result:\n{pretty}")
-            else:
-                self.right_pane.chat.add_system_message(f"✅ Lookup result: {str(result)}")
-        except Exception:
-            try:
-                self.right_pane.chat.add_system_message(f"✅ Lookup result: {str(result)}")
-            except Exception:
-                pass
     
     def load_saved_models(self):
         """Load saved models into the left pane"""

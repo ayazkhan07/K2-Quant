@@ -10,7 +10,10 @@ import pandas as pd
 from psycopg2 import sql
 
 from k2_quant.utilities.data.db_manager import DatabaseManager, db_manager
-from k2_quant.utilities.services.schema_manager import SchemaManager
+try:
+    from k2_quant.utilities.services.schema_manager import SchemaManager
+except Exception:
+    SchemaManager = None  # optional
 
 
 FORBIDDEN_SQL_TOKENS = ["DROP", "TRUNCATE"]
@@ -32,8 +35,8 @@ class OllamaConfig:
         "open", "high", "low", "close", "volume", "vwap",
         "symbol", "date", "timestamp", "id"
     ])
-    allow_schema_changes: bool = True
-    allow_data_modifications: bool = True
+    allow_schema_changes: bool = False
+    allow_data_modifications: bool = False
     auto_backup_before_changes: bool = False
     create_audit_tables: bool = False
 
@@ -54,7 +57,7 @@ class OllamaService:
         self._schema_cache: Optional[Dict[str, Any]] = None
         self._schema_cache_ts: float = 0.0
         self._verify_models_safely()
-        self.schema_mgr = SchemaManager(self.db, protected_columns=set(self.config.protected_columns))
+        self.schema_mgr = SchemaManager(self.db, protected_columns=set(self.config.protected_columns)) if SchemaManager else None
 
     # ---------------- Chat ----------------
 
@@ -296,8 +299,19 @@ class OllamaService:
 
     def _verify_models_safely(self) -> None:
         try:
-            models = self._client.list().get("models", [])
-            names = {m.get("name") for m in models}
+            resp = self._client.list()
+            try:
+                models = resp.get("models")
+            except Exception:
+                models = getattr(resp, "models", []) or []
+            names = set()
+            for m in models:
+                if isinstance(m, dict):
+                    nm = m.get("model") or m.get("name")
+                else:
+                    nm = getattr(m, "model", None) or getattr(m, "name", None)
+                if nm:
+                    names.add(nm)
             _ = (self.config.reasoning_model in names) and (self.config.sql_model in names)
         except Exception:
             # Ollama might not be running at import-time; defer failures to first call.
