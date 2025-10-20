@@ -38,7 +38,8 @@ except ImportError as e:
 
 # New: expose table_controller
 try:
-    from .table_controller import table_controller
+    from .table_controller import TableController
+    table_controller = TableController()
 except Exception as e:
     print(f"Warning: Could not import table_controller: {e}")
     table_controller = None

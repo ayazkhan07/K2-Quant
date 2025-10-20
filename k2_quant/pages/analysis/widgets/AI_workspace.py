@@ -263,8 +263,26 @@ class AIChatWidget(QWidget):
 		fmt.setForeground(QColor("#fff"))
 		fmt.setFontWeight(QFont.Weight.Normal)
 		cursor.setCharFormat(fmt)
+
+		# FIX: Check if message needs formatting
 		if message:
-			cursor.insertText(message)
+			# Check for template pattern with result
+			if "{0}" in message and "Result:" in message:
+				# Extract template and result
+				parts = message.split("Result:")
+				if len(parts) == 2:
+					template = parts[0].strip()
+					result_value = parts[1].strip()
+					# Format the template with the result
+					try:
+						formatted_message = template.format(result_value)
+						cursor.insertText(formatted_message)
+					except Exception:
+						cursor.insertText(message)
+				else:
+					cursor.insertText(message)
+			else:
+				cursor.insertText(message)
 
 		# Auto-scroll
 		scrollbar = self.chat_display.verticalScrollBar()

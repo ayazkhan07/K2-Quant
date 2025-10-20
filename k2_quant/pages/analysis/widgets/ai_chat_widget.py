@@ -366,6 +366,13 @@ class AIChatWidget(QWidget):
         # Auto-scroll
         scrollbar = self.chat_display.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
+
+        # Add to history
+        self.conversation_history.append({
+            'role': 'assistant',
+            'content': message,
+            'timestamp': datetime.now().isoformat()
+        })
     
     def streaming_complete(self):
         """Handle streaming completion"""
@@ -455,25 +462,42 @@ class AIChatWidget(QWidget):
         """Add AI message to chat"""
         cursor = self.chat_display.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
-        
+
         # Add spacing
         cursor.insertText("\n\n")
-        
+
         # Add AI label
         format = QTextCharFormat()
         format.setForeground(QColor("#4aa"))
         format.setFontWeight(QFont.Weight.Bold)
         cursor.setCharFormat(format)
         cursor.insertText("AI: ")
-        
+
         # Add message
         format.setForeground(QColor("#ccc"))
         format.setFontWeight(QFont.Weight.Normal)
         cursor.setCharFormat(format)
-        
+
+        # FIX: Check if message needs formatting
         if message:
-            cursor.insertText(message)
-        
+            # Check for template pattern with result
+            if "{0}" in message and "Result:" in message:
+                # Extract template and result
+                parts = message.split("Result:")
+                if len(parts) == 2:
+                    template = parts[0].strip()
+                    result_value = parts[1].strip()
+                    # Format the template with the result
+                    try:
+                        formatted_message = template.format(result_value)
+                        cursor.insertText(formatted_message)
+                    except Exception:
+                        cursor.insertText(message)
+                else:
+                    cursor.insertText(message)
+            else:
+                cursor.insertText(message)
+
         # Auto-scroll
         scrollbar = self.chat_display.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())

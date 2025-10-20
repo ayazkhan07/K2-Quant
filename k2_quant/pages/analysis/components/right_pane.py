@@ -23,16 +23,17 @@ class CommandWorker(QThread):
     result_ready = pyqtSignal(dict)
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, table_name: str, command_text: str):
+    def __init__(self, table_name: str, command_text: str, conversation_state: Optional[Dict[str, Any]] = None):
         super().__init__()
         self.table_name = table_name
         self.command_text = command_text
+        self.conversation_state = conversation_state or {}
 
     def run(self):
         try:
             if table_controller is None:
                 raise RuntimeError("table_controller service is not available")
-            result = table_controller.execute_command(self.table_name, self.command_text)
+            result = table_controller.execute_command(self.table_name, self.command_text, self.conversation_state)
             self.result_ready.emit(result)
         except Exception as e:
             self.error_occurred.emit(str(e))
@@ -144,7 +145,24 @@ class RightPaneWidget(QFrame):
         # Show loading indicator
         self.loading_bar.show()
         
-        self.worker = CommandWorker(table_name, message)
+        # Build structured conversation_state for LLM follow-ups
+        structured_answers = [
+            {
+                'label': h.get('label', ''),
+                'value': h.get('value'),
+                'column': h.get('column')
+            }
+            for h in self.conversation_history if h.get('role') == 'answer'
+        ][-5:]
+        # Fallback to assistant text if no structured answers yet
+        if not structured_answers:
+            structured_answers = [
+                {'label': '', 'value': h.get('content')}
+                for h in self.conversation_history if h.get('role') == 'assistant'
+            ][-5:]
+        conversation_state = {'last_answers': structured_answers}
+
+        self.worker = CommandWorker(table_name, message, conversation_state)
         self.worker.result_ready.connect(self._on_worker_result)
         self.worker.error_occurred.connect(self._on_worker_error)
         self.worker.start()
@@ -153,20 +171,79 @@ class RightPaneWidget(QFrame):
         self.message_sent.emit(message)
     
     def stream_response(self, text: str, prefix: str = "\nAI: "):
-        """Stream text character by character for natural appearance"""
+        """Stream text with markdown table support."""
+        if '|' in text and '\n|' in text and '---' in text:
+            self._render_formatted_response(prefix, text)
+            return
+
         self.streaming_text = text
         self.streaming_index = 0
-        
-        # Add prefix immediately
         self.chat_display.append(prefix)
         
-        # Create timer for streaming effect
         if self.streaming_timer:
             self.streaming_timer.stop()
         
         self.streaming_timer = QTimer()
         self.streaming_timer.timeout.connect(self._stream_next_chunk)
-        self.streaming_timer.start(20)  # 20ms between chunks for smooth streaming
+        self.streaming_timer.start(20)
+
+    def _render_formatted_response(self, prefix: str, text: str):
+        """Render response with markdown table formatting."""
+        cursor = self.chat_display.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertText(prefix)
+        
+        parts = text.split('\n')
+        in_table = False
+        table_rows = []
+        
+        for line in parts:
+            if '|' in line and not line.strip().startswith('|--') and not set(line.strip()) == {'|'}:
+                if not in_table:
+                    in_table = True
+                    table_rows = []
+                cells = [cell.strip() for cell in line.split('|') if cell.strip()]
+                if cells:
+                    table_rows.append(cells)
+            elif '|--' in line or '---' in line:
+                continue
+            else:
+                if in_table and table_rows:
+                    self._insert_table(cursor, table_rows)
+                    table_rows = []
+                    in_table = False
+                if line.strip():
+                    cursor.insertText(line + '\n')
+        
+        if in_table and table_rows:
+            self._insert_table(cursor, table_rows)
+        
+        self.chat_display.ensureCursorVisible()
+
+    def _insert_table(self, cursor, rows):
+        """Insert a formatted table into the chat."""
+        if not rows:
+            return
+        
+        table_html = """
+        <table style='border-collapse: collapse; margin: 10px 0; font-family: monospace;'>
+        """
+        
+        # Header
+        table_html += "<tr style='background: #2a2a2a;'>"
+        for cell in rows[0]:
+            table_html += f"<th style='padding: 5px 10px; border: 1px solid #444; color: #fff; text-align: left;'>{cell}</th>"
+        table_html += "</tr>"
+        
+        # Body
+        for row in rows[1:]:
+            table_html += "<tr>"
+            for cell in row:
+                table_html += f"<td style='padding: 5px 10px; border: 1px solid #444; color: #ccc;'>{cell}</td>"
+            table_html += "</tr>"
+        
+        table_html += "</table>"
+        cursor.insertHtml(table_html)
     
     def _stream_next_chunk(self):
         """Stream next chunk of text"""
@@ -200,11 +277,9 @@ class RightPaneWidget(QFrame):
             if result.get('interpreted_result'):
                 response = result['interpreted_result']
             elif result.get('query_result') is not None:
+                # Only use raw query_result as last resort
                 query_result = result['query_result']
-                if isinstance(query_result, (int, float)):
-                    response = f"The result is {query_result:,}" if isinstance(query_result, int) else f"The result is {query_result}"
-                else:
-                    response = f"Result: {query_result}"
+                response = str(query_result)
             elif result.get('new_columns'):
                 cols = [c for c in result['new_columns'] if c]
                 response = f"Successfully added {len(cols)} new column{'s' if len(cols) != 1 else ''}: {', '.join(cols)}"
@@ -219,6 +294,17 @@ class RightPaneWidget(QFrame):
             
             # Stream the response
             self.stream_response(response)
+
+            # Capture structured answers for follow-up pronoun resolution
+            answer_to_remember = result.get('answer_to_remember')
+            if answer_to_remember:
+                self.conversation_history.append({
+                    'role': 'answer',
+                    'label': answer_to_remember.get('label', ''),
+                    'value': answer_to_remember.get('value'),
+                    'column': answer_to_remember.get('column'),
+                    'timestamp': datetime.now().isoformat()
+                })
         else:
             error = result.get('error', 'Operation failed')
             self.stream_response(f"Unable to complete that request. {error}")

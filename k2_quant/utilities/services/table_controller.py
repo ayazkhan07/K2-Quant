@@ -15,6 +15,7 @@ Notes:
 
 import json
 import re
+from decimal import Decimal
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 
@@ -37,38 +38,80 @@ class TableController(QObject):
     def __init__(self):
         super().__init__()
 
-    def execute_command(self, table: str, command: str) -> Dict[str, Any]:
-        """High-level entry: ask AI for a plan, then execute it (SQL or Python)."""
+    def execute_command(self, table: str, command: str, conversation_state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Plan → execute SQL/Python → describe results with LLM prose (including tables)."""
         try:
-            plan = self._get_ai_execution_plan(table, command)
+            plan = self._get_ai_execution_plan(table, command, conversation_state)
             if not plan:
                 result = {'success': False, 'error': 'Could not generate execution plan'}
                 self.operation_failed.emit(result['error'])
                 return result
 
-            # Store the natural language interpretation from the plan
-            interpretation_template = plan.get('result_interpretation', '')
-            
+            # Clarification short-circuit
+            if plan.get('needs_clarification'):
+                return {
+                    'success': False,
+                    'reason': 'needs_clarification',
+                    'clarifying_question': plan.get('clarifying_question', 'Could you clarify your request?')
+                }
+
+            result_type = plan.get('result_type', 'unknown')
+            execute_then_describe = plan.get('execute_then_describe', True)
+
+            # Execute the plan
             if plan.get('sql'):
                 result = self._execute_sql(plan['sql'], plan.get('params'))
-                # Apply interpretation to SELECT results
-                if result.get('success') and result.get('query_result') is not None and interpretation_template:
-                    result['interpreted_result'] = self._interpret_result(
-                        result['query_result'], 
-                        interpretation_template,
-                        plan.get('result_type', 'unknown')
-                    )
             elif plan.get('python_code'):
                 result = self._execute_python(table, plan['python_code'])
             else:
                 result = {'success': False, 'error': 'No executable code in plan'}
 
-            if result.get('success'):
-                self.operation_complete.emit(result)
-            else:
+            if not result.get('success'):
                 self.operation_failed.emit(result.get('error', 'Unknown error'))
+                return result
 
+            # Second LLM pass for natural language with table support
+            if execute_then_describe and result.get('query_result') is not None:
+                try:
+                    final_response = self._generate_natural_response(
+                        command=command,
+                        query_result=result.get('query_result'),
+                        columns=result.get('columns', []),
+                        result_type=result_type,
+                        conversation_state=conversation_state or {},
+                        plan_metadata={
+                            'referent_resolution': plan.get('referent_resolution'),
+                            'column_candidates': plan.get('column_candidates')
+                        }
+                    )
+                    if final_response:
+                        result['interpreted_result'] = final_response
+                        result['display_message'] = final_response
+                except Exception as e:
+                    k2_logger.warning(f"Natural response generation failed: {e}", "TABLE_CTRL")
+                    result['display_message'] = "Query completed successfully"
+
+            # Update answer_to_remember with actual result
+            if plan.get('answer_to_remember'):
+                try:
+                    answer = plan['answer_to_remember'].copy()
+                    answer['value'] = result.get('query_result')
+                    # Persist which column was used when available
+                    if 'column' not in answer:
+                        col_used = plan.get('column_used')
+                        if col_used:
+                            answer['column'] = col_used
+                    result['answer_to_remember'] = answer
+                except Exception:
+                    pass
+
+            # Pass-through metadata
+            result['referent_resolution'] = plan.get('referent_resolution')
+            result['follow_up_suggestion'] = plan.get('follow_up_suggestion')
+
+            self.operation_complete.emit(result)
             return result
+
         except Exception as e:
             msg = str(e)
             k2_logger.error(f"execute_command failed: {msg}", "TABLE_CTRL")
@@ -78,6 +121,8 @@ class TableController(QObject):
     def _interpret_result(self, query_result: Any, template: str, result_type: str = 'unknown') -> str:
         """Enhanced interpretation that handles various result types"""
         try:
+            # Normalize common placeholder variants like "{{0}}" -> "{0}"
+            template = self._normalize_template_placeholders(template)
             # Handle empty results
             if query_result is None:
                 return "No data found for your query"
@@ -126,12 +171,16 @@ class TableController(QObject):
                     return f"{template}. Retrieved {row_count} rows with {col_count} columns each"
             
             # Handle single value results
-            elif isinstance(query_result, (int, float, str, bool)):
+            elif isinstance(query_result, (int, float, str, bool, Decimal, np.floating, np.integer)):
                 return self._format_value_with_template(query_result, template)
             
             # Fallback
             else:
-                return f"{template}. Result: {str(query_result)[:100]}"
+                # Don't append "Result:" - just format the template properly
+                if isinstance(query_result, (int, float, str, Decimal, np.floating, np.integer)):
+                    return self._format_value_with_template(query_result, template)
+                else:
+                    return f"{template}: {str(query_result)[:100]}"
                 
         except Exception as e:
             k2_logger.warning(f"Could not interpret result: {e}", "TABLE_CTRL")
@@ -145,15 +194,16 @@ class TableController(QObject):
         """Format a single value for display"""
         if value is None:
             return "NULL"
-        elif isinstance(value, float):
+        elif isinstance(value, (float, np.floating, Decimal)):
             # Format floats with appropriate precision
-            if abs(value) < 0.01 and value != 0:
-                return f"{value:.4f}"
-            elif abs(value) >= 1000:
-                return f"{value:,.2f}"
+            numeric_value = float(value)
+            if abs(numeric_value) < 0.01 and numeric_value != 0:
+                return f"{numeric_value:.4f}"
+            elif abs(numeric_value) >= 1000:
+                return f"{numeric_value:,.2f}"
             else:
-                return f"{value:.2f}"
-        elif isinstance(value, int):
+                return f"{numeric_value:.2f}"
+        elif isinstance(value, (int, np.integer)):
             return f"{value:,}"
         elif isinstance(value, bool):
             return str(value)
@@ -163,17 +213,59 @@ class TableController(QObject):
     def _format_value_with_template(self, value: Any, template: str) -> str:
         """Apply template to a single value with proper formatting"""
         formatted = self._format_value(value)
+        template = self._normalize_template_placeholders(template)
         
-        if '{0}' in template:
-            try:
-                return template.format(formatted)
-            except:
-                return f"{template.replace('{0}', formatted)}"
-        else:
-            # No placeholder - append value
-            return f"{template}: {formatted}"
+        # Try Python formatting first
+        try:
+            return template.format(formatted)
+        except Exception:
+            pass
 
-    def _get_ai_execution_plan(self, table: str, command: str) -> Optional[Dict[str, Any]]:
+        # Direct replacement of common tokens
+        try:
+            replaced = template.replace('{0}', formatted)
+            replaced = replaced.replace('{value}', formatted).replace('{values}', formatted)
+            # Regex-based replacement to catch variants with hidden spaces/characters
+            replaced = re.sub(r"\{\s*0\s*\}", formatted, replaced)
+            replaced = re.sub(r"\{\s*value\s*\}", formatted, replaced)
+            if replaced != template:
+                return replaced
+        except Exception:
+            pass
+
+        # As a last resort, replace any brace-wrapped token with the value
+        try:
+            generic = re.sub(r"\{[^\}]*\}", formatted, template)
+            if generic:
+                return generic
+        except Exception:
+            pass
+
+        return f"{template}: {formatted}"
+
+    def _normalize_template_placeholders(self, template: str) -> str:
+        """Normalize AI-provided placeholders to Python format style.
+        Supports variants like "{{0}}", "{ 0 }", and "{{values}}" -> "{values}".
+        """
+        try:
+            if not isinstance(template, str):
+                return str(template)
+            normalized = template
+            # Convert double-brace escaped placeholders to single braces
+            normalized = normalized.replace('{{values}}', '{values}')
+            normalized = normalized.replace('{{0}}', '{0}')
+            normalized = normalized.replace('{{1}}', '{1}')
+            normalized = normalized.replace('{{2}}', '{2}')
+            # Remove spaces inside braces like "{ 0 }" or "{ values }"
+            normalized = re.sub(r'\{\s*values\s*\}', '{values}', normalized)
+            normalized = re.sub(r'\{\s*0\s*\}', '{0}', normalized)
+            normalized = re.sub(r'\{\s*1\s*\}', '{1}', normalized)
+            normalized = re.sub(r'\{\s*2\s*\}', '{2}', normalized)
+            return normalized
+        except Exception:
+            return template
+
+    def _get_ai_execution_plan(self, table: str, command: str, conversation_state: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """Get execution plan from OpenAI with enhanced financial analysis guidance"""
         try:
             # Gather context
@@ -206,6 +298,7 @@ Primary Key: timestamp
 Rows: {row_count}
 
 User request: {command}
+Recent context for pronoun resolution: {json.dumps((conversation_state or {}).get('last_answers', [])[-5:], separators=(',', ':'))}
 
 Generate SQL or Python to accomplish this.
 
@@ -217,6 +310,12 @@ SQL Guidelines:
 - For financial metrics: Use appropriate aggregation functions (MIN, MAX, AVG, STDDEV, etc.)
 - For time series: Use window functions with OVER (ORDER BY date_time_market)
 - You may DELETE/UPDATE/ALTER/INSERT as needed
+
+CRITICAL SQL Rules:
+- Resolve pronouns using the recent context above.
+- Use ACTUAL resolved numeric values; NEVER output placeholders like {{value}}, {{open_price}}, ?, $1.
+- For floating point comparison use tolerance: WHERE ABS(col - 123.45) < 0.01 or ROUND(col, 2) = 123.45.
+- Choose the correct price column (open/high/low/close) per the request/context.
 
 Python Guidelines:
 - If Python code is used, operate on 'df' (pandas DataFrame)
@@ -247,7 +346,7 @@ Examples of good result_interpretation:
                 response = client.chat.completions.create(
                     model="gpt-4o-mini",
                     messages=[
-                        {"role": "system", "content": "You are a financial data expert. Output only valid JSON. Always use STRING_AGG for combining multiple text values into one result."},
+                        {"role": "system", "content": "You are a financial data expert. Output only valid JSON. Resolve pronouns using provided context. Never return SQL with placeholders; embed actual resolved numeric values with float tolerance (e.g., ABS(col - 123.45) < 0.01). Always use STRING_AGG for combining multiple text values into one result."},
                         {"role": "user", "content": prompt}
                     ],
                     temperature=0.1
@@ -259,7 +358,7 @@ Examples of good result_interpretation:
                 response = openai.ChatCompletion.create(
                     model="gpt-4",
                     messages=[
-                        {"role": "system", "content": "You are a financial data expert. Output only valid JSON. Always use STRING_AGG for combining multiple text values into one result."},
+                        {"role": "system", "content": "You are a financial data expert. Output only valid JSON. Resolve pronouns using provided context. Never return SQL with placeholders; embed actual resolved numeric values with float tolerance (e.g., ABS(col - 123.45) < 0.01). Always use STRING_AGG for combining multiple text values into one result."},
                         {"role": "user", "content": prompt}
                     ],
                     temperature=0.1
@@ -281,18 +380,20 @@ Examples of good result_interpretation:
             return None
 
     def _execute_sql(self, sql: str, params: Optional[List[Any]] = None) -> Dict[str, Any]:
-        """Execute SQL verbatim. Returns SELECT results."""
+        """Execute SQL and return results with column names."""
         try:
             with db_manager.get_connection() as conn:
                 with db_manager.get_cursor(conn) as cur:
-                    if params and isinstance(params, (list, tuple)):
+                    if params:
                         cur.execute(sql, params)
                     else:
                         cur.execute(sql)
 
-                    # For SELECT queries, fetch the results and return
                     if sql.strip().upper().startswith('SELECT'):
+                        columns = [desc[0] for desc in cur.description] if cur.description else []
                         results = cur.fetchall()
+
+                        # For single value results, extract directly
                         if len(results) == 1 and len(results[0]) == 1:
                             query_result = results[0][0]
                         else:
@@ -301,10 +402,11 @@ Examples of good result_interpretation:
                         return {
                             'success': True,
                             'sql_executed': sql[:200] + ('...' if len(sql) > 200 else ''),
-                            'query_result': query_result
+                            'query_result': query_result,
+                            'columns': columns
                         }
                     else:
-                        affected = cur.rowcount if cur.rowcount else 0
+                        affected = cur.rowcount or 0
                         conn.commit()
                         return {
                             'success': True,
@@ -313,6 +415,109 @@ Examples of good result_interpretation:
                         }
         except Exception as e:
             return {'success': False, 'error': str(e)}
+
+    def _generate_natural_response(self, command: str, query_result: Any, columns: List[str], 
+                                   result_type: str, conversation_state: Dict[str, Any], 
+                                   plan_metadata: Dict[str, Any]) -> Optional[str]:
+        """Generate natural language with table formatting when appropriate."""
+        if query_result is None:
+            return "No data found for your query"
+
+        api_key = api_config.openai_api_key
+        if not api_key:
+            return None
+
+        # Smart summarization
+        summary = self._summarize_result_for_prompt(query_result, result_type, columns)
+        
+        # Detect if user wants tabular display
+        wants_table = any(word in command.lower() for word in ['table', 'show', 'list', 'display', 'compare'])
+
+        recent_answers = (conversation_state or {}).get('last_answers', [])[-3:]
+        recent_ctx = [{'label': a.get('label', ''), 'value': a.get('value')} for a in recent_answers]
+
+        system_prompt = """You are a conversational data analyst.
+Write a COMPLETE natural-language answer.
+- NEVER use placeholders like {0} or {values}
+- If data is tabular and user wants details, format as markdown table
+- For tables >10 rows, show first 5-10 rows and note "Showing X of Y rows"
+- Keep tables to essential columns only
+
+For tables, use this format:
+| Column1 | Column2 | Column3 |
+|---------|---------|---------|
+| Value1  | Value2  | Value3  |
+
+Return ONLY the final prose and/or table, no JSON."""
+
+        user_prompt = f"""User query: {command}
+Wants table: {wants_table}
+Columns available: {columns}
+Result summary: {json.dumps(summary, separators=(',', ':'))}
+Recent context: {json.dumps(recent_ctx, separators=(',', ':'))}"""
+
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=api_key)
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.1
+            )
+            return (response.choices[0].message.content or "").strip()
+        except Exception as e:
+            k2_logger.error(f"LLM call failed: {e}", "TABLE_CTRL")
+            return None
+
+    def _summarize_result_for_prompt(self, query_result: Any, result_type: str, columns: List[str] = None) -> Dict[str, Any]:
+        """Smart summarization that preserves structure for tables."""
+        try:
+            # Single value
+            if isinstance(query_result, (int, float, str, bool, Decimal)):
+                return {'type': 'single_value', 'value': self._format_value(query_result)}
+            
+            # List results
+            if isinstance(query_result, list) and len(query_result) > 0:
+                # Multi-column table data
+                if isinstance(query_result[0], tuple) and len(query_result[0]) > 1:
+                    sample_size = min(10, len(query_result))
+                    return {
+                        'type': 'table',
+                        'columns': columns or [],
+                        'rows': len(query_result),
+                        'sample': [
+                            [self._format_value(cell) for cell in row]
+                            for row in query_result[:sample_size]
+                        ],
+                        'truncated': len(query_result) > sample_size
+                    }
+                
+                # Single column list
+                if len(query_result) <= 10:
+                    return {
+                        'type': 'list',
+                        'count': len(query_result),
+                        'values': [self._format_value(row[0] if isinstance(row, tuple) else row) 
+                                  for row in query_result]
+                    }
+                
+                # Large list - intelligent sampling
+                return {
+                    'type': 'large_list',
+                    'count': len(query_result),
+                    'first_5': [self._format_value(row[0] if isinstance(row, tuple) else row) 
+                               for row in query_result[:5]],
+                    'last_2': [self._format_value(row[0] if isinstance(row, tuple) else row) 
+                              for row in query_result[-2:]] if len(query_result) > 7 else []
+                }
+            
+            return {'type': 'unknown', 'preview': str(query_result)[:200]}
+        except Exception as e:
+            k2_logger.warning(f"Summarization failed: {e}", "TABLE_CTRL")
+            return {'type': 'unknown'}
 
     def _execute_python(self, table: str, code: str) -> Dict[str, Any]:
         """Execute Python to transform a DataFrame and persist numeric changes."""
