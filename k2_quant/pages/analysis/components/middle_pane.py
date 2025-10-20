@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import (QFrame, QVBoxLayout, QHBoxLayout, QWidget,
                              QPushButton, QComboBox, QLabel, QSplitter,
                              QTableWidget, QTableWidgetItem, QProgressBar)
 from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QFont
 
 from k2_quant.utilities.logger import k2_logger
 
@@ -161,6 +162,11 @@ class MiddlePaneWidget(QFrame):
             self.data_table = QTableWidget()
             self.data_table.setAlternatingRowColors(True)
             self.data_table.horizontalHeader().setStretchLastSection(True)
+            # Apply small-caps to header titles
+            header = self.data_table.horizontalHeader()
+            header_font = header.font()
+            header_font.setCapitalization(QFont.Capitalization.SmallCaps)
+            header.setFont(header_font)
             self.splitter.addWidget(self.data_table)
             
             # Set initial sizes (60/40 split)

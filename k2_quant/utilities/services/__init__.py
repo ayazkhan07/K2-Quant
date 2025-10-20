@@ -36,6 +36,13 @@ except ImportError as e:
     print(f"Warning: Could not import strategy_service: {e}")
     strategy_service = None
 
+# New: expose table_controller
+try:
+    from .table_controller import table_controller
+except Exception as e:
+    print(f"Warning: Could not import table_controller: {e}")
+    table_controller = None
+
 __all__ = [
     'polygon_client',
     'stock_service',
@@ -43,5 +50,6 @@ __all__ = [
     'ta_service',
     'ai_chat_service',
     'dpe_service',
-    'strategy_service'
+    'strategy_service',
+    'table_controller'
 ]

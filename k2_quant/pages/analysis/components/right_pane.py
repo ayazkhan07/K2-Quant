@@ -1,5 +1,5 @@
 """
-Right Pane Component - Conversational AI
+Right Pane Component - Conversational AI with streaming
 
 Contains AI chat interface for strategy development.
 Save as: k2_quant/pages/analysis/components/right_pane.py
@@ -9,10 +9,33 @@ from typing import Dict, Any, Optional
 from datetime import datetime
 
 from PyQt6.QtWidgets import (QFrame, QVBoxLayout, QHBoxLayout, QTextEdit,
-                             QLineEdit, QPushButton, QLabel, QWidget)
-from PyQt6.QtCore import Qt, pyqtSignal
+                             QLineEdit, QPushButton, QLabel, QWidget, QProgressBar)
+from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer
+from PyQt6.QtGui import QTextCursor
 
 from k2_quant.utilities.logger import k2_logger
+from k2_quant.utilities.services import table_controller
+
+
+class CommandWorker(QThread):
+    """Worker to execute AI-driven table commands in background."""
+
+    result_ready = pyqtSignal(dict)
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, table_name: str, command_text: str):
+        super().__init__()
+        self.table_name = table_name
+        self.command_text = command_text
+
+    def run(self):
+        try:
+            if table_controller is None:
+                raise RuntimeError("table_controller service is not available")
+            result = table_controller.execute_command(self.table_name, self.command_text)
+            self.result_ready.emit(result)
+        except Exception as e:
+            self.error_occurred.emit(str(e))
 
 
 class RightPaneWidget(QFrame):
@@ -28,12 +51,15 @@ class RightPaneWidget(QFrame):
         self.setFixedWidth(380)
         self.setObjectName("rightPane")
         
-        self.current_context = None
+        self.current_context: Optional[Dict[str, Any]] = None
         self.conversation_history = []
+        self.worker: Optional[CommandWorker] = None
+        self.streaming_timer = None
+        self.streaming_text = ""
+        self.streaming_index = 0
         
         self.init_ui()
         self.setup_styling()
-        self.show_welcome_message()
     
     def init_ui(self):
         """Initialize the UI"""
@@ -52,6 +78,16 @@ class RightPaneWidget(QFrame):
         self.chat_display.setReadOnly(True)
         self.chat_display.setObjectName("chatDisplay")
         layout.addWidget(self.chat_display)
+        
+        # Loading indicator (initially hidden)
+        self.loading_bar = QProgressBar()
+        self.loading_bar.setObjectName("loadingBar")
+        self.loading_bar.setMaximum(0)  # Indeterminate progress
+        self.loading_bar.setMinimum(0)
+        self.loading_bar.setTextVisible(False)
+        self.loading_bar.setFixedHeight(2)
+        self.loading_bar.hide()
+        layout.addWidget(self.loading_bar)
         
         # Input area
         input_widget = QWidget()
@@ -72,12 +108,8 @@ class RightPaneWidget(QFrame):
         
         layout.addWidget(input_widget)
     
-    def show_welcome_message(self):
-        """Show welcome message"""
-        self.chat_display.append("AI: Hello! I can help you analyze stock data and create custom strategies. Load a model to get started.")
-    
     def send_ai_message(self):
-        """Send message to AI"""
+        """Send message to AI and execute via controller"""
         message = self.ai_input.text().strip()
         if not message:
             return
@@ -95,58 +127,127 @@ class RightPaneWidget(QFrame):
             'timestamp': datetime.now().isoformat()
         })
         
-        # Emit signal
+        # Determine current table from context
+        table_name = None
+        if self.current_context:
+            table_name = self.current_context.get('table_name')
+
+        if not table_name:
+            self.stream_response("Please load a model first so I know which table to operate on.")
+            return
+
+        # Launch background worker
+        if self.worker and self.worker.isRunning():
+            self.stream_response("Previous command is still executing. Please wait.")
+            return
+
+        # Show loading indicator
+        self.loading_bar.show()
+        
+        self.worker = CommandWorker(table_name, message)
+        self.worker.result_ready.connect(self._on_worker_result)
+        self.worker.error_occurred.connect(self._on_worker_error)
+        self.worker.start()
+
+        # Emit signal for external listeners if needed
         self.message_sent.emit(message)
-        
-        # Simulate AI response (in full implementation, would call AI service)
-        self.process_ai_response(message)
     
-    def process_ai_response(self, message: str):
-        """Process and display AI response"""
-        # Simulate different responses based on keywords
-        response = ""
+    def stream_response(self, text: str, prefix: str = "\nAI: "):
+        """Stream text character by character for natural appearance"""
+        self.streaming_text = text
+        self.streaming_index = 0
         
-        if "create strategy" in message.lower():
-            response = "I'll help you create a custom trading strategy. What conditions would you like to use?"
-        elif "projection" in message.lower():
-            response = "I can create price projections based on historical patterns. What time frame are you interested in?"
-            self.projection_requested.emit({'timeframe': 30})
-        elif "elasticity" in message.lower():
-            response = "Creating an elasticity strategy that calculates (high-low)/low*100..."
-            # Simulate code generation
-            code = """def elasticity_strategy(df):
-    df['elasticity'] = (df['high'] - df['low']) / df['low'] * 100
-    return df"""
-            self.strategy_generated.emit("Elasticity Strategy", code)
-        elif self.current_context:
-            response = f"I understand you want to analyze the {self.current_context.get('symbol', 'data')}. Let me help you with that..."
+        # Add prefix immediately
+        self.chat_display.append(prefix)
+        
+        # Create timer for streaming effect
+        if self.streaming_timer:
+            self.streaming_timer.stop()
+        
+        self.streaming_timer = QTimer()
+        self.streaming_timer.timeout.connect(self._stream_next_chunk)
+        self.streaming_timer.start(20)  # 20ms between chunks for smooth streaming
+    
+    def _stream_next_chunk(self):
+        """Stream next chunk of text"""
+        if self.streaming_index < len(self.streaming_text):
+            # Stream 1-3 characters at a time for natural appearance
+            chunk_size = min(2, len(self.streaming_text) - self.streaming_index)
+            chunk = self.streaming_text[self.streaming_index:self.streaming_index + chunk_size]
+            
+            # Move cursor to end and insert text
+            cursor = self.chat_display.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            cursor.insertText(chunk)
+            self.chat_display.setTextCursor(cursor)
+            
+            # Ensure visible
+            self.chat_display.ensureCursorVisible()
+            
+            self.streaming_index += chunk_size
         else:
-            response = "Please load a model first so I can help you analyze the data."
+            # Streaming complete
+            self.streaming_timer.stop()
+            self.streaming_timer = None
+    
+    def _on_worker_result(self, result: Dict[str, Any]):
+        """Handle worker completion - show only natural language results"""
+        # Hide loading indicator
+        self.loading_bar.hide()
         
-        # Display response
-        self.chat_display.append(f"\nAI: {response}")
-        
+        if result.get('success'):
+            # Determine response text
+            if result.get('interpreted_result'):
+                response = result['interpreted_result']
+            elif result.get('query_result') is not None:
+                query_result = result['query_result']
+                if isinstance(query_result, (int, float)):
+                    response = f"The result is {query_result:,}" if isinstance(query_result, int) else f"The result is {query_result}"
+                else:
+                    response = f"Result: {query_result}"
+            elif result.get('new_columns'):
+                cols = [c for c in result['new_columns'] if c]
+                response = f"Successfully added {len(cols)} new column{'s' if len(cols) != 1 else ''}: {', '.join(cols)}"
+            elif result.get('rows_deleted'):
+                response = f"Deleted {result['rows_deleted']:,} rows from the dataset"
+            elif result.get('rows_inserted'):
+                response = f"Inserted {result['rows_inserted']:,} new rows into the dataset"
+            elif result.get('rows_affected') is not None:
+                response = f"Operation completed. {result['rows_affected']:,} rows were affected"
+            else:
+                response = "Operation completed successfully"
+            
+            # Stream the response
+            self.stream_response(response)
+        else:
+            error = result.get('error', 'Operation failed')
+            self.stream_response(f"Unable to complete that request. {error}")
+
         # Add to history
         self.conversation_history.append({
             'role': 'assistant',
-            'content': response,
+            'content': response if result.get('success') else error,
             'timestamp': datetime.now().isoformat()
         })
+
+        self.worker = None
+
+    def _on_worker_error(self, error_msg: str):
+        """Handle worker error"""
+        # Hide loading indicator
+        self.loading_bar.hide()
+        
+        self.stream_response(f"Unable to process that request. {error_msg}")
+        self.worker = None
     
     def set_data_context(self, context: Dict[str, Any]):
-        """Set the data context for AI"""
+        """Set the data context for AI - no announcement"""
         self.current_context = context
-        
-        # Show in chat
-        symbol = context.get('symbol', 'Unknown')
-        records = context.get('records', 0)
-        self.chat_display.append(f"\nAI: Loaded {symbol} with {records:,} records. How can I help you analyze this data?")
     
     def clear_chat(self):
         """Clear chat history"""
         self.chat_display.clear()
         self.conversation_history.clear()
-        self.show_welcome_message()
         k2_logger.info("Chat cleared", "AI_CHAT")
     
     def setup_styling(self):
@@ -179,6 +280,16 @@ class RightPaneWidget(QFrame):
                 line-height: 1.6;
             }
             
+            #loadingBar {
+                background-color: #0a0a0a;
+                border: none;
+            }
+            
+            #loadingBar::chunk {
+                background-color: #ffffff;
+                border-radius: 1px;
+            }
+            
             #chatInput {
                 background-color: #1a1a1a;
                 color: #fff;
@@ -204,5 +315,7 @@ class RightPaneWidget(QFrame):
     
     def cleanup(self):
         """Cleanup resources"""
+        if self.streaming_timer:
+            self.streaming_timer.stop()
         self.clear_chat()
         self.current_context = None

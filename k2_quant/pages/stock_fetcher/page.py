@@ -359,6 +359,11 @@ class StockFetcherWidget(QMainWindow):
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
 
+        # Apply small-caps to header titles
+        header_font = header.font()
+        header_font.setCapitalization(QFont.Capitalization.SmallCaps)
+        header.setFont(header_font)
+
         data_table.verticalHeader().setVisible(False)
         data_table.setCornerButtonEnabled(False)
         data_table.setAlternatingRowColors(True)
@@ -401,7 +406,7 @@ class StockFetcherWidget(QMainWindow):
             QTableWidget::item { padding: 10px 15px; border: none; border-bottom: 1px solid #1a1a1a; color: #fff; }
             QTableWidget::item:selected { background-color: #2a2a2a; color: #fff; }
             QTableWidget::item:alternate { background-color: #0f0f0f; }
-            QHeaderView::section { background-color: #0a0a0a; color: #999; padding: 12px 15px; border: none; border-bottom: 2px solid #2a2a2a; font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 1px; text-align: left; }
+            QHeaderView::section { background-color: #0a0a0a; color: #999; padding: 12px 15px; border: none; border-bottom: 2px solid #2a2a2a; font-weight: 600; font-size: 11px; letter-spacing: 1px; text-align: left; }
             QHeaderView::section:first { border-left: none; }
             QHeaderView::section:last { border-right: none; }
             QTableCornerButton::section { background-color: #0a0a0a; border: none; }

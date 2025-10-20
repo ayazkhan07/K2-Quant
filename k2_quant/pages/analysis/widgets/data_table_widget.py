@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QTableWidget,
                              QTableWidgetItem, QPushButton, QLabel, QHeaderView,
                              QFileDialog, QMessageBox, QProgressDialog)
 from PyQt6.QtCore import Qt, pyqtSignal, QThread
+from PyQt6.QtGui import QFont
 
 from k2_quant.utilities.logger import k2_logger
 
@@ -99,6 +100,11 @@ class DataTableWidget(QWidget):
         self.table.setSelectionMode(QTableWidget.SelectionMode.ContiguousSelection)
         self.table.setVerticalScrollMode(QTableWidget.ScrollMode.ScrollPerPixel)
         self.table.setHorizontalScrollMode(QTableWidget.ScrollMode.ScrollPerPixel)
+        # Apply small-caps to header titles
+        header = self.table.horizontalHeader()
+        header_font = header.font()
+        header_font.setCapitalization(QFont.Capitalization.SmallCaps)
+        header.setFont(header_font)
         
         # Connect signals
         self.table.itemSelectionChanged.connect(self.on_selection_changed)
@@ -465,7 +471,6 @@ class DataTableWidget(QWidget):
                 border: none;
                 border-bottom: 2px solid #2a2a2a;
                 font-weight: 600;
-                text-transform: uppercase;
                 font-size: 11px;
                 letter-spacing: 0.5px;
             }
