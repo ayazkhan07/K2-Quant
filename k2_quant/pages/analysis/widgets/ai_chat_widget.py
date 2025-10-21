@@ -16,6 +16,7 @@ from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer
 from PyQt6.QtGui import QTextCursor, QFont, QTextCharFormat, QColor
 
 from k2_quant.utilities.logger import k2_logger
+from k2_quant.utilities.text.math_formatter import MathFormatter
 
 
 class AIStreamThread(QThread):
@@ -71,6 +72,7 @@ class AIChatWidget(QWidget):
         self.ai_thread = None
         self.current_code_block = ""
         self.is_streaming = False
+        self.math_formatter = MathFormatter(use_block_markers=True)
         
         self.init_ui()
         self.setup_styling()
@@ -361,7 +363,9 @@ class AIChatWidget(QWidget):
         if "```python" in chunk or "```" in chunk:
             self.current_code_block += chunk
         else:
-            cursor.insertText(chunk)
+            # Scope formatting to math delimiters; preserve non-math text
+            formatted_chunk = self.math_formatter.feed(chunk)
+            cursor.insertText(formatted_chunk)
         
         # Auto-scroll
         scrollbar = self.chat_display.verticalScrollBar()
@@ -385,6 +389,16 @@ class AIChatWidget(QWidget):
         # Hide streaming indicator
         self.streaming_indicator.hide()
         
+        # Flush any remaining formatted math from the stream buffer
+        try:
+            remaining = self.math_formatter.flush()
+            if remaining:
+                cursor = self.chat_display.textCursor()
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                cursor.insertText(remaining)
+        except Exception:
+            pass
+
         # Process any code blocks
         if self.current_code_block:
             self.process_code_block(self.current_code_block)

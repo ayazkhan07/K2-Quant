@@ -15,6 +15,7 @@ from PyQt6.QtGui import QTextCursor
 
 from k2_quant.utilities.logger import k2_logger
 from k2_quant.utilities.services import table_controller
+from k2_quant.utilities.text.math_formatter import MathFormatter
 
 
 class CommandWorker(QThread):
@@ -49,7 +50,7 @@ class RightPaneWidget(QFrame):
     
     def __init__(self):
         super().__init__()
-        self.setFixedWidth(380)
+        self.setFixedWidth(684)
         self.setObjectName("rightPane")
         
         self.current_context: Optional[Dict[str, Any]] = None
@@ -58,6 +59,7 @@ class RightPaneWidget(QFrame):
         self.streaming_timer = None
         self.streaming_text = ""
         self.streaming_index = 0
+        self.math_formatter = MathFormatter(use_block_markers=True)
         
         self.init_ui()
         self.setup_styling()
@@ -176,7 +178,8 @@ class RightPaneWidget(QFrame):
             self._render_formatted_response(prefix, text)
             return
 
-        self.streaming_text = text
+        # Apply math formatting only within explicit delimiters; keep others intact
+        self.streaming_text = self.math_formatter.format_full(text)
         self.streaming_index = 0
         self.chat_display.append(prefix)
         

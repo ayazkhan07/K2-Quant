@@ -14,6 +14,7 @@ from PyQt6.QtCore import Qt, pyqtSignal, QThread
 from PyQt6.QtGui import QTextCursor, QFont, QTextCharFormat, QColor
 
 from k2_quant.utilities.logger import k2_logger
+from k2_quant.utilities.text.math_formatter import MathFormatter
 
 
 class AIStreamThread(QThread):
@@ -55,6 +56,7 @@ class AIChatWidget(QWidget):
 
 		self.ai_thread: Optional[AIStreamThread] = None
 		self.is_streaming = False
+		self.math_formatter = MathFormatter(use_block_markers=True)
 
 		self.init_ui()
 		self.setup_styling()
@@ -185,7 +187,8 @@ class AIChatWidget(QWidget):
 		"""Append streamed text to AI message"""
 		cursor = self.chat_display.textCursor()
 		cursor.movePosition(QTextCursor.MoveOperation.End)
-		cursor.insertText(chunk)
+		formatted_chunk = self.math_formatter.feed(chunk)
+		cursor.insertText(formatted_chunk)
 
 		# Auto-scroll
 		scrollbar = self.chat_display.verticalScrollBar()
@@ -201,6 +204,16 @@ class AIChatWidget(QWidget):
 
 		# Hide streaming indicator
 		self.streaming_indicator.hide()
+
+		# Flush remaining formatted math from buffer
+		try:
+			remaining = self.math_formatter.flush()
+			if remaining:
+				cursor = self.chat_display.textCursor()
+				cursor.movePosition(QTextCursor.MoveOperation.End)
+				cursor.insertText(remaining)
+		except Exception:
+			pass
 
 		k2_logger.info("AI streaming complete", "AI_CHAT")
 
