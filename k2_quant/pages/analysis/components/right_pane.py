@@ -50,7 +50,7 @@ class RightPaneWidget(QFrame):
     
     def __init__(self):
         super().__init__()
-        self.setFixedWidth(684)
+        self.setFixedWidth(380)
         self.setObjectName("rightPane")
         
         self.current_context: Optional[Dict[str, Any]] = None
