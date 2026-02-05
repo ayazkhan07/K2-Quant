@@ -3,6 +3,33 @@ K2 Quant Analysis Page - Harmonized Orchestrator
 
 Coordinates the three pane components without containing UI logic.
 Save as: k2_quant/pages/analysis/page.py
+
+EXPECTATIONS:
+=============
+This module orchestrates technical indicator application with the following objectives:
+
+1. DISPLAY NAME MAPPING:
+   - MUST translate user-friendly display names (e.g., "Bollinger Bands", "Stochastic") 
+     to TA service names (e.g., "BBANDS", "STOCH")
+   - MUST handle indicators with spaces or special characters in display names
+
+2. PARAMETER MAPPING:
+   - MUST translate user-friendly parameter names to TA-Lib parameter names:
+     * "period" -> "timeperiod" (for SMA, EMA, RSI, etc.)
+     * "std" -> "nbdevup"/"nbdevdn" (for Bollinger Bands)
+     * "k_period"/"d_period" -> "slowk_period"/"slowd_period" (for Stochastic)
+     * "fast"/"slow"/"signal" -> "fastperiod"/"slowperiod"/"signalperiod" (for MACD)
+
+3. INDICATOR APPLICATION:
+   - MUST validate indicator calculation succeeds before adding to UI
+   - MUST ensure indicator data is valid (not empty, has values) before display
+   - MUST add indicator to BOTH chart AND table when applied
+   - MUST remove indicator from BOTH chart AND table when removed
+
+4. ERROR HANDLING:
+   - MUST NOT add indicators to UI if calculation fails
+   - MUST log errors clearly when indicator application fails
+   - MUST handle parameter mismatches gracefully
 """
 
 import re
@@ -281,7 +308,12 @@ class AnalysisPageWidget(QWidget):
             self.remove_indicator(indicator_name)
     
     def extract_default_indicator_params(self, indicator_name: str) -> Dict:
-        """Extract default parameters from indicator name"""
+        """
+        Extract default parameters from indicator name.
+        
+        EXPECTATION: Returns user-friendly parameter names that will be 
+        mapped to TA-Lib parameter names later.
+        """
         params = {}
         
         # Extract number from parentheses if present
@@ -310,58 +342,237 @@ class AnalysisPageWidget(QWidget):
         
         return params
     
-    def apply_indicator(self, indicator_name: str, params: Dict):
-        """Apply indicator to current data"""
+    def _map_indicator_params(self, ta_service_name: str, params: Dict) -> Dict:
+        """
+        Map user-friendly parameter names to TA-Lib parameter names.
+        
+        EXPECTATION: MUST convert all user-friendly parameter names to 
+        TA-Lib standard parameter names. Returns mapped parameters dict.
+        """
+        mapped = params.copy()
+        
+        # Map common parameter names
+        if 'period' in mapped:
+            mapped['timeperiod'] = mapped.pop('period')
+        
+        # BBANDS specific mapping
+        if ta_service_name == 'BBANDS':
+            if 'std' in mapped:
+                std_value = mapped.pop('std')
+                mapped['nbdevup'] = std_value
+                mapped['nbdevdn'] = std_value
+        
+        # MACD specific mapping
+        if ta_service_name == 'MACD':
+            if 'fast' in mapped:
+                mapped['fastperiod'] = mapped.pop('fast')
+            if 'slow' in mapped:
+                mapped['slowperiod'] = mapped.pop('slow')
+            if 'signal' in mapped:
+                mapped['signalperiod'] = mapped.pop('signal')
+        
+        # Stochastic specific mapping
+        if ta_service_name == 'STOCH':
+            if 'k_period' in mapped:
+                mapped['slowk_period'] = mapped.pop('k_period')
+            if 'd_period' in mapped:
+                mapped['slowd_period'] = mapped.pop('d_period')
+        
+        return mapped
+
+    def _get_indicator_source_dataframe(self) -> Optional[pd.DataFrame]:
+        """
+        Return a small, in-memory dataframe suitable for fast indicator calculation.
+
+        PERFORMANCE OBJECTIVE:
+        - Indicator toggles MUST NOT fetch the full dataset (millions of rows) on the UI thread.
+        - Prefer using the chart widget's currently loaded data window (already chunked).
+
+        Returns a dataframe in "display" format with columns:
+        Date, Time, Open, High, Low, Close, Volume, VWAP
+        """
         try:
-            # Get full dataframe
-            df = stock_service.get_full_dataframe(self.current_model)
-            if df is None or df.empty:
+            cw = getattr(self.middle_pane, "chart_widget", None)
+            if cw is None:
+                return None
+
+            df = getattr(cw, "data", None)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                # Only keep expected display columns to avoid copying large extras
+                cols = [c for c in ['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'VWAP'] if c in df.columns]
+                if cols:
+                    return df[cols].copy()
+                return df.copy()
+        except Exception:
+            return None
+
+        return None
+    
+    def apply_indicator(self, indicator_name: str, params: Dict):
+        """
+        Apply indicator to current data.
+        
+        EXPECTATION: MUST validate calculation succeeds before adding to UI.
+        MUST add indicator to both chart AND table.
+        MUST map display names and parameters correctly.
+        """
+        try:
+            # PERFORMANCE: Use the chart widget's currently loaded window.
+            # Do NOT fetch full dataset for large models on indicator toggle.
+            display_df = self._get_indicator_source_dataframe()
+            if display_df is None or display_df.empty:
+                k2_logger.warning("No chart window available for indicator calculation", "ANALYSIS")
                 return
-            
-            # Create datetime index in UTC
-            df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC')
+
+            # Build a timezone-naive datetime index (Date+Time when available)
+            if 'Date' in display_df.columns and 'Time' in display_df.columns:
+                dt_index = pd.to_datetime(
+                    display_df['Date'].astype(str) + ' ' + display_df['Time'].astype(str),
+                    errors='coerce'
+                )
+            elif 'Date' in display_df.columns:
+                dt_index = pd.to_datetime(display_df['Date'], errors='coerce')
+            else:
+                k2_logger.warning("Indicator source dataframe missing Date column", "ANALYSIS")
+                return
+
+            if dt_index.isna().all():
+                k2_logger.warning("Could not build datetime index for indicator calculation", "ANALYSIS")
+                return
+
+            # Prepare TA dataframe in expected lowercase schema
+            df = display_df.rename(columns={
+                'Open': 'open',
+                'High': 'high',
+                'Low': 'low',
+                'Close': 'close',
+                'Volume': 'volume',
+                'VWAP': 'vwap',
+            }).copy()
+            df['datetime'] = dt_index
             df.set_index('datetime', inplace=True)
             
-            # Get base indicator name
+            # Get base indicator name (display name)
             base_name = indicator_name.split("(")[0].strip()
             
-            # Calculate indicator
-            indicator_data = ta_service.calculate_indicator(df, base_name, params)
+            # Map display name to TA service name
+            ta_service_name = ta_service.map_display_name_to_service_name(base_name)
+            if ta_service_name is None:
+                ta_service_name = base_name.upper()
             
-            if indicator_data is not None:
-                # Determine color
-                colors = {
-                    'SMA': '#00ffff',
-                    'EMA': '#ff00ff',
-                    'MACD': '#ffa500',
-                    'RSI': '#00ff00',
-                    'BOLLINGER': '#ffff00',
-                    'STOCHASTIC': '#00ff00',
-                    'OBV': '#ff69b4',
-                    'VWAP': '#ffd700'
-                }
-                color = colors.get(base_name.upper(), '#ffff00')
-                
-                # Ensure it's a Series
-                if isinstance(indicator_data, np.ndarray):
-                    indicator_data = pd.Series(indicator_data, index=df.index, name=indicator_name)
-                
-                # Add to chart
-                self.middle_pane.add_indicator(indicator_name, indicator_data, color)
-                
+            # Map parameters to TA-Lib format
+            mapped_params = self._map_indicator_params(ta_service_name, params)
+            
+            # Calculate indicator
+            indicator_data = ta_service.calculate_indicator(df, ta_service_name, mapped_params)
+            
+            # Keep a timezone-naive index for alignment
+            df_index = df.index
+            if isinstance(df_index, pd.DatetimeIndex) and df_index.tz is not None:
+                df_index = df_index.tz_localize(None)
+            
+            # Use white color for all technical indicators for better visibility
+            color = '#ffffff'
+            
+            # Handle multi-line indicators (like Bollinger Bands)
+            if isinstance(indicator_data, dict):
+                # Multi-line indicator - add each line separately
+                for line_name, line_series in indicator_data.items():
+                    full_name = f"{indicator_name} ({line_name})"
+                    
+                    # Remove timezone from index if present
+                    if hasattr(line_series.index, 'tz') and line_series.index.tz is not None:
+                        line_series.index = line_series.index.tz_localize(None)
+                    
+                    # Reindex to match dataframe
+                    line_series = line_series.reindex(df_index)
+                    line_series.name = full_name
+                    
+                    # Skip if all NaN
+                    if line_series.isna().all():
+                        continue
+                    
+                    # Add to chart and table
+                    self.middle_pane.add_indicator(full_name, line_series, color)
+                    
                 # Store in applied indicators
                 self.applied_indicators[indicator_name] = params
+                k2_logger.info(f"Successfully applied multi-line indicator: {indicator_name}", "ANALYSIS")
+                return
+            
+            # Single-line indicator
+            # Validate indicator data before adding to UI
+            if indicator_data is None:
+                k2_logger.warning(f"Indicator calculation returned no data for {indicator_name}", "ANALYSIS")
+                return
+            
+            if isinstance(indicator_data, pd.Series) and indicator_data.empty:
+                k2_logger.warning(f"Indicator calculation returned empty data for {indicator_name}", "ANALYSIS")
+                return
+            
+            # Check if we have valid values (not all NaN)
+            if isinstance(indicator_data, pd.Series) and indicator_data.isna().all():
+                k2_logger.warning(f"Indicator calculation returned only NaN values for {indicator_name}", "ANALYSIS")
+                return
+            
+            # Ensure indicator data is a Series with datetime index matching the dataframe
+            if isinstance(indicator_data, np.ndarray):
+                indicator_data = pd.Series(indicator_data, index=df_index, name=indicator_name)
+            elif isinstance(indicator_data, pd.Series):
+                # Remove timezone from indicator index if present
+                if hasattr(indicator_data.index, 'tz') and indicator_data.index.tz is not None:
+                    indicator_data.index = indicator_data.index.tz_localize(None)
                 
-                # Optionally persist to database
-                self.persist_indicator_to_db(base_name, params, indicator_data)
+                # Reindex to match dataframe index
+                indicator_data = indicator_data.reindex(df_index)
+                indicator_data.name = indicator_name
+            else:
+                k2_logger.error(f"Unexpected indicator data type: {type(indicator_data)}", "ANALYSIS")
+                return
+            
+            # Get indicator config to determine pane type (main overlay vs separate pane)
+            indicator_config = ta_service.get_indicator_info(ta_service_name)
+            pane_type = 'main'  # Default to overlay
+            if indicator_config and hasattr(indicator_config, 'pane'):
+                pane_type = indicator_config.pane
+            
+            # Add to chart based on pane type
+            # Oscillators (RSI, Stochastic, MACD) go in separate panes with 0-100 Y-axis
+            # Overlays (SMA, EMA, Bollinger) go on the main chart
+            if pane_type == 'separate':
+                self.middle_pane.add_indicator_pane(indicator_name, indicator_data, color)
+            else:
+                self.middle_pane.add_indicator(indicator_name, indicator_data, color)
+            
+            # Store in applied indicators
+            self.applied_indicators[indicator_name] = params
+            
+            # PERFORMANCE: Do not persist indicators to DB on toggle.
+            # Persisting requires full-dataset reads and full-column updates which can take 30+ seconds
+            # on large (1MIN-20Y) models and blocks the UI thread.
+            
+            k2_logger.info(f"Successfully applied indicator: {indicator_name} (pane: {pane_type})", "ANALYSIS")
                 
         except Exception as e:
             k2_logger.error(f"Error applying indicator {indicator_name}: {e}", "ANALYSIS")
     
     def remove_indicator(self, indicator_name: str):
-        """Remove indicator from display"""
+        """Remove indicator from display (handles multi-line indicators like Bollinger Bands)"""
         try:
+            # For multi-line indicators, remove all lines
+            # Check if this is a base indicator name (e.g., "Bollinger Bands")
+            base_name = indicator_name.split("(")[0].strip()
+            
+            # Try to remove the exact indicator name first
             self.middle_pane.remove_indicator(indicator_name)
+            
+            # Also remove any sub-indicators (e.g., "Bollinger Bands (upper)", etc.)
+            sub_names = [f"{indicator_name} (upper)", f"{indicator_name} (middle)", f"{indicator_name} (lower)"]
+            for sub_name in sub_names:
+                try:
+                    self.middle_pane.remove_indicator(sub_name)
+                except:
+                    pass
             
             if indicator_name in self.applied_indicators:
                 del self.applied_indicators[indicator_name]

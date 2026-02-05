@@ -3,6 +3,40 @@ Technical Analysis Service for K2 Quant
 
 Provides all technical indicators using TA-Lib library.
 Organized alphabetically with multi-pane support.
+
+EXPECTATIONS:
+=============
+This service provides technical indicator calculations with the following objectives:
+
+1. INDICATOR REGISTRY:
+   - MUST maintain complete registry of all available indicators
+   - MUST provide mapping from display names to service names
+   - MUST provide default parameters for each indicator
+   - MUST document expected parameter names for TA-Lib functions
+
+2. PARAMETER HANDLING:
+   - MUST accept TA-Lib standard parameter names (timeperiod, fastperiod, etc.)
+   - MUST NOT accept user-friendly parameter names (period, fast, etc.)
+   - MUST validate parameters before calculation
+   - MUST use default parameters if custom parameters not provided
+
+3. CALCULATION:
+   - MUST return pandas Series with datetime index aligned to input data
+   - MUST handle indicators that return multiple values (return primary value)
+   - MUST handle missing data gracefully (NaN values)
+   - MUST return empty Series on calculation failure (not None)
+
+4. ERROR HANDLING:
+   - MUST log calculation errors clearly
+   - MUST return empty Series (not None) when calculation fails
+   - MUST validate TA-Lib availability before attempting calculations
+   - MUST handle parameter mismatches without crashing
+
+5. INDICATOR MAPPING:
+   - MUST provide map_display_name_to_service_name() method
+   - MUST map "Bollinger Bands" -> "BBANDS"
+   - MUST map "Stochastic" -> "STOCH"
+   - MUST handle case-insensitive matching
 """
 
 import pandas as pd
@@ -186,9 +220,13 @@ class TechnicalAnalysisService:
             ),
             
             # V
+            'VOLUME': IndicatorConfig(
+                'VOLUME', 'Volume', 'volume', 'separate',
+                {}, 'Trading volume'
+            ),
             'VWAP': IndicatorConfig(
                 'VWAP', 'Volume Weighted Average Price', 'overlay', 'main',
-                {}, 'Average price weighted by volume'
+                {}, 'Average price weighted by volume (daily reset)'
             ),
             
             # W
@@ -217,14 +255,60 @@ class TechnicalAnalysisService:
         """Get information about an indicator"""
         return self.indicators.get(indicator_name)
     
+    def map_display_name_to_service_name(self, display_name: str) -> Optional[str]:
+        """
+        Map display name (e.g., 'Bollinger Bands') to TA service name (e.g., 'BBANDS').
+        
+        EXPECTATION: MUST handle all user-friendly display names and map them to 
+        TA-Lib service names. Returns None if no mapping found.
+        """
+        display_name_upper = display_name.upper().strip()
+        
+        # First, check if it's already a service name
+        if display_name_upper in self.indicators:
+            return display_name_upper
+        
+        # Check if it matches a full_name (case-insensitive)
+        for service_name, config in self.indicators.items():
+            if config.full_name.upper() == display_name_upper:
+                return service_name
+        
+        # Handle common display name variations
+        name_mappings = {
+            'BOLLINGER BANDS': 'BBANDS',
+            'BOLLINGER': 'BBANDS',
+            'STOCHASTIC': 'STOCH',
+            'STOCHASTIC OSCILLATOR': 'STOCH',
+        }
+        
+        return name_mappings.get(display_name_upper)
+    
     def calculate_indicator(self, data: pd.DataFrame, indicator_name: str,
                           custom_params: Dict[str, Any] = None) -> pd.Series:
-        """Calculate a technical indicator"""
+        """
+        Calculate a technical indicator.
+        
+        EXPECTATION: MUST accept either display names or service names.
+        MUST map display names to service names automatically.
+        MUST return empty Series (not None) on failure.
+        """
         if not TALIB_AVAILABLE:
             k2_logger.error("TA-Lib not available", "TA")
             return pd.Series()
         
-        indicator_name = indicator_name.upper()
+        # Map display name to service name if needed
+        service_name = self.map_display_name_to_service_name(indicator_name)
+        if service_name is None:
+            # Try uppercase as fallback
+            indicator_name_upper = indicator_name.upper()
+            if indicator_name_upper in self.indicators:
+                service_name = indicator_name_upper
+            else:
+                k2_logger.error(f"Unknown indicator: {indicator_name}", "TA")
+                return pd.Series()
+        else:
+            indicator_name = service_name
+        
         if indicator_name not in self.indicators:
             k2_logger.error(f"Unknown indicator: {indicator_name}", "TA")
             return pd.Series()
@@ -244,14 +328,31 @@ class TechnicalAnalysisService:
             volume = data['volume'].values if 'volume' in data.columns else None
             open_price = data['open'].values if 'open' in data.columns else None
             
+            # Special handling for VWAP - needs date grouping for daily reset
+            if indicator_name == 'VWAP':
+                result = self._calculate_vwap_daily(data)
+                if result is not None:
+                    series = pd.Series(result, index=data.index)
+                    k2_logger.info(f"Calculated {indicator_name} (daily reset)", "TA")
+                    return series
+                return pd.Series()
+            
             # Calculate based on indicator type
             result = self._calculate_specific_indicator(
                 indicator_name, open_price, high, low, close, volume, params
             )
             
-            # Convert to Series
-            if isinstance(result, tuple):
-                # For indicators that return multiple values (like BBANDS, MACD)
+            # Convert to Series or dict of Series
+            if isinstance(result, dict):
+                # For indicators that return multiple lines (like BBANDS)
+                # Return dict of Series
+                series_dict = {}
+                for key, values in result.items():
+                    series_dict[key] = pd.Series(values, index=data.index)
+                k2_logger.info(f"Calculated {indicator_name} (multiple lines)", "TA")
+                return series_dict
+            elif isinstance(result, tuple):
+                # For indicators that return multiple values (like MACD)
                 # Return the main line
                 result = result[0]
             
@@ -322,7 +423,8 @@ class TechnicalAnalysisService:
             return talib.ATR(high, low, close, **params)
         elif name == 'BBANDS':
             upper, middle, lower = talib.BBANDS(close, **params)
-            return middle  # Return middle band for main display
+            # Return all three bands as a dict for complete Bollinger Bands display
+            return {'upper': upper, 'middle': middle, 'lower': lower}
         
         # Volume Indicators
         elif name == 'OBV':
@@ -343,24 +445,84 @@ class TechnicalAnalysisService:
         
         # Custom VWAP calculation (not in TA-Lib)
         elif name == 'VWAP':
-            return self._calculate_vwap(high, low, close, volume)
+            # VWAP needs the full dataframe for date grouping - handled in calculate_indicator
+            return None  # Placeholder - actual calculation in calculate_indicator
+        
+        # Volume (raw)
+        elif name == 'VOLUME':
+            return volume
         
         else:
             k2_logger.warning(f"Indicator {name} not implemented", "TA")
             return None
     
-    def _calculate_vwap(self, high, low, close, volume) -> np.ndarray:
-        """Calculate Volume Weighted Average Price"""
-        typical_price = (high + low + close) / 3
-        cumulative_tpv = np.cumsum(typical_price * volume)
-        cumulative_volume = np.cumsum(volume)
+    def _calculate_vwap_daily(self, data: pd.DataFrame) -> Optional[np.ndarray]:
+        """
+        Calculate Volume Weighted Average Price with daily reset.
         
-        # Avoid division by zero
-        vwap = np.where(cumulative_volume != 0, 
-                       cumulative_tpv / cumulative_volume, 
-                       typical_price)
-        
-        return vwap
+        VWAP resets at the start of each trading day, providing an intraday
+        average price weighted by volume.
+        """
+        try:
+            # Get required columns
+            high = data['high'].values if 'high' in data.columns else None
+            low = data['low'].values if 'low' in data.columns else None
+            close = data['close'].values if 'close' in data.columns else None
+            volume = data['volume'].values if 'volume' in data.columns else None
+            
+            if high is None or low is None or close is None or volume is None:
+                k2_logger.warning("Missing required columns for VWAP", "TA")
+                return None
+            
+            # Calculate typical price
+            typical_price = (high + low + close) / 3
+            
+            # Get date from index (should be datetime index)
+            if isinstance(data.index, pd.DatetimeIndex):
+                dates = data.index.date
+            elif 'timestamp' in data.columns:
+                # Convert timestamp (ms) to date
+                dates = pd.to_datetime(data['timestamp'], unit='ms').dt.date.values
+            else:
+                # Fallback: try to extract date from index
+                try:
+                    dates = pd.to_datetime(data.index).date
+                except:
+                    # No date info available - use cumulative VWAP as fallback
+                    k2_logger.warning("No date info for VWAP daily reset - using cumulative", "TA")
+                    cumulative_tpv = np.cumsum(typical_price * volume)
+                    cumulative_volume = np.cumsum(volume)
+                    return np.where(cumulative_volume != 0, 
+                                   cumulative_tpv / cumulative_volume, 
+                                   typical_price)
+            
+            # Create arrays for VWAP calculation
+            vwap = np.zeros(len(data), dtype=np.float64)
+            
+            # Group by date and calculate VWAP per day
+            unique_dates = np.unique(dates)
+            
+            for date in unique_dates:
+                mask = dates == date
+                day_tp = typical_price[mask]
+                day_vol = volume[mask]
+                
+                # Cumulative sums within the day
+                cumulative_tpv = np.cumsum(day_tp * day_vol)
+                cumulative_vol = np.cumsum(day_vol)
+                
+                # Calculate VWAP for the day
+                day_vwap = np.where(cumulative_vol != 0,
+                                   cumulative_tpv / cumulative_vol,
+                                   day_tp)
+                
+                vwap[mask] = day_vwap
+            
+            return vwap
+            
+        except Exception as e:
+            k2_logger.error(f"Failed to calculate daily VWAP: {e}", "TA")
+            return None
     
     def calculate_multiple_indicators(self, data: pd.DataFrame, 
                                     indicator_list: List[str]) -> Dict[str, pd.Series]:

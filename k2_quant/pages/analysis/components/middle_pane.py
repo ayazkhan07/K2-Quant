@@ -3,6 +3,33 @@ Middle Pane Component - Data Visualization
 
 Contains chart and data table with controls.
 Save as: k2_quant/pages/analysis/components/middle_pane.py
+
+EXPECTATIONS:
+=============
+This component manages both chart and table display with the following objectives:
+
+1. INDICATOR DISPLAY:
+   - MUST display indicators on the chart as visual overlays/lines
+   - MUST display indicator values in the table as additional columns
+   - MUST align indicator data with table rows by timestamp/date
+   - MUST update table dynamically when indicators are added/removed
+
+2. DATA SYNCHRONIZATION:
+   - MUST keep chart and table data synchronized
+   - MUST merge indicator Series data into table DataFrame
+   - MUST handle indicators with different data lengths or missing values
+   - MUST preserve existing table columns when adding indicators
+
+3. TABLE MANAGEMENT:
+   - MUST support dynamic column addition/removal for indicators
+   - MUST format indicator values appropriately (numeric with proper decimals)
+   - MUST maintain table performance with large datasets
+   - MUST update table headers when indicators are added/removed
+
+4. INDICATOR STATE:
+   - MUST track active indicators in active_indicators dictionary
+   - MUST remove indicator data from both chart and table when indicator is removed
+   - MUST handle indicator updates when parameters change
 """
 
 from typing import Dict, List, Any, Optional, Union
@@ -251,19 +278,81 @@ class MiddlePaneWidget(QFrame):
         self.data_updated.emit()
     
     def load_data_into_table(self, data):
-        """Load data into the table widget"""
+        """
+        Load data into the table widget.
+        
+        EXPECTATION: MUST merge active indicator data into the table DataFrame.
+        MUST include indicator columns in the table display.
+        """
         if data is None or not self.data_table:
             return
         
-        # Handle both DataFrame and list formats
+        # Convert to DataFrame if needed
         if isinstance(data, pd.DataFrame):
-            rows = data.values.tolist()
-            columns = list(data.columns)
+            df = data.copy()
         elif isinstance(data, list):
-            rows = data
-            columns = ['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'VWAP']
+            columns = ['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'VWAP']
+            df = pd.DataFrame(data, columns=columns[:len(data[0])] if data else columns)
         else:
             return
+        
+        # Merge active indicators into DataFrame
+        # Indicators are stored as Series with datetime index.
+        #
+        # IMPORTANT:
+        # The table is not necessarily a contiguous time slice (for large datasets we load a
+        # sample of oldest + newest rows). Therefore, indicator values MUST be aligned to
+        # each table row by timestamp (Date+Time), not by positional slicing.
+        if self.active_indicators:
+            table_len = len(df)
+
+            # Build a datetime index for the table rows (timezone-naive)
+            table_index = None
+            try:
+                if 'Date' in df.columns and 'Time' in df.columns:
+                    dt = pd.to_datetime(
+                        df['Date'].astype(str) + ' ' + df['Time'].astype(str),
+                        errors='coerce'
+                    )
+                    if not dt.isna().all():
+                        table_index = pd.DatetimeIndex(dt)
+            except Exception:
+                table_index = None
+
+            for indicator_name, indicator_series in self.active_indicators.items():
+                if indicator_series is None:
+                    continue
+
+                try:
+                    series = indicator_series
+                    if not isinstance(series, pd.Series):
+                        series = pd.Series(series)
+                    if series.empty:
+                        continue
+
+                    # Ensure timezone-naive for alignment with table datetimes
+                    if isinstance(series.index, pd.DatetimeIndex) and series.index.tz is not None:
+                        series = series.copy()
+                        series.index = series.index.tz_localize(None)
+
+                    if table_index is not None and len(table_index) == table_len:
+                        aligned = series.reindex(table_index)
+                        df[indicator_name] = aligned.values
+                    else:
+                        # Fallback: positional alignment (best-effort)
+                        indicator_values = series.values
+                        if len(indicator_values) >= table_len:
+                            df[indicator_name] = indicator_values[:table_len]
+                        else:
+                            padded_values = np.full(table_len, np.nan)
+                            padded_values[:len(indicator_values)] = indicator_values
+                            df[indicator_name] = padded_values
+                except Exception as e:
+                    k2_logger.warning(f"Could not align indicator {indicator_name}: {e}", "MIDDLE_PANE")
+        
+        # Convert to rows and columns for table widget
+        rows = df.values.tolist()
+        columns = list(df.columns)
         
         # Set up table
         self.data_table.setRowCount(len(rows))
@@ -273,14 +362,33 @@ class MiddlePaneWidget(QFrame):
         # Populate table
         for i, row in enumerate(rows):
             for j, value in enumerate(row):
-                if columns[j] in ['Open', 'High', 'Low', 'Close', 'VWAP']:
+                col_name = columns[j]
+                
+                # Format value based on column type
+                if pd.isna(value):
+                    text = ""
+                elif col_name in ['Open', 'High', 'Low', 'Close', 'VWAP']:
                     try:
                         text = f"{float(value):.2f}"
                     except:
                         text = str(value)
-                elif columns[j] == 'Volume':
+                elif col_name == 'Volume':
                     try:
                         text = f"{int(value):,}"
+                    except:
+                        text = str(value)
+                elif col_name in self.active_indicators:
+                    # Format indicator values
+                    try:
+                        if isinstance(value, (int, np.integer)):
+                            text = f"{value:,}"
+                        elif isinstance(value, (float, np.floating)):
+                            if abs(value) < 10000 and abs(value) > 0.01:
+                                text = f"{value:.2f}"
+                            else:
+                                text = f"{value:.4f}"
+                        else:
+                            text = str(value)
                     except:
                         text = str(value)
                 else:
@@ -289,19 +397,65 @@ class MiddlePaneWidget(QFrame):
                 self.data_table.setItem(i, j, QTableWidgetItem(text))
     
     def add_indicator(self, indicator_name: str, indicator_data: pd.Series, color: str = '#ffff00'):
-        """Add indicator to chart"""
+        """
+        Add indicator overlay to main chart and table.
+        
+        EXPECTATION: MUST add indicator to chart AND update table with indicator column.
+        MUST store indicator data for table merging.
+        """
         if self.chart_widget:
             self.chart_widget.add_indicator(indicator_name, indicator_data, color=color)
-            self.active_indicators[indicator_name] = indicator_data
-            k2_logger.info(f"Added indicator: {indicator_name}", "MIDDLE_PANE")
+        
+        # Store indicator data for table merging
+        self.active_indicators[indicator_name] = indicator_data
+        
+        # Update table to include new indicator column
+        if self.current_data is not None:
+            self.load_data_into_table(self.current_data)
+        
+        k2_logger.info(f"Added indicator: {indicator_name} (chart overlay and table)", "MIDDLE_PANE")
+    
+    def add_indicator_pane(self, indicator_name: str, indicator_data: pd.Series, color: str = '#ffffff'):
+        """
+        Add indicator in a separate pane below the main chart.
+        
+        Used for oscillators (RSI, Stochastic, MACD) that have different Y-axis scales (0-100).
+        """
+        if self.chart_widget:
+            self.chart_widget.add_indicator_pane(indicator_name, indicator_data, color=color)
+        
+        # Store indicator data for table merging
+        self.active_indicators[indicator_name] = indicator_data
+        
+        # Update table to include new indicator column
+        if self.current_data is not None:
+            self.load_data_into_table(self.current_data)
+        
+        k2_logger.info(f"Added indicator: {indicator_name} (separate pane and table)", "MIDDLE_PANE")
     
     def remove_indicator(self, indicator_name: str):
-        """Remove indicator from chart"""
+        """
+        Remove indicator from both chart and table.
+        
+        EXPECTATION: MUST remove indicator from chart AND remove column from table.
+        Handles both overlays and separate panes.
+        """
         if self.chart_widget:
+            # Try to remove from overlay first
             self.chart_widget.remove_indicator(indicator_name)
-            if indicator_name in self.active_indicators:
-                del self.active_indicators[indicator_name]
-            k2_logger.info(f"Removed indicator: {indicator_name}", "MIDDLE_PANE")
+            # Also try to remove from panes (for oscillators)
+            if hasattr(self.chart_widget, 'remove_indicator_pane'):
+                self.chart_widget.remove_indicator_pane(indicator_name)
+        
+        # Remove from active indicators
+        if indicator_name in self.active_indicators:
+            del self.active_indicators[indicator_name]
+        
+        # Update table to remove indicator column
+        if self.current_data is not None:
+            self.load_data_into_table(self.current_data)
+        
+        k2_logger.info(f"Removed indicator: {indicator_name} (chart and table)", "MIDDLE_PANE")
     
     def jump_to_end(self):
         """Jump to the latest data in the chart"""

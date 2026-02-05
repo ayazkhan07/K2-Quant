@@ -828,10 +828,14 @@ class ChartWidget(QWidget):
         
         layout.addWidget(self.chart_container, stretch=3)
         
-        # Indicator container
-        self.indicator_container = QVBoxLayout()
+        # Indicator container (QWidget with layout for separate pane indicators)
+        # Hidden by default - only shown when oscillator indicators are active
+        self.indicator_widget = QWidget()
+        self.indicator_container = QVBoxLayout(self.indicator_widget)
+        self.indicator_container.setContentsMargins(0, 0, 0, 0)
         self.indicator_container.setSpacing(2)
-        layout.addLayout(self.indicator_container, stretch=1)
+        self.indicator_widget.hide()  # Start hidden - show only when panes are added
+        layout.addWidget(self.indicator_widget, stretch=1)
         
         return container
         
@@ -2404,28 +2408,60 @@ class ChartWidget(QWidget):
             self._method_cache.clear()
             
     def add_indicator(self, indicator_name, indicator_data, color='#ffff00'):
-        """Add indicator overlay"""
+        """
+        Add indicator overlay to chart.
+        
+        EXPECTATION: MUST align indicator data with chart's x_values.
+        Indicator data may have different length due to warmup periods.
+        MUST handle alignment by matching lengths properly.
+        """
         if indicator_name in self.indicator_overlays:
             self.remove_indicator(indicator_name)
 
+        # Get y_values from indicator data
+        if isinstance(indicator_data, pd.Series):
+            y_values = indicator_data.values.astype(np.float32)
+        else:
+            y_values = np.array(indicator_data, dtype=np.float32)
+
+        # Ensure x_values exists and matches the chart data length
         if self.x_values is None:
-            self.x_values = np.arange(len(indicator_data), dtype=np.float32)
+            # If x_values not set, create based on indicator length
+            self.x_values = np.arange(len(y_values), dtype=np.float32)
+        
+        # Align indicator data with chart's x_values
+        # IMPORTANT: Chart typically shows the LAST N data points (most recent)
+        # So we need to take the LAST N indicator values, not the first
+        x_len = len(self.x_values)
+        y_len = len(y_values)
+        
+        if y_len < x_len:
+            # Indicator is shorter - pad with NaN at the start
+            y_aligned = np.full(x_len, np.nan, dtype=np.float32)
+            y_aligned[-y_len:] = y_values
+        elif y_len > x_len:
+            # Indicator is longer - take the LAST x_len values (most recent)
+            # to match the chart's visible data range
+            y_aligned = y_values[-x_len:]
+        else:
+            # Same length - use as is
+            y_aligned = y_values
 
-        y_values = indicator_data.values.astype(np.float32) if isinstance(indicator_data, pd.Series) else np.array(indicator_data, dtype=np.float32)
+        # Clip and clean values
+        y_aligned = np.clip(y_aligned, -1e6, 1e6)
+        y_aligned[np.isinf(y_aligned)] = np.nan
 
-        y_values = np.clip(y_values, -1e6, 1e6)
-        y_values[np.isinf(y_values)] = np.nan
-
+        # Create plot item with aligned data
         plot_item = OptimizedPlotDataItem(
-            x=self.x_values[:len(y_values)],
-            y=y_values,
+            x=self.x_values,
+            y=y_aligned,
             pen=pg.mkPen(color=color, width=2, style=Qt.PenStyle.DashLine),
             connect='finite'
         )
 
         self.main_plot.addItem(plot_item)
         self.indicator_overlays[indicator_name] = plot_item
-        k2_logger.info(f"Added indicator overlay: {indicator_name}", "CHART")
+        k2_logger.info(f"Added indicator overlay: {indicator_name} (aligned: {y_len} -> {x_len})", "CHART")
 
     def remove_indicator(self, indicator_name):
         """Remove indicator"""
@@ -2434,13 +2470,18 @@ class ChartWidget(QWidget):
             del self.indicator_overlays[indicator_name]
             k2_logger.info(f"Removed indicator: {indicator_name}", "CHART")
             
-    def add_indicator_pane(self, indicator_name, data, chart_type='line'):
-        """Add indicator pane"""
+    def add_indicator_pane(self, indicator_name, data, chart_type='line', color='#ffffff'):
+        """
+        Add indicator in a separate pane below the main chart.
+        
+        Used for oscillators (RSI, Stochastic, MACD) that have different Y-axis scales.
+        """
         if indicator_name in self.indicator_panes:
             self.remove_indicator_pane(indicator_name)
 
         indicator_plot = pg.PlotWidget()
         indicator_plot.setMaximumHeight(150)
+        indicator_plot.setMinimumHeight(100)
         indicator_plot.showGrid(x=True, y=True, alpha=0.3)
         indicator_plot.setLabel('left', indicator_name)
         indicator_plot.setBackground('#0a0a0a')
@@ -2450,43 +2491,114 @@ class ChartWidget(QWidget):
         indicator_plot.getAxis('bottom').setPen(pg.mkPen(color='#666'))
         indicator_plot.getAxis('bottom').setTextPen(pg.mkPen(color='#999'))
 
-        indicator_plot.setXLink(self.main_plot)
+        # Get y_values from data - use float64 for large values (OBV, Volume)
+        if isinstance(data, pd.Series):
+            y_values = data.values.astype(np.float64)
+        else:
+            y_values = np.array(data, dtype=np.float64)
+        
+        # For indicator panes, we need to align with the chart's current data
+        # The chart displays x_values which are indices into its data array
+        if self.x_values is None or len(self.x_values) == 0:
+            k2_logger.warning("No x_values available for indicator pane", "CHART")
+            return
+        
+        x_len = len(self.x_values)
+        y_len = len(y_values)
+        
+        k2_logger.info(f"Indicator pane alignment: x_len={x_len}, y_len={y_len}", "CHART")
+        
+        # Align indicator data to chart's x_values
+        # Chart shows indices [0, x_len), representing the LAST x_len points of full data
+        # Indicator data has y_len points; we need the LAST x_len of those
+        if y_len < x_len:
+            # Indicator shorter than chart - pad with NaN at start
+            y_aligned = np.full(x_len, np.nan, dtype=np.float64)
+            y_aligned[-y_len:] = y_values
+        elif y_len > x_len:
+            # Indicator longer than chart - take the last x_len values
+            y_aligned = y_values[-x_len:].astype(np.float64)
+        else:
+            y_aligned = y_values.astype(np.float64)
+        
+        # Clean up invalid values (use large range for volume-based indicators)
+        y_aligned[np.isinf(y_aligned)] = np.nan
+        
+        # Check if we have any valid data to plot
+        valid_count = np.count_nonzero(~np.isnan(y_aligned))
+        if valid_count == 0:
+            k2_logger.warning(f"No valid data points for indicator pane: {indicator_name}", "CHART")
+            return
+        
+        k2_logger.info(f"Indicator pane {indicator_name}: {valid_count} valid points", "CHART")
 
-        y_values = data.values.astype(np.float32) if isinstance(data, pd.Series) else np.array(data, dtype=np.float32)
-        y_values = np.clip(y_values, -1e6, 1e6)
-        y_values[np.isinf(y_values)] = np.nan
+        # Create x array matching chart indices
+        x_array = self.x_values.copy()
 
         if chart_type == 'line':
             plot_item = OptimizedPlotDataItem(
-                x=self.x_values[:len(y_values)],
-                y=y_values,
-                pen=pg.mkPen(color='#4a4', width=2),
+                x=x_array,
+                y=y_aligned,
+                pen=pg.mkPen(color=color, width=2),
                 connect='finite'
             )
             indicator_plot.addItem(plot_item)
 
         elif chart_type == 'bar':
             bargraph = pg.BarGraphItem(
-                x=self.x_values[:len(y_values)],
-                height=y_values,
+                x=x_array,
+                height=y_aligned,
                 width=0.8,
-                brush='#4a4'
+                brush=color
             )
             indicator_plot.addItem(bargraph)
 
+        # Store plot item reference for later updates
+        indicator_plot.plot_item = plot_item if chart_type == 'line' else bargraph
+        indicator_plot.y_data = y_aligned
+        indicator_plot.x_data = x_array
+
+        # Add to container and show the indicator widget
         self.indicator_container.addWidget(indicator_plot)
         self.indicator_panes[indicator_name] = indicator_plot
+        
+        # Show the indicator widget container (it starts hidden)
+        if not self.indicator_widget.isVisible():
+            self.indicator_widget.show()
+
+        # Set up X-link AFTER adding to layout to ensure proper geometry
+        # Disable auto-range first to prevent unwanted resets
+        indicator_plot.getViewBox().disableAutoRange()
+        indicator_plot.setXLink(self.main_plot)
+        
+        # Manually set Y-range based on valid data
+        valid_mask = ~np.isnan(y_aligned)
+        if np.any(valid_mask):
+            y_min = float(np.nanmin(y_aligned))
+            y_max = float(np.nanmax(y_aligned))
+            y_padding = (y_max - y_min) * 0.1 if y_max > y_min else 1.0
+            indicator_plot.setYRange(y_min - y_padding, y_max + y_padding, padding=0)
+        
+        # Sync X-range with main chart's current view
+        main_vb = self.main_plot.getViewBox()
+        x_range = main_vb.viewRange()[0]
+        indicator_plot.setXRange(x_range[0], x_range[1], padding=0)
 
         k2_logger.info(f"Added indicator pane: {indicator_name}", "CHART")
         
     def remove_indicator_pane(self, indicator_name):
-        """Remove indicator pane"""
+        """Remove indicator pane and hide container if no panes remain"""
         if indicator_name in self.indicator_panes:
             widget = self.indicator_panes[indicator_name]
             self.indicator_container.removeWidget(widget)
             widget.deleteLater()
             del self.indicator_panes[indicator_name]
             k2_logger.info(f"Removed indicator pane: {indicator_name}", "CHART")
+            
+            # Hide the indicator widget container if no panes remain
+            if not self.indicator_panes and self.indicator_widget.isVisible():
+                self.indicator_widget.hide()
+                k2_logger.info("Hidden indicator pane container (no panes active)", "CHART")
         
     def cleanup(self):
         """Cleanup resources"""
