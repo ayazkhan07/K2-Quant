@@ -7,11 +7,12 @@ Save as: k2_quant/pages/analysis/components/right_pane.py
 
 from typing import Dict, Any, Optional
 from datetime import datetime
+import html as html_mod
 
 from PyQt6.QtWidgets import (QFrame, QVBoxLayout, QHBoxLayout, QTextEdit,
                              QLineEdit, QPushButton, QLabel, QWidget, QProgressBar)
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer
-from PyQt6.QtGui import QTextCursor
+from PyQt6.QtGui import QTextCursor, QTextBlockFormat, QTextCharFormat, QColor
 
 from k2_quant.utilities.logger import k2_logger
 from k2_quant.utilities.services import table_controller
@@ -50,7 +51,7 @@ class RightPaneWidget(QFrame):
     
     def __init__(self):
         super().__init__()
-        self.setFixedWidth(380)
+        self.setFixedWidth(570)
         self.setObjectName("rightPane")
         
         self.current_context: Optional[Dict[str, Any]] = None
@@ -60,6 +61,10 @@ class RightPaneWidget(QFrame):
         self.streaming_text = ""
         self.streaming_index = 0
         self.math_formatter = MathFormatter(use_block_markers=True)
+
+        # Per-model chat persistence: {table_name: {'html': str, 'history': list}}
+        self._chat_store: Dict[str, Dict[str, Any]] = {}
+        self._active_table: Optional[str] = None
         
         self.init_ui()
         self.setup_styling()
@@ -117,8 +122,25 @@ class RightPaneWidget(QFrame):
         if not message:
             return
         
-        # Add user message to chat
-        self.chat_display.append(f"\nYOU: {message}")
+        # Add user message to chat (right-aligned via block format)
+        cursor = self.chat_display.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+
+        block_fmt = QTextBlockFormat()
+        block_fmt.setAlignment(Qt.AlignmentFlag.AlignRight)
+        block_fmt.setTopMargin(18)
+        block_fmt.setBottomMargin(0)
+        cursor.insertBlock(block_fmt)
+
+        label_fmt = QTextCharFormat()
+        label_fmt.setForeground(QColor("#666666"))
+        cursor.insertText("YOU: ", label_fmt)
+
+        text_fmt = QTextCharFormat()
+        text_fmt.setForeground(QColor("#ffffff"))
+        cursor.insertText(message, text_fmt)
+
+        self.chat_display.setTextCursor(cursor)
         
         # Clear input
         self.ai_input.clear()
@@ -172,16 +194,35 @@ class RightPaneWidget(QFrame):
         # Emit signal for external listeners if needed
         self.message_sent.emit(message)
     
-    def stream_response(self, text: str, prefix: str = "\nAI: "):
+    def stream_response(self, text: str, prefix: str = "AI: "):
         """Stream text with markdown table support."""
         if '|' in text and '\n|' in text and '---' in text:
-            self._render_formatted_response(prefix, text)
+            self._render_formatted_response(text)
             return
 
         # Apply math formatting only within explicit delimiters; keep others intact
         self.streaming_text = self.math_formatter.format_full(text)
         self.streaming_index = 0
-        self.chat_display.append(prefix)
+
+        # Insert left-aligned AI block via block format; streaming appends into this block
+        cursor = self.chat_display.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+
+        block_fmt = QTextBlockFormat()
+        block_fmt.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        block_fmt.setTopMargin(6)
+        block_fmt.setBottomMargin(18)
+        cursor.insertBlock(block_fmt)
+
+        label_fmt = QTextCharFormat()
+        label_fmt.setForeground(QColor("#666666"))
+        cursor.insertText(prefix, label_fmt)
+
+        # Set char format to white for the streamed content
+        text_fmt = QTextCharFormat()
+        text_fmt.setForeground(QColor("#ffffff"))
+        cursor.setCharFormat(text_fmt)
+        self.chat_display.setTextCursor(cursor)
         
         if self.streaming_timer:
             self.streaming_timer.stop()
@@ -190,11 +231,25 @@ class RightPaneWidget(QFrame):
         self.streaming_timer.timeout.connect(self._stream_next_chunk)
         self.streaming_timer.start(20)
 
-    def _render_formatted_response(self, prefix: str, text: str):
+    def _render_formatted_response(self, text: str):
         """Render response with markdown table formatting."""
         cursor = self.chat_display.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
-        cursor.insertText(prefix)
+
+        # Insert left-aligned AI block via block format
+        block_fmt = QTextBlockFormat()
+        block_fmt.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        block_fmt.setTopMargin(6)
+        block_fmt.setBottomMargin(18)
+        cursor.insertBlock(block_fmt)
+
+        label_fmt = QTextCharFormat()
+        label_fmt.setForeground(QColor("#666666"))
+        cursor.insertText("AI: ", label_fmt)
+
+        text_fmt = QTextCharFormat()
+        text_fmt.setForeground(QColor("#ffffff"))
+        cursor.setCharFormat(text_fmt)
         
         parts = text.split('\n')
         in_table = False
@@ -255,10 +310,12 @@ class RightPaneWidget(QFrame):
             chunk_size = min(2, len(self.streaming_text) - self.streaming_index)
             chunk = self.streaming_text[self.streaming_index:self.streaming_index + chunk_size]
             
-            # Move cursor to end and insert text
+            # Move cursor to end and insert text with white color
             cursor = self.chat_display.textCursor()
             cursor.movePosition(QTextCursor.MoveOperation.End)
-            cursor.insertText(chunk)
+            fmt = QTextCharFormat()
+            fmt.setForeground(QColor("#ffffff"))
+            cursor.insertText(chunk, fmt)
             self.chat_display.setTextCursor(cursor)
             
             # Ensure visible
@@ -330,13 +387,34 @@ class RightPaneWidget(QFrame):
         self.worker = None
     
     def set_data_context(self, context: Dict[str, Any]):
-        """Set the data context for AI - no announcement"""
+        """Set the data context for AI, saving and restoring chat per model."""
+        new_table = context.get('table_name') if context else None
+
+        # Save current model's chat before switching
+        if self._active_table:
+            self._chat_store[self._active_table] = {
+                'html': self.chat_display.toHtml(),
+                'history': list(self.conversation_history),
+            }
+
+        # Restore or start fresh for the new model
+        if new_table and new_table in self._chat_store:
+            saved = self._chat_store[new_table]
+            self.chat_display.setHtml(saved['html'])
+            self.conversation_history = list(saved['history'])
+        else:
+            self.chat_display.clear()
+            self.conversation_history.clear()
+
+        self._active_table = new_table
         self.current_context = context
     
     def clear_chat(self):
-        """Clear chat history"""
+        """Clear chat history for the active model"""
         self.chat_display.clear()
         self.conversation_history.clear()
+        if self._active_table and self._active_table in self._chat_store:
+            del self._chat_store[self._active_table]
         k2_logger.info("Chat cleared", "AI_CHAT")
     
     def setup_styling(self):
@@ -406,5 +484,8 @@ class RightPaneWidget(QFrame):
         """Cleanup resources"""
         if self.streaming_timer:
             self.streaming_timer.stop()
-        self.clear_chat()
+        self.chat_display.clear()
+        self.conversation_history.clear()
+        self._chat_store.clear()
+        self._active_table = None
         self.current_context = None

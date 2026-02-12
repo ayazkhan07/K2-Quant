@@ -440,7 +440,8 @@ Examples of good result_interpretation:
 Write a COMPLETE natural-language answer.
 - NEVER use placeholders like {0} or {values}
 - If data is tabular and user wants details, format as markdown table
-- For tables >10 rows, show first 5-10 rows and note "Showing X of Y rows"
+- If all data rows are provided in the summary, show ALL of them in the table
+- Only truncate if the summary explicitly says it was truncated; in that case note "Showing X of Y rows"
 - Keep tables to essential columns only
 
 For tables, use this format:
@@ -483,7 +484,7 @@ Recent context: {json.dumps(recent_ctx, separators=(',', ':'))}"""
             if isinstance(query_result, list) and len(query_result) > 0:
                 # Multi-column table data
                 if isinstance(query_result[0], tuple) and len(query_result[0]) > 1:
-                    sample_size = min(10, len(query_result))
+                    sample_size = min(200, len(query_result))
                     return {
                         'type': 'table',
                         'columns': columns or [],
@@ -496,7 +497,7 @@ Recent context: {json.dumps(recent_ctx, separators=(',', ':'))}"""
                     }
                 
                 # Single column list
-                if len(query_result) <= 10:
+                if len(query_result) <= 200:
                     return {
                         'type': 'list',
                         'count': len(query_result),
@@ -508,10 +509,10 @@ Recent context: {json.dumps(recent_ctx, separators=(',', ':'))}"""
                 return {
                     'type': 'large_list',
                     'count': len(query_result),
-                    'first_5': [self._format_value(row[0] if isinstance(row, tuple) else row) 
-                               for row in query_result[:5]],
-                    'last_2': [self._format_value(row[0] if isinstance(row, tuple) else row) 
-                              for row in query_result[-2:]] if len(query_result) > 7 else []
+                    'first_10': [self._format_value(row[0] if isinstance(row, tuple) else row) 
+                               for row in query_result[:10]],
+                    'last_5': [self._format_value(row[0] if isinstance(row, tuple) else row) 
+                              for row in query_result[-5:]] if len(query_result) > 15 else []
                 }
             
             return {'type': 'unknown', 'preview': str(query_result)[:200]}

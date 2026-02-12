@@ -103,53 +103,53 @@ VIEW_RANGE_CONFIG = {
     ViewRange.ALL: {"kind": "all"}
 }
 
-# Fixed Time format configurations - using MM-DD-YYYY
+# Fixed Time format configurations - compact date labels (D-MMM-YY)
 TIME_FORMATS = {
     TimeSpan.INTRADAY_MINUTES: {
-        'major': '%m-%d-%Y %H:%M',
+        'major': '%d-%b-%y\n%H:%M',
         'minor': '%H:%M',
         'context': None,
         'interval_func': lambda span: timedelta(minutes=5 if span < 1800 else 15 if span < 3600 else 30)
     },
     TimeSpan.INTRADAY_HOURS: {
-        'major': '%m-%d-%Y %H:00',
+        'major': '%d-%b-%y\n%H:00',
         'minor': '%H:%M',
         'context': None,
         'interval_func': lambda span: timedelta(hours=1 if span < 21600 else 2 if span < 43200 else 4)
     },
     TimeSpan.DAILY: {
-        'major': '%m-%d-%Y',
-        'minor': '%m-%d',
+        'major': '%d-%b-%y',
+        'minor': '%d-%b',
         'context': None,
         'interval_func': lambda span: timedelta(days=1)
     },
     TimeSpan.WEEKLY: {
-        'major': '%m-%d-%Y',
-        'minor': '%m-%d',
+        'major': '%d-%b-%y',
+        'minor': '%d-%b',
         'context': None,
         'interval_func': lambda span: timedelta(days=1 if span < 604800 else 7)
     },
     TimeSpan.MONTHLY: {
-        'major': '%m-%d-%Y',
-        'minor': '%m-%d',
+        'major': '%d-%b-%y',
+        'minor': '%d-%b',
         'context': None,
         'interval_func': lambda span: timedelta(days=7 if span < 2592000 else 14)
     },
     TimeSpan.QUARTERLY: {
-        'major': '%m-%d-%Y',
-        'minor': '%m-%Y',
+        'major': '%d-%b-%y',
+        'minor': '%b-%y',
         'context': None,
         'interval_func': lambda span: timedelta(days=30)
     },
     TimeSpan.YEARLY: {
-        'major': '%m-%d-%Y',
-        'minor': '%m-%Y',
+        'major': '%d-%b-%y',
+        'minor': '%b-%y',
         'context': None,
         'interval_func': lambda span: timedelta(days=90 if span < 31536000 else 180)
     },
     TimeSpan.MULTI_YEAR: {
-        'major': '%m-%d-%Y',
-        'minor': '%Y',
+        'major': '%d-%b-%y',
+        'minor': '%y',
         'context': None,
         'interval_func': lambda span: timedelta(days=365)
     }
@@ -173,7 +173,11 @@ def safe_strftime(date_val, format_string, default=""):
                 return default
         
         if hasattr(date_val, 'strftime'):
-            return date_val.strftime(format_string)
+            formatted = date_val.strftime(format_string)
+            # Compact day formatting: prefer "2-Feb-26" over "02-Feb-26" when day is leading.
+            if isinstance(formatted, str) and formatted.startswith("0"):
+                formatted = formatted[1:]
+            return formatted
         else:
             return str(date_val)[:len(format_string)]
     except (ValueError, AttributeError, TypeError):
@@ -326,6 +330,8 @@ class TimeAxisManager:
         if x_max - x_min < 1:  # Need at least 2 points to show labels
             return []
         
+        visible_points = x_max - x_min + 1
+        
         # Get date range
         try:
             start_date = pd.to_datetime(data.iloc[x_min][date_column])
@@ -339,6 +345,22 @@ class TimeAxisManager:
         # Determine time span and get format config
         time_span, duration_seconds = get_time_span(start_date, end_date)
         format_config = TIME_FORMATS[time_span]
+        
+        # At max zoom (few visible points), label every single data point
+        if visible_points <= 20:
+            labels = []
+            for idx in range(x_min, x_max + 1):
+                try:
+                    dt = pd.to_datetime(data.iloc[idx][date_column])
+                    if pd.isna(dt):
+                        continue
+                    x_pos = axis_width * ((idx - x_range[0]) / (x_range[1] - x_range[0]))
+                    label_text = safe_strftime(dt, format_config['major'], '')
+                    if label_text:
+                        labels.append((label_text, x_pos))
+                except Exception:
+                    continue
+            return labels
         
         # Calculate interval
         interval = format_config['interval_func'](duration_seconds)
@@ -567,7 +589,7 @@ class DiscreteViewBox(pg.ViewBox):
                 # Allow small buffer past last data point
                 buffer = min(50, int((new_x_max - new_x_min) * 0.1))
                 new_x_max = min(self.data_x_max + buffer, new_x_max)
-                new_x_min = min(new_x_min, new_x_max - 10)  # Ensure at least 10 points visible
+                new_x_min = min(new_x_min, new_x_max - 3)  # Ensure at least 3 points visible
             
             self.setXRange(new_x_min, new_x_max, padding=0)
             
@@ -627,7 +649,7 @@ class EmbeddedAxis(pg.GraphicsWidget):
             self._height = 100
         else:
             self._width = 100
-            self._height = 40  # Increased height for multi-level labels
+            self._height = 50  # Height for stacked date/time labels
 
     def boundingRect(self):
         return QRectF(0, 0, self._width, self._height)
@@ -660,23 +682,22 @@ class EmbeddedAxis(pg.GraphicsWidget):
                     text_rect = QRectF(5, pos - 10, self._width - 10, 20)
                     painter.drawText(text_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, label)
             else:
-                # Draw main labels
+                # Draw main labels - stacked: date on top, time on bottom
                 for label, pos in self.labels:
-                    # Check for multi-line labels (with context)
                     if '\n' in label:
                         parts = label.split('\n')
-                        # Main label
-                        text_rect = QRectF(pos - 40, 5, 80, 20)
-                        painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, parts[0])
-                        # Context label (smaller, below)
+                        # Date on top (smaller, subdued)
                         painter.setFont(self.small_font)
                         painter.setPen(self.subtext_pen)
-                        text_rect = QRectF(pos - 40, 20, 80, 15)
-                        painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, parts[1])
+                        text_rect = QRectF(pos - 45, 4, 90, 16)
+                        painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, parts[0])
+                        # Time on bottom (normal, brighter)
                         painter.setFont(self.font)
                         painter.setPen(self.text_pen)
+                        text_rect = QRectF(pos - 45, 22, 90, 20)
+                        painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, parts[1])
                     else:
-                        text_rect = QRectF(pos - 40, 5, 80, self._height - 10)
+                        text_rect = QRectF(pos - 45, 5, 90, self._height - 10)
                         painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, label)
 
     def setLabels(self, labels):
@@ -716,7 +737,7 @@ class ChartWidget(QWidget):
         self.x_values = None
         self.current_timeframe = '1D'
         self.current_view_range = ViewRange.D5
-        self.min_visible_points = 10
+        self.min_visible_points = 3
         self.min_granularity = None
         self.last_5_days_range = None
         
@@ -886,17 +907,30 @@ class ChartWidget(QWidget):
             self._grid_pool['h'].append(line)
             
     def _add_crosshair(self):
-        """Add crosshair with optimized updates"""
+        """Add crosshair: V-line snaps to data; shows Date, Time, OHLC at intersections.
+        H-line is fluid (visual aid only)."""
         self.vLine = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('#666', width=1))
         self.hLine = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen('#666', width=1))
         self.main_plot.addItem(self.vLine, ignoreBounds=True)
         self.main_plot.addItem(self.hLine, ignoreBounds=True)
         
-        self.value_label = pg.TextItem(color='#fff', anchor=(0, 1))
-        self.value_label.setFont(QFont('Arial', 10))
-        self.main_plot.addItem(self.value_label)
+        font = QFont('Arial', 10)
+        self.crosshair_date_label = pg.TextItem(color='#fff', anchor=(0, 0))
+        self.crosshair_date_label.setFont(font)
+        self.main_plot.addItem(self.crosshair_date_label)
         
-        # Rate-limited crosshair updates
+        self.crosshair_time_label = pg.TextItem(color='#fff', anchor=(0, 0))
+        self.crosshair_time_label.setFont(font)
+        self.main_plot.addItem(self.crosshair_time_label)
+        
+        self.crosshair_ohlc_labels = {}
+        for col in ['High', 'Open', 'Close', 'Low']:
+            color = OHLC_COLORS.get(col, '#fff')
+            label = pg.TextItem(color=color, anchor=(0, 0.5))
+            label.setFont(font)
+            self.main_plot.addItem(label)
+            self.crosshair_ohlc_labels[col] = label
+        
         self.proxy = pg.SignalProxy(
             self.main_plot.scene().sigMouseMoved,
             rateLimit=33,
@@ -1204,7 +1238,7 @@ class ChartWidget(QWidget):
         vb_rect = vb.sceneBoundingRect()
 
         y_axis_width = 70
-        x_axis_height = 40  # Increased for multi-level labels
+        x_axis_height = 50  # Height for stacked date/time labels
 
         self.y_axis.setSize(y_axis_width, vb_rect.height())
         self.x_axis.setSize(vb_rect.width(), x_axis_height)
@@ -1435,21 +1469,27 @@ class ChartWidget(QWidget):
             
             # Check if we have valid dates
             if self.data['Date'].notna().any():
-                if 'Time' in self.data.columns and self.current_timeframe in INTRADAY_TIMEFRAMES:
-                    # Only combine with time for intraday timeframes
+                # IMPORTANT (TradingView-style axis behavior):
+                # Always preserve the most granular timestamps available for the X-axis.
+                # If Time exists, we keep Date+Time regardless of the selected timeframe so that
+                # zooming naturally shows minutes/hours/days on the axis (via TimeAxisManager).
+                if 'Time' in self.data.columns:
                     try:
                         self.data['datetime'] = pd.to_datetime(
-                            self.data['Date'].dt.strftime('%Y-%m-%d') + ' ' + 
+                            self.data['Date'].dt.strftime('%Y-%m-%d') + ' ' +
                             self.data['Time'].astype(str),
                             format='%Y-%m-%d %H:%M:%S',
                             errors='coerce'
                         )
-                    except:
-                        self.data['datetime'] = self.data['Date']
+                    except Exception:
+                        self.data['datetime'] = pd.to_datetime(
+                            self.data['Date'].astype(str) + ' ' + self.data['Time'].astype(str),
+                            errors='coerce'
+                        )
                 else:
-                    # For daily+ timeframes, just use date without time
-                    self.data['datetime'] = self.data['Date'].dt.normalize()  # Remove time component
-                
+                    # No time column available; fall back to date-only timestamps
+                    self.data['datetime'] = self.data['Date']
+
                 self.date_column = 'datetime'
             else:
                 k2_logger.error("No valid dates found in Date column", "CHART")
@@ -1612,14 +1652,15 @@ class ChartWidget(QWidget):
             self.main_plot.setYRange(y_min, y_max, padding=0)
             
     def update_crosshair(self, evt):
-        """Optimized crosshair update with correct coordinate mapping and date formatting"""
+        """Crosshair: V-line snaps to data; Date/Time at top; OHLC labels at intersections.
+        H-line stays fluid (visual aid only)."""
         pos = evt[0]
         if not self.main_plot.sceneBoundingRect().contains(pos):
+            self._hide_crosshair_labels()
             return
             
         mousePoint = self.main_plot.getViewBox().mapSceneToView(pos)
         
-        # Snap to discrete X
         x_raw = mousePoint.x()
         x_snapped = int(round(x_raw))
         x_snapped = max(0, min(x_snapped, len(self.data) - 1) if self.data is not None else x_snapped)
@@ -1627,77 +1668,60 @@ class ChartWidget(QWidget):
         self.vLine.setPos(x_snapped)
         self.hLine.setPos(mousePoint.y())
         
-        # Update label with proper date formatting and price from data
-        if self.data is not None and self.date_column and len(self.data) > 0:
-            if 0 <= x_snapped < len(self.data):
-                # Get date value
-                date_val = self.data.iloc[x_snapped][self.date_column]
-                
-                # Format date based on current view range (≤1D shows time)
-                if pd.notna(date_val):
-                    if self._range_is_intraday():
-                        date_str = safe_strftime(date_val, '%m-%d-%Y %H:%M:%S', 'N/A')
-                    else:
-                        date_str = safe_strftime(date_val, '%m-%d-%Y', 'N/A')
-                else:
-                    date_str = "N/A"
-                
-                # Hybrid snap: prefer nearest series (OHLC + indicators) within pixel tolerance,
-                # else snap to nearest grid level, else free-float cursor Y
-                PIX_TOL = 8  # pixels
-
-                def _y_to_pixel(y_val: float) -> float:
-                    vb_local = self.main_plot.getViewBox()
-                    return vb_local.mapViewToScene(QPointF(0, y_val)).y()
-
-                y_cursor = float(mousePoint.y())
-
-                # Collect candidate series values at current x
-                candidates = []
-                # OHLC series
-                for col in ['Open', 'High', 'Low', 'Close']:
-                    if col in self.data.columns and col in self.active_lines:
-                        val_raw = self.data.iloc[x_snapped][col]
-                        val_num = pd.to_numeric(val_raw, errors='coerce')
-                        if pd.notna(val_num) and np.isfinite(val_num):
-                            candidates.append(float(val_num))
-                # Indicator overlays
-                for item in self.indicator_overlays.values():
-                    try:
-                        x_arr, y_arr = item.getData()
-                        if x_arr is None or y_arr is None or len(x_arr) == 0:
-                            continue
-                        ix = int(np.clip(np.searchsorted(x_arr, x_snapped), 0, len(x_arr) - 1))
-                        yv_raw = y_arr[ix]
-                        yv_num = pd.to_numeric(yv_raw, errors='coerce')
-                        if pd.notna(yv_num) and np.isfinite(yv_num):
-                            candidates.append(float(yv_num))
-                    except Exception:
-                        pass
-
-                snap_series = None
-                if candidates:
-                    y_cursor_px = _y_to_pixel(y_cursor)
-                    best = min(candidates, key=lambda v: abs(_y_to_pixel(v) - y_cursor_px))
-                    if abs(_y_to_pixel(best) - y_cursor_px) <= PIX_TOL:
-                        snap_series = best
-
-                if snap_series is not None:
-                    y_display = snap_series
-                else:
-                    # Try grid snap
-                    vb_local = self.main_plot.getViewBox()
-                    _, (y_min, y_max) = vb_local.viewRange()
-                    price_range = max(0.01, y_max - max(0, y_min))
-                    interval = self._get_price_interval(price_range)
-                    grid_snap = round(y_cursor / interval) * interval
-                    y_display = grid_snap if abs(_y_to_pixel(grid_snap) - _y_to_pixel(y_cursor)) <= PIX_TOL else y_cursor
-
-                # Set crosshair and label at snapped value (or free-float fallback)
-                self.hLine.setPos(y_display)
-                price_str = f"${y_display:.3f}" if y_display < 10 else (f"${y_display:.2f}" if y_display < 1000 else f"${y_display:,.2f}")
-                self.value_label.setText(f"{date_str}\n{price_str}")
-                self.value_label.setPos(x_snapped, y_display)
+        if self.data is None or not self.date_column or len(self.data) == 0 or not (0 <= x_snapped < len(self.data)):
+            self._hide_crosshair_labels()
+            return
+            
+        vb = self.main_plot.getViewBox()
+        x_range, (y_min, y_max) = vb.viewRange()
+        
+        date_val = self.data.iloc[x_snapped][self.date_column]
+        if pd.isna(date_val):
+            self._hide_crosshair_labels()
+            return
+            
+        date_str = safe_strftime(date_val, '%d-%b-%y', '')
+        time_str = safe_strftime(date_val, '%H:%M:%S', '') if self._range_is_intraday() else ''
+        
+        x_label = x_snapped + (x_range[1] - x_range[0]) * 0.008 if (x_range[1] - x_range[0]) > 0 else x_snapped + 0.5
+        
+        self.crosshair_date_label.setText(date_str or '—')
+        self.crosshair_date_label.setPos(x_label, y_max)
+        self.crosshair_date_label.setVisible(True)
+        
+        if time_str:
+            self.crosshair_time_label.setText(time_str)
+            self.crosshair_time_label.setPos(x_label, y_max - (y_max - y_min) * 0.03)
+            self.crosshair_time_label.setVisible(True)
+        else:
+            self.crosshair_time_label.setVisible(False)
+        
+        for col in ['High', 'Open', 'Close', 'Low']:
+            lbl = self.crosshair_ohlc_labels[col]
+            if col not in self.data.columns or col not in self.active_lines:
+                lbl.setVisible(False)
+                continue
+            val_raw = self.data.iloc[x_snapped][col]
+            val_num = pd.to_numeric(val_raw, errors='coerce')
+            if pd.isna(val_num) or not np.isfinite(val_num):
+                lbl.setVisible(False)
+                continue
+            price = float(val_num)
+            short = col[0]
+            price_str = f"${price:.3f}" if price < 10 else (f"${price:.2f}" if price < 1000 else f"${price:,.2f}")
+            lbl.setText(f"{short} - {price_str}")
+            lbl.setPos(x_label, price)
+            lbl.setVisible(True)
+    
+    def _hide_crosshair_labels(self):
+        """Hide crosshair labels when mouse outside chart or no data."""
+        for attr in ['crosshair_date_label', 'crosshair_time_label']:
+            item = getattr(self, attr, None)
+            if item is not None:
+                item.setVisible(False)
+        for lbl in getattr(self, 'crosshair_ohlc_labels', {}).values():
+            if lbl is not None:
+                lbl.setVisible(False)
             
     def _emit_viewport_changed(self):
         """Emit viewport changed signal"""
@@ -1998,7 +2022,7 @@ class ChartWidget(QWidget):
         new_x_max = int(round(new_x_min + x_width))
         
         # Ensure we have valid range
-        if new_x_max - new_x_min < 10:  # Minimum 10 points visible
+        if new_x_max - new_x_min < 3:  # Minimum 3 points visible
             return
             
         vb.setXRange(new_x_min, new_x_max, padding=0)
@@ -2090,8 +2114,8 @@ class ChartWidget(QWidget):
         buffer = min(50, int(x_width * 0.1))  # Small buffer
         new_x_max = min(len(self.data) + buffer, new_x_max)
         
-        # Minimum 10 points visible
-        if new_x_max - new_x_min < 10:
+        # Minimum 3 points visible
+        if new_x_max - new_x_min < 3:
             return
         
         # Calculate Y range with boundaries
@@ -2641,12 +2665,18 @@ class ChartWidget(QWidget):
                 setattr(self, attr, None)
         
         # Remove crosshair
-        for attr in ['vLine', 'hLine', 'value_label']:
+        crosshair_attrs = ['vLine', 'hLine', 'crosshair_date_label', 'crosshair_time_label']
+        for attr in crosshair_attrs:
             if hasattr(self, attr):
                 item = getattr(self, attr)
                 if item and item.scene():
                     self.main_plot.removeItem(item)
                 setattr(self, attr, None)
+        for lbl in getattr(self, 'crosshair_ohlc_labels', {}).values():
+            if lbl and lbl.scene():
+                self.main_plot.removeItem(lbl)
+        if hasattr(self, 'crosshair_ohlc_labels'):
+            self.crosshair_ohlc_labels = {}
         
         # Clear proxy
         if hasattr(self, 'proxy'):

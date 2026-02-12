@@ -137,7 +137,10 @@ class SavedModelsManager:
 			result: List[Dict[str, Any]] = []
 			for r in rows:
 				# Build human-readable name: "TICKER-FREQUENCY-RANGE-MM/DD"
-				today = datetime.now().strftime("%m/%d")
+				# IMPORTANT: the MM/DD suffix MUST be stable and reflect the dataset cutoff,
+				# not the current day. Use the stored date_range_end (max date_time_market) when available.
+				cutoff_dt = r.get("date_range_end") or r.get("created_at")
+				cutoff = cutoff_dt.strftime("%m/%d") if isinstance(cutoff_dt, datetime) else ""
 				symbol = str(r.get("symbol", "")).upper()
 				timespan_raw = str(r.get("timespan", ""))
 				range_val = str(r.get("range_val", "")).upper()
@@ -159,7 +162,7 @@ class SavedModelsManager:
 				else:
 					freq_token = timespan_raw.upper() if timespan_raw else ""
 
-				parts = [p for p in [symbol, freq_token, range_val, today] if p]
+				parts = [p for p in [symbol, freq_token, range_val, cutoff] if p]
 				display_name = r.get("custom_name") or "-".join(parts)
 				result.append({
 					"table_name": r["table_name"],

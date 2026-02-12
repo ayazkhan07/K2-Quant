@@ -292,18 +292,72 @@ class DatabaseManager:
                 conn.commit()
                 return affected
 
+    def persist_indicator_columns(
+        self,
+        table_name: str,
+        indicators: 'Dict[str, Any]',
+        timestamps: 'pd.Series',
+    ) -> int:
+        """
+        Create indicator columns (if missing) and batch-update their values.
+
+        Parameters
+        ----------
+        table_name : str
+            Target PostgreSQL table.
+        indicators : dict
+            Mapping of column_name -> numpy array of values (aligned to *timestamps*).
+        timestamps : pd.Series
+            Timestamp series (integer epoch ms) aligned to the value arrays.
+
+        Returns
+        -------
+        int
+            Total number of column-row updates performed.
+        """
+        import numpy as np
+
+        total_affected = 0
+        for col_name, values in indicators.items():
+            try:
+                # Ensure column exists
+                self.ensure_indicator_column(table_name, col_name, "DOUBLE PRECISION")
+
+                # Build (timestamp, value) pairs, converting NaN to NULL
+                pairs = [
+                    (int(ts), None if (val is None or np.isnan(val)) else float(val))
+                    for ts, val in zip(timestamps.values, values)
+                ]
+
+                with self.get_connection() as conn:
+                    with self.get_cursor(conn) as cur:
+                        execute_values(
+                            cur,
+                            f"UPDATE {table_name} AS t "
+                            f"SET {col_name} = v.val "
+                            f"FROM (VALUES %s) AS v(ts, val) "
+                            f"WHERE t.timestamp = v.ts",
+                            pairs,
+                        )
+                        total_affected += cur.rowcount or 0
+                        conn.commit()
+            except Exception as e:
+                k2_logger.error(
+                    f"persist_indicator_columns failed for '{col_name}': {e}", "DB"
+                )
+
+        k2_logger.info(
+            f"Persisted {len(indicators)} indicator columns on {table_name} "
+            f"({total_affected} cell updates)",
+            "DB",
+        )
+        return total_affected
+
     def fetch_dataframe(self, table_name: str) -> pd.DataFrame:
-        """Fetch dataframe with lowercase columns for TA service compatibility"""
+        """Fetch dataframe including any persisted indicator columns."""
         with self.get_connection() as conn:
             return pd.read_sql_query(
-                f"""
-                SELECT
-                  timestamp,
-                  date_time_market,
-                  open, high, low, close, volume, vwap
-                FROM {table_name}
-                ORDER BY timestamp
-                """,
+                f"SELECT * FROM {table_name} ORDER BY timestamp",
                 conn,
             )
 

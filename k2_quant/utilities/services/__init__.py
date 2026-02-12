@@ -18,13 +18,6 @@ except ImportError as e:
     ta_service = None
 
 try:
-    from .ai_chat_service import ai_chat_service
-except ImportError as e:
-    print(f"Warning: Could not import ai_chat_service: {e}")
-    print("Install AI dependencies: pip install openai anthropic")
-    ai_chat_service = None
-
-try:
     from .dynamic_python_engine import dpe_service
 except ImportError as e:
     print(f"Warning: Could not import dpe_service: {e}")
@@ -49,7 +42,6 @@ __all__ = [
     'stock_service',
     'model_loader_service',
     'ta_service',
-    'ai_chat_service',
     'dpe_service',
     'strategy_service',
     'table_controller'

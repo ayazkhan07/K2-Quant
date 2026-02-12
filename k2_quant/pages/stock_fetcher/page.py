@@ -449,6 +449,9 @@ class StockFetcherWidget(QMainWindow):
             success = saved_models_manager.save_model(model_data)
             
             if success:
+                # Pre-compute and persist standard technical indicators
+                self._persist_standard_indicators(self.current_table)
+
                 # Show success message
                 show_info(
                     self, 
@@ -471,6 +474,41 @@ class StockFetcherWidget(QMainWindow):
         except Exception as e:
             k2_logger.error(f"Error saving model: {str(e)}", "STOCK_FETCHER")
             show_error(self, "Save Error", f"Failed to save model: {str(e)}")
+
+    def _persist_standard_indicators(self, table_name: str) -> None:
+        """Compute and persist all pre-configured technical indicators for *table_name*."""
+        try:
+            from k2_quant.utilities.services.technical_analysis_service import ta_service
+            from k2_quant.utilities.data.db_manager import db_manager
+
+            # Load the full OHLCV dataframe
+            df = db_manager.fetch_dataframe(table_name)
+            if df is None or df.empty:
+                k2_logger.warning(
+                    f"No data in {table_name} -- skipping indicator persistence",
+                    "STOCK_FETCHER",
+                )
+                return
+
+            indicators = ta_service.compute_standard_indicators(df)
+            if not indicators:
+                k2_logger.warning(
+                    "No indicators computed -- TA-Lib may be unavailable",
+                    "STOCK_FETCHER",
+                )
+                return
+
+            db_manager.persist_indicator_columns(
+                table_name, indicators, df['timestamp']
+            )
+            k2_logger.info(
+                f"Standard indicators persisted for {table_name}", "STOCK_FETCHER"
+            )
+        except Exception as e:
+            # Non-fatal: model is already saved; indicators are a bonus
+            k2_logger.error(
+                f"Failed to persist standard indicators: {e}", "STOCK_FETCHER"
+            )
 
     def clear_data(self):
         """Handle clear data with saved model check"""

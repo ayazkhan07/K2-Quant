@@ -321,12 +321,15 @@ class TechnicalAnalysisService:
             params.update(custom_params)
         
         try:
-            # Prepare data
-            high = data['high'].values if 'high' in data.columns else None
-            low = data['low'].values if 'low' in data.columns else None
-            close = data['close'].values if 'close' in data.columns else None
-            volume = data['volume'].values if 'volume' in data.columns else None
-            open_price = data['open'].values if 'open' in data.columns else None
+            # Prepare data - TA-Lib requires float64 (C double)
+            def _f64(arr):
+                return np.asarray(arr, dtype=np.float64) if arr is not None else None
+            
+            high = _f64(data['high'].values) if 'high' in data.columns else None
+            low = _f64(data['low'].values) if 'low' in data.columns else None
+            close = _f64(data['close'].values) if 'close' in data.columns else None
+            volume = _f64(data['volume'].values) if 'volume' in data.columns else None
+            open_price = _f64(data['open'].values) if 'open' in data.columns else None
             
             # Special handling for VWAP - needs date grouping for daily reset
             if indicator_name == 'VWAP':
