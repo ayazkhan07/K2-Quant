@@ -259,12 +259,8 @@ class AnalysisPageWidget(QWidget):
                     state = saved_models_manager.get_model_state(table_name)
                     if state and self.middle_pane.chart_widget:
                         k2_logger.info(f"Model state available for {table_name}", "ANALYSIS")
-                        # Restore aggregation and view range if present
                         cw = self.middle_pane.chart_widget
                         agg = state.get('aggregation') if isinstance(state, dict) else None
-                        vr  = state.get('view_range') if isinstance(state, dict) else None
-                        if vr:
-                            cw.set_view_range(vr)
                         if agg:
                             cw.change_timeframe(agg)
                 except Exception as e:
@@ -276,11 +272,6 @@ class AnalysisPageWidget(QWidget):
                         cw = self.middle_pane.chart_widget
                         cw.timeframe_changed.connect(
                             lambda tf, tn=table_name: saved_models_manager.set_model_state(
-                                tn, indicators=None, active_strategy=None, chart_range=None
-                            )
-                        )
-                        cw.view_range_changed.connect(
-                            lambda vr, tn=table_name: saved_models_manager.set_model_state(
                                 tn, indicators=None, active_strategy=None, chart_range=None
                             )
                         )

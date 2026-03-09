@@ -115,16 +115,6 @@ class MiddlePaneWidget(QFrame):
         self.view_selector.currentTextChanged.connect(self.change_view)
         layout.addWidget(self.view_selector)
 
-        # View Range control
-        layout.addWidget(QLabel("RANGE:"))
-        self.view_range_combo = QComboBox()
-        self.view_range_combo.addItems(["15m", "30m", "1h", "4h", "1D", "5D", "1M", "3M", "YTD", "1Y", "All"])
-        self.view_range_combo.setCurrentText("5D")
-        self.view_range_combo.currentTextChanged.connect(
-            lambda key: (self.chart_widget.set_view_range(key) if self.chart_widget else None)
-        )
-        layout.addWidget(self.view_range_combo)
-        
         # Viewport/status label
         self.status_label = QLabel("")
         self.status_label.setStyleSheet("color: #666; font-size: 11px;")
@@ -180,8 +170,7 @@ class MiddlePaneWidget(QFrame):
             self.chart_widget.data_loading.connect(self.on_data_loading)
             self.chart_widget.data_loaded.connect(self.on_data_loaded)
             self.chart_widget.viewport_changed.connect(self.on_viewport_changed)
-            self.chart_widget.timeframe_changed.connect(lambda tf: self.update_view_range_combo())
-            self.chart_widget.allowed_view_ranges_changed.connect(self._apply_allowed_view_ranges)
+            
             
             self.splitter.addWidget(self.chart_widget)
             
@@ -200,7 +189,6 @@ class MiddlePaneWidget(QFrame):
             self.splitter.setSizes([360, 240])
             
             layout.addWidget(self.splitter)
-            self.update_view_range_combo()
     
     def change_view(self, view_type: str):
         """Change the middle pane view"""
@@ -482,34 +470,8 @@ class MiddlePaneWidget(QFrame):
         """Hide loading bar when data is loaded"""
         if self.loading_bar:
             self.loading_bar.hide()
-        # Re-apply allowed ranges after (re)load
-        self.update_view_range_combo()
 
-    def update_view_range_combo(self):
-        """Refresh enabled/disabled state of View Range options based on current aggregation."""
-        if not self.chart_widget or not hasattr(self, 'view_range_combo') or not self.view_range_combo:
-            return
-        try:
-            allowed = [vr.value for vr in self.chart_widget._compute_allowed_view_ranges()]
-            self._apply_allowed_view_ranges(allowed)
-        except Exception:
-            pass
-
-    def _apply_allowed_view_ranges(self, allowed_keys: list):
-        if not hasattr(self, 'view_range_combo') or not self.view_range_combo:
-            return
-        current = self.view_range_combo.currentText()
-        first_allowed = None
-        for i in range(self.view_range_combo.count()):
-            key = self.view_range_combo.itemText(i)
-            is_allowed = key in allowed_keys
-            item = self.view_range_combo.model().item(i)
-            if item is not None:
-                item.setEnabled(is_allowed)
-            if is_allowed and first_allowed is None:
-                first_allowed = key
-        if current not in allowed_keys and first_allowed:
-            self.view_range_combo.setCurrentText(first_allowed)
+    
     
     def apply_quick_indicator(self, indicator_type: str):
         """Apply a quick indicator with default parameters"""
