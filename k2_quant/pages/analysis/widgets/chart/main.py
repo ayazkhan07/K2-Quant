@@ -24,7 +24,7 @@ import math
 
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QFrame, QButtonGroup)
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QPointF, QRectF, QEvent
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QPointF, QRectF, QEvent, QThread
 from PyQt6.QtGui import QColor, QPen, QBrush, QFont, QCursor
 
 # Logger setup
@@ -385,6 +385,29 @@ class TimeAxisManager:
         return positions
 
 
+class _RawDataWorker(QThread):
+    """Background worker that fetches all raw rows from Postgres."""
+    finished = pyqtSignal(str, object)  # (table_name, DataFrame or None)
+
+    def __init__(self, table_name: str, total_records: int, parent=None):
+        super().__init__(parent)
+        self._table_name = table_name
+        self._total = total_records
+
+    def run(self):
+        try:
+            df = stock_service.get_chart_data_chunk(
+                self._table_name, 0, self._total)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                for col in list(NUMERIC_COLUMNS & set(df.columns)):
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                self.finished.emit(self._table_name, df)
+                return
+        except Exception as e:
+            k2_logger.error(f"Background fetch failed: {e}", "CHART")
+        self.finished.emit(self._table_name, None)
+
+
 class OptimizedPlotDataItem(pg.PlotDataItem):
     """Optimized PlotDataItem with better memory management"""
     def __init__(self, *args, **kwargs):
@@ -404,10 +427,11 @@ class OptimizedPlotDataItem(pg.PlotDataItem):
 
 class DiscreteViewBox(pg.ViewBox):
     """TradingView-style ViewBox:
-    - Left-drag pans X only (Y auto-fits to visible prices)
+    - Left-drag pans freely in X and Y (2D pan)
     - Mouse wheel scrolls horizontally through time
     - Ctrl+wheel zooms at cursor position
     - Drag release triggers momentum / inertia
+    - Manual Y mode disables auto-fit until double-click on Y axis
     """
 
     _MOMENTUM_INTERVAL_MS = 16
@@ -421,14 +445,20 @@ class DiscreteViewBox(pg.ViewBox):
         super().__init__(*args, **kwargs)
         self.setLimits(xMin=0, xMax=1e6, yMin=0, yMax=1e6)
         self.data_x_max = 0
+        self.data_y_min = 0.0
+        self.data_y_max = 1e6
 
         self._chart_widget = None
+        self._manual_y_mode = False
 
         self._pan_origin_x = None
+        self._pan_origin_y = None
         self._pan_origin_range = None
+        self._pan_origin_y_range = None
         self._velocity_samples: deque = deque(maxlen=self._VELOCITY_WINDOW)
 
         self._momentum_vx = 0.0
+        self._momentum_vy = 0.0
         self._momentum_timer = QTimer()
         self._momentum_timer.setInterval(self._MOMENTUM_INTERVAL_MS)
         self._momentum_timer.timeout.connect(self._tick_momentum)
@@ -438,23 +468,43 @@ class DiscreteViewBox(pg.ViewBox):
 
     # -- helpers --------------------------------------------------------
 
+    _OVERSCROLL = 0.25  # allow 25% of viewport beyond data edges
+
     def _clamp_x(self, x_min, x_max):
-        """Clamp viewport to data boundaries. Span is NEVER changed --
-        if an edge hits a boundary the whole viewport stops."""
+        """Clamp X viewport allowing 1/4 viewport of overscroll past data edges."""
         span = x_max - x_min
-        if x_min < 0:
-            x_min = 0.0
-            x_max = span
-        if self.data_x_max > 0 and x_max > self.data_x_max:
-            x_max = float(self.data_x_max)
-            x_min = max(0.0, x_max - span)
+        overshoot = span * self._OVERSCROLL
+        left_wall = 0.0 - overshoot
+        right_wall = (float(self.data_x_max) if self.data_x_max > 0 else span) + overshoot
+        if x_min < left_wall:
+            x_min = left_wall
+            x_max = x_min + span
+        if x_max > right_wall:
+            x_max = right_wall
+            x_min = x_max - span
         return x_min, x_max
 
+    def _clamp_y(self, y_min, y_max):
+        """Clamp Y viewport allowing 1/4 viewport of overscroll past data edges."""
+        span = y_max - y_min
+        overshoot = span * self._OVERSCROLL
+        floor = max(0.0, self.data_y_min - overshoot)
+        ceiling = self.data_y_max + overshoot
+        if y_min < floor:
+            y_min = floor
+            y_max = y_min + span
+        if y_max > ceiling:
+            y_max = ceiling
+            y_min = max(floor, y_max - span)
+        return y_min, y_max
+
     def _auto_fit_y(self):
+        if self._manual_y_mode:
+            return
         if self._chart_widget is not None:
             self._chart_widget.auto_scale_y_for_visible_data()
 
-    # -- drag (X-only pan + momentum) -----------------------------------
+    # -- drag (2D pan + momentum) ---------------------------------------
 
     def mouseDragEvent(self, ev, axis=None):
         if axis == 1:
@@ -469,16 +519,22 @@ class DiscreteViewBox(pg.ViewBox):
         if ev.isStart():
             self._momentum_timer.stop()
             self._momentum_vx = 0.0
+            self._momentum_vy = 0.0
             self._pan_origin_x = ev.pos().x()
+            self._pan_origin_y = ev.pos().y()
             self._pan_origin_range = self.viewRange()[0]
+            self._pan_origin_y_range = self.viewRange()[1]
             self._velocity_samples.clear()
+            self._manual_y_mode = True
             if self._chart_widget is not None:
                 self._chart_widget._is_panning = True
                 self._chart_widget.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
 
         elif ev.isFinish():
             self._pan_origin_x = None
+            self._pan_origin_y = None
             self._pan_origin_range = None
+            self._pan_origin_y_range = None
             if self._chart_widget is not None:
                 self._chart_widget._is_panning = False
                 self._chart_widget.setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
@@ -486,16 +542,25 @@ class DiscreteViewBox(pg.ViewBox):
 
         elif self._pan_origin_x is not None:
             width = self.width()
-            if width == 0:
+            height = self.height()
+            if width == 0 or height == 0:
                 return
-            r = self._pan_origin_range
-            x_scale = (r[1] - r[0]) / width
+
+            rx = self._pan_origin_range
+            x_scale = (rx[1] - rx[0]) / width
             dx = (ev.pos().x() - self._pan_origin_x) * x_scale
+            new_x_min, new_x_max = self._clamp_x(rx[0] - dx, rx[1] - dx)
+            self.setXRange(new_x_min, new_x_max, padding=0)
 
-            new_min, new_max = self._clamp_x(r[0] - dx, r[1] - dx)
-            self.setXRange(new_min, new_max, padding=0)
+            ry = self._pan_origin_y_range
+            y_scale = (ry[1] - ry[0]) / height
+            dy = (ev.pos().y() - self._pan_origin_y) * y_scale
+            new_y_min, new_y_max = self._clamp_y(ry[0] + dy, ry[1] + dy)
+            self.setYRange(new_y_min, new_y_max, padding=0)
 
-            self._velocity_samples.append((_time.perf_counter(), ev.pos().x()))
+            self._velocity_samples.append((
+                _time.perf_counter(), ev.pos().x(), ev.pos().y()
+            ))
 
     # -- momentum -------------------------------------------------------
 
@@ -503,39 +568,66 @@ class DiscreteViewBox(pg.ViewBox):
         samples = self._velocity_samples
         if len(samples) < 2:
             return
-        t0, x0 = samples[0]
-        t1, x1 = samples[-1]
+        t0, x0, y0 = samples[0]
+        t1, x1, y1 = samples[-1]
         dt = t1 - t0
         if dt <= 0 or dt > 0.25:
             return
 
         width = self.width()
-        if width == 0:
+        height = self.height()
+        if width == 0 or height == 0:
             return
-        x_range = self.viewRange()[0]
-        x_scale = (x_range[1] - x_range[0]) / width
-        px_per_sec = (x0 - x1) / dt
-        self._momentum_vx = px_per_sec * x_scale * (self._MOMENTUM_INTERVAL_MS / 1000.0)
 
-        if abs(self._momentum_vx) > self._MOMENTUM_MIN_VELOCITY:
+        tick = self._MOMENTUM_INTERVAL_MS / 1000.0
+        x_range = self.viewRange()[0]
+        y_range = self.viewRange()[1]
+        x_scale = (x_range[1] - x_range[0]) / width
+        y_scale = (y_range[1] - y_range[0]) / height
+
+        self._momentum_vx = ((x0 - x1) / dt) * x_scale * tick
+        self._momentum_vy = ((y0 - y1) / dt) * y_scale * tick
+
+        has_vx = abs(self._momentum_vx) > self._MOMENTUM_MIN_VELOCITY
+        has_vy = abs(self._momentum_vy) > self._MOMENTUM_MIN_VELOCITY * (y_scale / x_scale if x_scale > 0 else 1.0)
+        if has_vx or has_vy:
             self._momentum_timer.start()
 
     def _tick_momentum(self):
-        if abs(self._momentum_vx) < self._MOMENTUM_MIN_VELOCITY:
+        vx_alive = abs(self._momentum_vx) >= self._MOMENTUM_MIN_VELOCITY
+        vy_alive = abs(self._momentum_vy) >= 0.001
+
+        if not vx_alive and not vy_alive:
             self._momentum_timer.stop()
             self._momentum_vx = 0.0
+            self._momentum_vy = 0.0
             return
 
-        cur = self.viewRange()[0]
-        new_min, new_max = self._clamp_x(cur[0] + self._momentum_vx,
-                                          cur[1] + self._momentum_vx)
-        if new_min == cur[0] and new_max == cur[1]:
+        x_changed = False
+        y_changed = False
+
+        if vx_alive:
+            cur_x = self.viewRange()[0]
+            new_x_min, new_x_max = self._clamp_x(cur_x[0] + self._momentum_vx,
+                                                   cur_x[1] + self._momentum_vx)
+            if new_x_min != cur_x[0] or new_x_max != cur_x[1]:
+                self.setXRange(new_x_min, new_x_max, padding=0)
+                x_changed = True
+            self._momentum_vx *= self._MOMENTUM_FRICTION
+
+        if vy_alive:
+            cur_y = self.viewRange()[1]
+            new_y_min, new_y_max = self._clamp_y(cur_y[0] - self._momentum_vy,
+                                                   cur_y[1] - self._momentum_vy)
+            if new_y_min != cur_y[0] or new_y_max != cur_y[1]:
+                self.setYRange(new_y_min, new_y_max, padding=0)
+                y_changed = True
+            self._momentum_vy *= self._MOMENTUM_FRICTION
+
+        if not x_changed and not y_changed:
             self._momentum_timer.stop()
             self._momentum_vx = 0.0
-            return
-
-        self.setXRange(new_min, new_max, padding=0)
-        self._momentum_vx *= self._MOMENTUM_FRICTION
+            self._momentum_vy = 0.0
 
     # -- wheel (scroll / zoom) ------------------------------------------
 
@@ -569,7 +661,9 @@ class DiscreteViewBox(pg.ViewBox):
             new_min, new_max = self._clamp_x(x_lo + offset, x_hi + offset)
             self.setXRange(new_min, new_max, padding=0)
 
-        self._auto_fit_y()
+        if not self._manual_y_mode:
+            if self._chart_widget is not None and hasattr(self._chart_widget, '_y_fit_timer'):
+                self._chart_widget._y_fit_timer.start()
         ev.accept()
 
 
@@ -731,12 +825,14 @@ class ChartWidget(QWidget):
         self._label_cache = {}
         self._format_cache = {}
         self._method_cache = {}
+        self._model_cache: dict = {}
+        self._raw_ready: set = set()
+        self._bg_worker: Optional[_RawDataWorker] = None
         
         # DB context
         self.current_table_name = None
         self.total_records = 0
         self._global_start_index = 0
-        self._initial_chunk_size = 1000
         self.is_fetching = False
         
         # Debounce timers dict
@@ -762,11 +858,11 @@ class ChartWidget(QWidget):
         self._viewport_signal_timer.setInterval(60)
         self._viewport_signal_timer.timeout.connect(self._emit_viewport_changed)
 
-        # Viewport update timer for auto-loading
-        self.viewport_update_timer = QTimer()
-        self.viewport_update_timer.setSingleShot(True)
-        self.viewport_update_timer.setInterval(300)
-        self.viewport_update_timer.timeout.connect(self._check_and_fetch_if_needed)
+        # Y auto-fit debounce timer (used by wheel events)
+        self._y_fit_timer = QTimer()
+        self._y_fit_timer.setSingleShot(True)
+        self._y_fit_timer.setInterval(50)
+        self._y_fit_timer.timeout.connect(self.auto_scale_y_for_visible_data)
         
     def init_ui(self):
         """Initialize UI with optimized layout"""
@@ -909,9 +1005,6 @@ class ChartWidget(QWidget):
         vb = self.main_plot.getViewBox()
         vb.sigRangeChanged.connect(lambda: self.axis_update_timer.start())
         vb.sigRangeChanged.connect(lambda: self._viewport_signal_timer.start())
-        vb.sigRangeChanged.connect(
-            lambda: self.viewport_update_timer.start() if self.current_table_name else None
-        )
 
         try:
             vb.sigResized.connect(lambda: self.range_update_timer.start())
@@ -1192,51 +1285,85 @@ class ChartWidget(QWidget):
             
     def load_data_from_table(self, table_name: str, total_records: Optional[int] = None,
                             metadata: Optional[Dict] = None):
-        """Entry point: set table context, detect granularity from a small
-        sample, then load + display bars for the default timeframe."""
+        """Two-phase load:
+        Phase 1 — server-side daily bars (fast, ~200ms).  Chart is usable.
+        Phase 2 — background thread fetches all raw rows for intraday."""
         if self.is_fetching:
             return
 
-        # Reset all state for the new model
         self.clear_all()
         self.data = None
         self.original_data = None
         self._dt_cache = None
+        vb = self.main_plot.getViewBox()
+        if isinstance(vb, DiscreteViewBox):
+            vb._manual_y_mode = False
         self.current_table_name = table_name
         self.total_records = total_records or 0
-
-        if not self.total_records and stock_service:
-            info = stock_service.get_table_info(table_name) or {}
-            self.total_records = int(info.get('total_records', 0))
 
         if self.total_records <= 0:
             k2_logger.warning("No records to load for chart", "CHART")
             return
 
-        # Small sample just for granularity detection
-        sample_size = min(self._initial_chunk_size, self.total_records)
-        sample_start = max(0, self.total_records - sample_size)
-        if stock_service:
-            sample = stock_service.get_chart_data_chunk(table_name, sample_start, self.total_records)
-            if isinstance(sample, pd.DataFrame) and not sample.empty:
-                self.original_data = sample.copy()
-                for col in list(NUMERIC_COLUMNS & set(sample.columns)):
-                    self.original_data[col] = pd.to_numeric(self.original_data[col], errors='coerce')
-                self._detect_granularity_optimized()
+        # --- Phase 1: daily bars (instant) ---
+        if table_name in self._raw_ready:
+            self.original_data = self._model_cache.get(table_name)
+        else:
+            daily_df = None
+            if stock_service:
+                daily_df = stock_service.get_daily_bars(table_name)
+            if daily_df is None or daily_df.empty:
+                return
+            for col in list(NUMERIC_COLUMNS & set(daily_df.columns)):
+                daily_df[col] = pd.to_numeric(daily_df[col], errors='coerce')
+            self.original_data = daily_df
+            self._model_cache[table_name] = daily_df
 
-        # Reset timeframe to default so _load_bars always runs fresh
+        self._detect_granularity_optimized()
+
         self.current_timeframe = '1D'
         self._update_timeframe_button_checked('1D')
 
-        self._load_bars(LOADED_BARS, self.current_timeframe)
+        self._process_timeframe_optimized()
+        self._global_start_index = 0
         self._update_viewport_limits()
         self._display_ohlc_optimized()
-        self.set_default_view()
+        self._show_last_n_bars(DEFAULT_VISIBLE_BARS)
         self.update_axis_geometry()
         QTimer.singleShot(0, self.update_axis_labels_and_grid)
         k2_logger.info(
             f"Loaded {len(self.data) if self.data is not None else 0} "
             f"{self.current_timeframe} bars for {table_name}", "CHART")
+
+        # --- Phase 2: background fetch of raw rows for intraday ---
+        if table_name not in self._raw_ready:
+            self._start_background_fetch(table_name)
+
+    def _start_background_fetch(self, table_name: str):
+        """Kick off a background thread to fetch all raw rows."""
+        if self._bg_worker is not None and self._bg_worker.isRunning():
+            self._bg_worker.finished.disconnect()
+            self._bg_worker.quit()
+            self._bg_worker.wait(2000)
+
+        self._bg_worker = _RawDataWorker(table_name, self.total_records, self)
+        self._bg_worker.finished.connect(self._on_raw_data_ready)
+        self._bg_worker.start()
+        k2_logger.info(f"Background fetch started for {table_name}", "CHART")
+
+    def _on_raw_data_ready(self, table_name: str, df):
+        """Called on main thread when background fetch completes."""
+        if df is not None and not df.empty:
+            self._model_cache[table_name] = df
+            self._raw_ready.add(table_name)
+            if self.current_table_name == table_name:
+                self.original_data = df
+            k2_logger.info(
+                f"Background fetch done: {len(df)} raw rows for {table_name}",
+                "CHART")
+        else:
+            k2_logger.warning(
+                f"Background fetch returned empty for {table_name}", "CHART")
         
     def _update_viewport_limits(self):
         """Update ViewBox limits based on actual data - FIXED VERSION"""
@@ -1269,63 +1396,54 @@ class ChartWidget(QWidget):
         y_min = max(0, y_min * 0.9)  # 10% padding below (but never negative)
         y_max = y_max * 1.2  # 20% padding above (not 2x!)
         
-        # Update ViewBox limits
+        # Set pyqtgraph hard limits generously; our _clamp_x/_clamp_y do the real work
+        overscroll_x = x_max * 0.5
+        overscroll_y = (y_max - y_min) * 0.5
         vb.setLimits(
-            xMin=0,
-            xMax=x_max + 50,  # Fixed 50 point buffer instead of percentage
-            yMin=0,  # Prices can't be negative
-            yMax=y_max  # Just 20% above max, not doubled
+            xMin=-overscroll_x,
+            xMax=x_max + overscroll_x,
+            yMin=max(0, y_min - overscroll_y),
+            yMax=y_max + overscroll_y
         )
         
-        # Store max X in ViewBox for reference
+        # Store data boundaries in ViewBox for clamping
         if isinstance(vb, DiscreteViewBox):
             vb.data_x_max = x_max
+            vb.data_y_min = y_min
+            vb.data_y_max = y_max
             
     def _detect_granularity_optimized(self):
-        """Optimized granularity detection"""
-        if self.original_data is None or len(self.original_data) == 0:
-            self.min_granularity = '1D'
-            return
-            
-        # Quick check for time column
-        if 'Time' not in self.original_data.columns:
-            self.min_granularity = '1D'
+        """Detect native data granularity from a tiny DB sample (10 rows)."""
+        self.min_granularity = '1D'
+        if not self.current_table_name or not stock_service:
             self._update_timeframe_buttons('1D')
             return
-            
+
         try:
-            # Create datetime column if needed
-            if 'datetime' not in self.original_data.columns:
-                self.original_data['datetime'] = pd.to_datetime(
-                    self.original_data['Date'].astype(str) + ' ' +
-                    self.original_data['Time'].astype(str),
-                    format='%Y-%m-%d %H:%M:%S',
-                    errors='coerce'
-                )
-                
-            # Sample intervals for speed (use first 100 rows)
-            sample = self.original_data['datetime'].head(100)
-            diffs = sample.diff().dt.total_seconds() / 60
+            sample_df = stock_service.get_chart_data_chunk(
+                self.current_table_name, 0, 100)
+            if sample_df is None or sample_df.empty or 'Time' not in sample_df.columns:
+                self._update_timeframe_buttons('1D')
+                return
+
+            dates = pd.to_datetime(sample_df['Date'], errors='coerce')
+            td = pd.to_timedelta(sample_df['Time'].astype(str), errors='coerce')
+            dt = dates + td.fillna(pd.Timedelta(0))
+
+            diffs = dt.diff().dt.total_seconds() / 60
             diffs = diffs[diffs > 0]
-            
+
             if len(diffs) > 0 and not diffs.isna().all():
                 min_interval = diffs[~diffs.isna()].min()
-                
-                # Determine granularity
                 for tf, config in TIMEFRAME_CONFIG.items():
                     if min_interval <= config['interval_minutes']:
                         self.min_granularity = tf
                         break
-                else:
-                    self.min_granularity = '1D'
-            else:
-                self.min_granularity = '1D'
-                
+
             self._update_timeframe_buttons(self.min_granularity)
-            
+
         except Exception as e:
             k2_logger.error(f"Granularity detection failed: {e}", "CHART")
-            self.min_granularity = '1D'
             self._update_timeframe_buttons('1D')
             
     def _update_timeframe_buttons(self, min_tf):
@@ -1343,27 +1461,25 @@ class ChartWidget(QWidget):
                 
     def _process_timeframe_optimized(self):
         """Build self.data from original_data: create datetime, filter market
-        hours (intraday only), resample if needed, ensure numerics."""
-        df = self.original_data.copy()
+        hours (intraday only), resample if needed.  Numerics are already
+        coerced at ingestion so we skip redundant conversions."""
+        df = self.original_data
 
-        # --- 1. Build a single datetime column ---
-        if 'Date' in df.columns:
-            df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+        # --- 1. Build a single datetime column (fast path) ---
+        if 'datetime' in df.columns:
+            pass
+        elif 'Date' in df.columns:
+            dates = pd.to_datetime(df['Date'], errors='coerce')
             if 'Time' in df.columns:
-                try:
-                    df['datetime'] = pd.to_datetime(
-                        df['Date'].dt.strftime('%Y-%m-%d') + ' ' + df['Time'].astype(str),
-                        format='%Y-%m-%d %H:%M:%S', errors='coerce')
-                except Exception:
-                    df['datetime'] = pd.to_datetime(
-                        df['Date'].astype(str) + ' ' + df['Time'].astype(str),
-                        errors='coerce')
+                td = pd.to_timedelta(df['Time'].astype(str), errors='coerce')
+                df = df.copy()
+                df['datetime'] = dates + td.fillna(pd.Timedelta(0))
             else:
-                df['datetime'] = df['Date']
-        elif 'datetime' not in df.columns:
+                df = df.copy()
+                df['datetime'] = dates
+        else:
             self.data = df
             self.date_column = None
-            self.clear_all()
             self.x_values = np.arange(len(df), dtype=np.float32)
             self._dt_cache = None
             return
@@ -1385,14 +1501,8 @@ class ChartWidget(QWidget):
         if self.min_granularity and self.current_timeframe != self.min_granularity:
             df = self._resample_df(df)
 
-        # --- 4. Ensure OHLC columns are numeric (handles any dtype drift) ---
-        for col in ['Open', 'High', 'Low', 'Close', 'Volume', 'VWAP']:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-
-        # --- 5. Store and build index / cache ---
+        # --- 4. Store and build index / cache ---
         self.data = df.reset_index(drop=True)
-        self.clear_all()
         self.x_values = np.arange(len(self.data), dtype=np.float32)
         if self.date_column in self.data.columns:
             self._dt_cache = self.data[self.date_column].values.astype('datetime64[ns]')
@@ -1451,12 +1561,7 @@ class ChartWidget(QWidget):
         if column_name not in self.data.columns:
             return
             
-        # Get data efficiently
-        y_values = self.data[column_name].values
-        
-        # Ensure numeric type
-        y_values = pd.to_numeric(y_values, errors='coerce')
-        y_values = np.array(y_values, dtype=np.float32)
+        y_values = np.asarray(self.data[column_name].values, dtype=np.float32)
         
         # Clean data - remove inf and clip
         y_values[np.isinf(y_values)] = np.nan
@@ -1482,6 +1587,9 @@ class ChartWidget(QWidget):
         
     def set_default_view(self):
         """Show the last DEFAULT_VISIBLE_BARS bars."""
+        vb = self.main_plot.getViewBox()
+        if isinstance(vb, DiscreteViewBox):
+            vb._manual_y_mode = False
         self._show_last_n_bars(DEFAULT_VISIBLE_BARS)
 
     def _show_last_n_bars(self, n: int):
@@ -1619,116 +1727,16 @@ class ChartWidget(QWidget):
         end = int(min(len(self.data), round(x_max)))
         self.viewport_changed.emit(start, end, len(self.data))
         
-    def _check_and_fetch_if_needed(self):
-        """Check if more data needs to be fetched"""
-        if not self.current_table_name or self.is_fetching or self.data is None:
+    
+    def _reprocess_for_timeframe(self, timeframe: str):
+        """Re-resample already-loaded original_data for a new timeframe.
+        No DB fetch — data is already in memory."""
+        if self.original_data is None or self.original_data.empty:
             return
-            
-        vb = self.main_plot.getViewBox()
-        x_min, _ = vb.viewRange()[0]
-        
-        # Fetch if near edge and more data available
-        NEAR_EDGE_THRESHOLD = 50
-        if int(round(x_min)) <= NEAR_EDGE_THRESHOLD and self._global_start_index > 0:
-            self._fetch_older_data()
-            
-    def _fetch_older_data(self):
-        """Prepend older raw data, reprocess at current timeframe, and restore
-        the viewport position so the user can keep scrolling left."""
-        if self.is_fetching or self._global_start_index <= 0:
-            return
-
-        try:
-            self.is_fetching = True
-            self.data_loading.emit()
-
-            old_bar_count = len(self.data) if self.data is not None else 0
-
-            fetch_end = self._global_start_index
-            fetch_start = max(0, fetch_end - self._initial_chunk_size * 10)
-
-            df = stock_service.get_chart_data_chunk(
-                self.current_table_name, fetch_start, fetch_end)
-
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                self._global_start_index = fetch_start
-                self.original_data = pd.concat([df, self.original_data], ignore_index=True)
-                for col in list(NUMERIC_COLUMNS & set(self.original_data.columns)):
-                    self.original_data[col] = pd.to_numeric(
-                        self.original_data[col], errors='coerce')
-
-                vb = self.main_plot.getViewBox()
-                x_lo, x_hi = vb.viewRange()[0]
-
-                self._process_timeframe_optimized()
-                new_bar_count = len(self.data) if self.data is not None else 0
-                added = new_bar_count - old_bar_count
-
-                self._update_viewport_limits()
-                self._display_ohlc_optimized()
-
-                vb.setXRange(x_lo + added, x_hi + added, padding=0)
-                self.auto_scale_y_for_visible_data()
-                self._emit_viewport_changed()
-
-        except Exception as e:
-            k2_logger.error(f"Failed to fetch older data: {e}", "CHART")
-        finally:
-            self.is_fetching = False
-            self.data_loaded.emit()
-            
-    def _load_bars(self, target_bars: int, timeframe: str):
-        """Single fetch + single resample.  If the first attempt produces too
-        few bars (e.g. 4h grouping discards off-market hours), doubles the
-        fetch window and retries once."""
-        if not self.current_table_name or not stock_service or self.is_fetching:
-            return
-        if self.total_records <= 0:
-            return
-
         self.current_timeframe = timeframe
-        tf_cfg = TIMEFRAME_CONFIG.get(timeframe, {})
-        native_cfg = TIMEFRAME_CONFIG.get(self.min_granularity or '1m', {})
-        native_ppd = native_cfg.get('points_per_day', 390)
-        tf_ppd = tf_cfg.get('points_per_day', 1)
-
-        raw_per_bar = native_ppd / tf_ppd if tf_ppd > 0 else native_ppd
-        raw_needed = int(target_bars * raw_per_bar * 1.1)
-        raw_needed = max(raw_needed, self._initial_chunk_size)
-
-        try:
-            self.is_fetching = True
-            self.data_loading.emit()
-
-            fetch_end = self.total_records
-            for _ in range(2):
-                fetch_start = max(0, fetch_end - raw_needed)
-                df = stock_service.get_chart_data_chunk(
-                    self.current_table_name, fetch_start, fetch_end)
-
-                if not isinstance(df, pd.DataFrame) or df.empty:
-                    break
-
-                self.original_data = df
-                for col in list(NUMERIC_COLUMNS & set(df.columns)):
-                    self.original_data[col] = pd.to_numeric(
-                        self.original_data[col], errors='coerce')
-                self._process_timeframe_optimized()
-
-                if len(self.data) >= target_bars or fetch_start == 0:
-                    break
-                raw_needed = min(raw_needed * 3, self.total_records)
-
-            self._global_start_index = fetch_start
-            k2_logger.info(
-                f"Loaded {len(self.data)} {timeframe} bars "
-                f"(from {len(self.original_data)} raw rows)", "CHART")
-
-        except Exception as e:
-            k2_logger.error(f"_load_bars failed: {e}", "CHART")
-        finally:
-            self.is_fetching = False
-            self.data_loaded.emit()
+        self._process_timeframe_optimized()
+        k2_logger.info(
+            f"Resampled to {len(self.data)} {timeframe} bars", "CHART")
 
     # Drawing methods
     def set_drawing_mode(self, mode):
@@ -1908,11 +1916,24 @@ class ChartWidget(QWidget):
             self.main_plot.removeItem(item)
             
     def change_timeframe(self, timeframe):
-        """Switch timeframe: load data, resample, display, fit viewport."""
+        """Switch timeframe: resample in-memory data, display, fit viewport.
+        If intraday is requested but raw data hasn't arrived yet, block
+        briefly until the background thread finishes."""
         if self.current_timeframe == timeframe:
             return
 
-        self._load_bars(LOADED_BARS, timeframe)
+        needs_raw = timeframe in INTRADAY_TIMEFRAMES
+        table = self.current_table_name
+
+        if needs_raw and table and table not in self._raw_ready:
+            if self._bg_worker is not None and self._bg_worker.isRunning():
+                self.data_loading.emit()
+                self._bg_worker.wait()
+                self.data_loaded.emit()
+            if table in self._raw_ready:
+                self.original_data = self._model_cache.get(table)
+
+        self._reprocess_for_timeframe(timeframe)
         self.timeframe_changed.emit(timeframe)
         self._update_viewport_limits()
         self._display_ohlc_optimized()
@@ -1934,8 +1955,6 @@ class ChartWidget(QWidget):
             new_lo = max(0, new_lo)
         vb.setXRange(new_lo, new_hi, padding=0)
         self.auto_scale_y_for_visible_data()
-        if self.current_table_name:
-            self.viewport_update_timer.start()
         self._emit_viewport_changed()
 
     def pan_right(self, points: int = 200):
@@ -1958,11 +1977,15 @@ class ChartWidget(QWidget):
         self._show_last_n_bars(DEFAULT_VISIBLE_BARS)
         
     def auto_scale_y_for_visible_data(self):
-        """Auto-scale Y for visible data"""
+        """Auto-scale Y for visible data (skipped when user is in manual Y mode)."""
         if self.data is None or len(self.data) == 0:
             return
 
-        x_range = self.main_plot.getViewBox().viewRange()[0]
+        vb = self.main_plot.getViewBox()
+        if isinstance(vb, DiscreteViewBox) and vb._manual_y_mode:
+            return
+
+        x_range = vb.viewRange()[0]
         x_min = int(max(0, round(x_range[0])))
         x_max = int(min(len(self.data) - 1, round(x_range[1])))
 
@@ -1971,6 +1994,9 @@ class ChartWidget(QWidget):
             
     def reset_zoom(self):
         """Reset to default view with Y auto-fit."""
+        vb = self.main_plot.getViewBox()
+        if isinstance(vb, DiscreteViewBox):
+            vb._manual_y_mode = False
         if self.last_default_x_range:
             lo, hi = self.last_default_x_range
             self.main_plot.setXRange(lo, hi, padding=0)
@@ -2097,9 +2123,12 @@ class ChartWidget(QWidget):
                 if y_rect.contains(scene_pos):
                     self.dragging_y_axis = True
                     self.drag_start_pos = scene_pos
-                    self.drag_start_y_range = self.main_plot.getViewBox().viewRange()[1]
-                    view_pt = self.main_plot.getViewBox().mapSceneToView(scene_pos)
+                    vb = self.main_plot.getViewBox()
+                    self.drag_start_y_range = vb.viewRange()[1]
+                    view_pt = vb.mapSceneToView(scene_pos)
                     self.drag_anchor_y = view_pt.y()
+                    if isinstance(vb, DiscreteViewBox):
+                        vb._manual_y_mode = True
                     return True
                 if x_rect.contains(scene_pos):
                     self.dragging_x_axis = True
@@ -2123,9 +2152,15 @@ class ChartWidget(QWidget):
         elif event.type() == QEvent.Type.MouseButtonDblClick and scene_pos is not None:
             if event.button() == Qt.MouseButton.LeftButton:
                 if y_rect.contains(scene_pos):
+                    vb = self.main_plot.getViewBox()
+                    if isinstance(vb, DiscreteViewBox):
+                        vb._manual_y_mode = False
                     self.auto_scale_y_for_visible_data()
                     return True
                 if x_rect.contains(scene_pos):
+                    vb = self.main_plot.getViewBox()
+                    if isinstance(vb, DiscreteViewBox):
+                        vb._manual_y_mode = False
                     self.set_default_view()
                     return True
 
@@ -2356,8 +2391,11 @@ class ChartWidget(QWidget):
         
     def cleanup(self):
         """Cleanup resources"""
-        # Stop timers
-        for timer_name in ['axis_update_timer', 'range_update_timer', 'viewport_update_timer', '_viewport_signal_timer']:
+        if self._bg_worker is not None and self._bg_worker.isRunning():
+            self._bg_worker.quit()
+            self._bg_worker.wait(3000)
+
+        for timer_name in ['axis_update_timer', 'range_update_timer', '_viewport_signal_timer', '_y_fit_timer']:
             if hasattr(self, timer_name):
                 timer = getattr(self, timer_name)
                 timer.stop()

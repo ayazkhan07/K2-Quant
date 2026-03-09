@@ -211,26 +211,22 @@ class AnalysisPageWidget(QWidget):
         k2_logger.info(f"Loading model: {table_name}", "ANALYSIS")
         
         try:
-            # Get data from table (limit to last 500 rows for performance)
             rows, total_count = stock_service.get_display_data(table_name, limit=500)
             
             if rows:
-                # Update current state
                 self.current_model = table_name
                 self.current_data = rows
                 
-                # Gather metadata
                 base_metadata = saved_models_manager.get_model_metadata(table_name) or {'symbol': table_name}
-                table_info = stock_service.get_table_info(table_name) or {}
-                date_range = table_info.get('date_range')
-                
-                # Merge metadata while keeping existing keys stable
+                parts = table_name.split('_')
+                symbol = parts[1].upper() if len(parts) > 1 else 'UNKNOWN'
+
                 self.current_metadata = dict(base_metadata)
                 self.current_metadata.update({
                     'records': total_count,
                     'table_name': table_name,
                     'total_records': total_count,
-                    'date_range': date_range
+                    'symbol': symbol,
                 })
                 
                 # Update status
@@ -240,14 +236,11 @@ class AnalysisPageWidget(QWidget):
                 # Load into middle pane (chart uses limited data; table uses limited data)
                 self.middle_pane.load_data(rows, self.current_metadata)
                 
-                # Update AI context
                 ctx = {
                     'symbol': self.current_metadata.get('symbol', table_name),
                     'records': total_count,
                     'table_name': table_name
                 }
-                if date_range:
-                    ctx['date_range'] = date_range
                 self.right_pane.set_data_context(ctx)
                 
                 # Clear any existing indicators/strategies when loading new model

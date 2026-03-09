@@ -237,7 +237,18 @@ class StockService:
             k2_logger.error(f"Failed to create filtered table: {e}", "STOCK_SERVICE")
             return False
 
-    # Minimal chart helpers (no DB manager changes needed)
+    def get_daily_bars(self, table_name: str) -> pd.DataFrame:
+        """Return all daily OHLCV bars aggregated server-side."""
+        try:
+            rows = self.db.fetch_daily_bars(table_name)
+            if not rows:
+                return pd.DataFrame()
+            columns = ['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'VWAP']
+            return pd.DataFrame(rows, columns=columns[:len(rows[0])])
+        except Exception as e:
+            k2_logger.error(f"get_daily_bars failed: {str(e)}", "CHART_DATA")
+            return pd.DataFrame()
+
     def get_chart_data_chunk(self, table_name: str, start_idx: int, end_idx: int) -> pd.DataFrame:
         """Return a DataFrame of rows [start_idx, end_idx) in display format."""
         try:

@@ -512,6 +512,32 @@ class DatabaseManager:
                     f"Retrieved {len(rows)} records (offset: {offset}, limit: {limit}, market_hours_only: {market_hours_only})")
                 return rows
 
+    def fetch_daily_bars(self, table_name: str) -> List[Tuple]:
+        """Server-side daily aggregation — returns (date, '00:00:00', O, H, L, C, V, VWAP)."""
+        with self.get_connection() as conn:
+            with self.get_cursor(conn) as cur:
+                has_new = self._check_column_exists(table_name, 'market_date')
+                date_col = 'market_date' if has_new else 'DATE(date_time_market)'
+                query = f"""
+                    SELECT {date_col}                       AS "Date",
+                           '00:00:00'                       AS "Time",
+                           (ARRAY_AGG(open ORDER BY timestamp))[1]  AS "Open",
+                           MAX(high)                        AS "High",
+                           MIN(low)                         AS "Low",
+                           (ARRAY_AGG(close ORDER BY timestamp DESC))[1] AS "Close",
+                           SUM(volume)                      AS "Volume",
+                           (ARRAY_AGG(vwap ORDER BY timestamp DESC))[1]  AS "VWAP"
+                    FROM {table_name}
+                    GROUP BY {date_col}
+                    ORDER BY {date_col}
+                """
+                cur.execute(query)
+                rows = cur.fetchall()
+                k2_logger.database_operation(
+                    f"Daily agg from {table_name}",
+                    f"Retrieved {len(rows)} daily bars")
+                return rows
+
     def fetch_time_window_df(self, table_name: str, start_dt: datetime, end_dt: datetime) -> pd.DataFrame:
         """Fetch data within a time window"""
         with self.get_connection() as conn:
