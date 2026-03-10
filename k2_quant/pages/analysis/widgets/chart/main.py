@@ -385,6 +385,36 @@ class TimeAxisManager:
         return positions
 
 
+def _precompute_datetime_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Pre-compute 'datetime' column and fast market-hours mask columns.
+
+    Done once (ideally off the UI thread) so that every subsequent
+    timeframe switch reuses the cached result instead of re-parsing
+    millions of Date/Time strings.
+    """
+    if 'datetime' in df.columns:
+        return df
+
+    if 'Date' not in df.columns:
+        return df
+
+    df = df.copy()
+    dates = pd.to_datetime(df['Date'], errors='coerce')
+    if 'Time' in df.columns:
+        td = pd.to_timedelta(df['Time'].astype(str), errors='coerce')
+        df['datetime'] = dates + td.fillna(pd.Timedelta(0))
+    else:
+        df['datetime'] = dates
+
+    # Pre-compute fast integer columns for market-hours filtering so we
+    # never need the extremely slow `.dt.time` accessor later.
+    dt = df['datetime']
+    df['_mkt_minutes'] = dt.dt.hour * 60 + dt.dt.minute
+    df['_weekday'] = dt.dt.weekday
+
+    return df
+
+
 class _RawDataWorker(QThread):
     """Background worker that fetches all raw rows from Postgres."""
     finished = pyqtSignal(str, object)  # (table_name, DataFrame or None)
@@ -401,6 +431,7 @@ class _RawDataWorker(QThread):
             if isinstance(df, pd.DataFrame) and not df.empty:
                 for col in list(NUMERIC_COLUMNS & set(df.columns)):
                     df[col] = pd.to_numeric(df[col], errors='coerce')
+                df = _precompute_datetime_column(df)
                 self.finished.emit(self._table_name, df)
                 return
         except Exception as e:
@@ -1372,20 +1403,17 @@ class ChartWidget(QWidget):
             
         vb = self.main_plot.getViewBox()
         
-        # Calculate Y limits from data
+        # Calculate Y limits from data using fast numpy (already numeric)
         y_min = float('inf')
         y_max = float('-inf')
         
         for col in ['Open', 'High', 'Low', 'Close']:
             if col in self.data.columns:
-                # Ensure data is numeric
-                col_data = pd.to_numeric(self.data[col], errors='coerce').dropna()
-                if len(col_data) > 0:
-                    # Filter out any remaining inf values
-                    col_data = col_data[~np.isinf(col_data)]
-                    if len(col_data) > 0:
-                        y_min = min(y_min, col_data.min())
-                        y_max = max(y_max, col_data.max())
+                arr = np.asarray(self.data[col].values, dtype=np.float64)
+                finite = arr[np.isfinite(arr)]
+                if len(finite) > 0:
+                    y_min = min(y_min, finite.min())
+                    y_max = max(y_max, finite.max())
         
         # Ensure valid Y range
         if y_min == float('inf') or y_max == float('-inf'):
@@ -1465,19 +1493,12 @@ class ChartWidget(QWidget):
         coerced at ingestion so we skip redundant conversions."""
         df = self.original_data
 
-        # --- 1. Build a single datetime column (fast path) ---
-        if 'datetime' in df.columns:
-            pass
-        elif 'Date' in df.columns:
-            dates = pd.to_datetime(df['Date'], errors='coerce')
-            if 'Time' in df.columns:
-                td = pd.to_timedelta(df['Time'].astype(str), errors='coerce')
-                df = df.copy()
-                df['datetime'] = dates + td.fillna(pd.Timedelta(0))
-            else:
-                df = df.copy()
-                df['datetime'] = dates
-        else:
+        # --- 1. Ensure datetime column exists (fast: usually pre-computed) ---
+        if 'datetime' not in df.columns:
+            df = _precompute_datetime_column(df)
+            self.original_data = df
+
+        if 'datetime' not in df.columns:
             self.data = df
             self.date_column = None
             self.x_values = np.arange(len(df), dtype=np.float32)
@@ -1487,12 +1508,15 @@ class ChartWidget(QWidget):
         self.date_column = 'datetime'
 
         # --- 2. Filter to market hours for intraday timeframes ---
+        #     Uses pre-computed integer columns (_mkt_minutes, _weekday)
+        #     instead of the extremely slow .dt.time accessor.
         if 'Time' in df.columns and self.current_timeframe in INTRADAY_TIMEFRAMES:
             try:
-                dt = df['datetime']
-                mkt_open = datetime.strptime('09:30:00', '%H:%M:%S').time()
-                mkt_close = datetime.strptime('16:00:00', '%H:%M:%S').time()
-                mask = (dt.dt.weekday < 5) & (dt.dt.time >= mkt_open) & (dt.dt.time < mkt_close)
+                MKT_OPEN_MIN = 9 * 60 + 30   # 09:30
+                MKT_CLOSE_MIN = 16 * 60       # 16:00
+                weekday = df['_weekday'] if '_weekday' in df.columns else df['datetime'].dt.weekday
+                minutes = df['_mkt_minutes'] if '_mkt_minutes' in df.columns else (df['datetime'].dt.hour * 60 + df['datetime'].dt.minute)
+                mask = (weekday < 5) & (minutes >= MKT_OPEN_MIN) & (minutes < MKT_CLOSE_MIN)
                 df = df[mask].reset_index(drop=True)
             except Exception:
                 pass
@@ -1539,51 +1563,73 @@ class ChartWidget(QWidget):
             k2_logger.error(f"Resample failed ({rule}): {e}", "CHART")
             return df
             
+    # --- Viewport-windowed OHLC rendering ---
+    # Only push the visible slice (+ buffer) to pyqtgraph so we never ask
+    # it to render hundreds of thousands of points.
+
+    _OHLC_VIEW_BUFFER = 500  # extra bars each side of viewport
+
     def _display_ohlc_optimized(self):
-        """Optimized OHLC display - FIXED to clear existing lines first"""
-        # Clear any existing lines to prevent duplicates
+        """Create empty PlotDataItems, then fill them with the visible window."""
         for line in list(self.active_lines.values()):
-            if line.scene():  # Check if item is still in scene
+            if line.scene():
                 self.main_plot.removeItem(line)
         self.active_lines.clear()
-        
-        # Now add the lines that should be visible
+
         for col in ['Open', 'High', 'Low', 'Close']:
             if col in self.data.columns and col in self.ohlc_buttons:
                 if self.ohlc_buttons[col].isChecked():
-                    self._add_ohlc_line_optimized(col)
-                
-    def _add_ohlc_line_optimized(self, column_name):
-        """Add OHLC line with optimization"""
+                    self._create_ohlc_plot_item(col)
+
+        self._refresh_visible_ohlc()
+
+    def _create_ohlc_plot_item(self, column_name):
+        """Create an empty PlotDataItem and add it to the scene."""
         if column_name in self.active_lines:
             return
-            
         if column_name not in self.data.columns:
             return
-            
-        y_values = np.asarray(self.data[column_name].values, dtype=np.float32)
-        
-        # Clean data - remove inf and clip
-        y_values[np.isinf(y_values)] = np.nan
-        y_values = np.clip(y_values, -1e6, 1e6)
-        
-        # Check for valid data
-        finite_mask = np.isfinite(y_values)
-        if not np.any(finite_mask):
-            return
-        
-        # Create plot item
+
         color = OHLC_COLORS.get(column_name, '#ffffff')
-        plot_item = OptimizedPlotDataItem(
-            x=self.x_values[:len(y_values)],
-            y=y_values,
+        plot_item = pg.PlotDataItem(
             pen=pg.mkPen(color=color, width=2),
             connect='finite'
         )
-        
         self.main_plot.addItem(plot_item)
         self.active_lines[column_name] = plot_item
-        k2_logger.info(f"Added {column_name} line", "CHART")
+
+    def _visible_ohlc_range(self):
+        """Return (lo, hi) index range that should be rendered."""
+        if self.data is None or len(self.data) == 0:
+            return 0, 0
+        vb = self.main_plot.getViewBox()
+        x_lo, x_hi = vb.viewRange()[0]
+        buf = self._OHLC_VIEW_BUFFER
+        lo = int(max(0, x_lo - buf))
+        hi = int(min(len(self.data), x_hi + buf + 1))
+        return lo, hi
+
+    def _refresh_visible_ohlc(self):
+        """Push only the visible window of data into each OHLC PlotDataItem."""
+        if self.data is None or len(self.data) == 0:
+            return
+
+        lo, hi = self._visible_ohlc_range()
+        if lo >= hi:
+            return
+
+        x_slice = self.x_values[lo:hi]
+        for col, item in list(self.active_lines.items()):
+            if col not in self.data.columns:
+                continue
+            y = np.asarray(self.data[col].values[lo:hi], dtype=np.float32)
+            y[np.isinf(y)] = np.nan
+            item.setData(x=x_slice, y=y)
+
+    def _add_ohlc_line_optimized(self, column_name):
+        """Add a single OHLC line and immediately populate it with visible data."""
+        self._create_ohlc_plot_item(column_name)
+        self._refresh_visible_ohlc()
         
     def set_default_view(self):
         """Show the last DEFAULT_VISIBLE_BARS bars."""
@@ -1718,9 +1764,10 @@ class ChartWidget(QWidget):
                 lbl.setVisible(False)
             
     def _emit_viewport_changed(self):
-        """Emit viewport changed signal using resampled bar indices."""
+        """Emit viewport changed signal and refresh visible OHLC window."""
         if self.data is None:
             return
+        self._refresh_visible_ohlc()
         vb = self.main_plot.getViewBox()
         x_min, x_max = vb.viewRange()[0]
         start = int(max(0, round(x_min)))
