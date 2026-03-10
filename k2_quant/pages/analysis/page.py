@@ -383,7 +383,7 @@ class AnalysisPageWidget(QWidget):
             df = getattr(cw, "data", None)
             if isinstance(df, pd.DataFrame) and not df.empty:
                 # Only keep expected display columns to avoid copying large extras
-                cols = [c for c in ['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'VWAP'] if c in df.columns]
+                cols = [c for c in ['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'VWAP', 'datetime'] if c in df.columns]
                 if cols:
                     return df[cols].copy()
                 return df.copy()
@@ -416,6 +416,8 @@ class AnalysisPageWidget(QWidget):
                 )
             elif 'Date' in display_df.columns:
                 dt_index = pd.to_datetime(display_df['Date'], errors='coerce')
+            elif 'datetime' in display_df.columns:
+                dt_index = pd.to_datetime(display_df['datetime'], errors='coerce')
             else:
                 k2_logger.warning("Indicator source dataframe missing Date column", "ANALYSIS")
                 return

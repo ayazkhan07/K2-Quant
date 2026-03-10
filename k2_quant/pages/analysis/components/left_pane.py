@@ -211,20 +211,42 @@ class LeftPaneWidget(QFrame):
             if child.widget():
                 child.widget().deleteLater()
         
-        # Define indicators (alphabetically sorted)
+        # Define indicators (alphabetically sorted) - all 31 from TechnicalAnalysisService
         indicators = [
+            "ADX",
+            "Aroon",
+            "ATR",
             "Bollinger Bands",
+            "BOP",
+            "CCI",
+            "CMO",
+            "DEMA (30)",
+            "DX",
             "EMA (20)",
             "EMA (50)",
+            "Hilbert Transform Trendline",
+            "KAMA (30)",
             "MACD",
+            "MFI",
+            "MOM (10)",
             "OBV",
+            "Parabolic SAR",
+            "PPO",
+            "ROC (10)",
             "RSI",
             "SMA (20)",
             "SMA (50)",
             "SMA (200)",
             "Stochastic",
+            "Stochastic RSI",
+            "T3",
+            "TEMA (30)",
+            "TRIX (30)",
+            "Ultimate Oscillator",
+            "Volume",
             "VWAP",
-            "Volume"
+            "Williams %R",
+            "WMA (20)",
         ]
         
         # Add indicator checkboxes
