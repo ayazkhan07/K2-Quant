@@ -186,6 +186,7 @@ class AnalysisPageWidget(QWidget):
         self.right_pane.message_sent.connect(self.on_ai_message_sent)
         self.right_pane.strategy_generated.connect(self.on_strategy_generated)
         self.right_pane.projection_requested.connect(self.on_projection_requested_from_ai)
+        self.right_pane.data_modified.connect(self._on_ai_data_modified)
     
     def refresh_left_pane_data(self):
         """Refresh all data in the left pane"""
@@ -724,7 +725,22 @@ class AnalysisPageWidget(QWidget):
     def on_projection_requested_from_ai(self, params: dict):
         """Handle projection request from AI"""
         k2_logger.info(f"Projection requested from AI: {params}", "ANALYSIS")
-        # Could generate projections based on params
+
+    def _on_ai_data_modified(self):
+        """Refresh middle pane when the AI agent modifies table data."""
+        if not self.current_model:
+            return
+        try:
+            k2_logger.info("AI modified data — refreshing middle pane", "ANALYSIS")
+            rows, total_count = stock_service.get_display_data(self.current_model, limit=500)
+            if rows:
+                self.current_data = rows
+                self.current_metadata['records'] = total_count
+                self.current_metadata['total_records'] = total_count
+                self.middle_pane.load_data(rows, self.current_metadata)
+                self.model_label.setText(f"Model: {self.current_model} ({total_count:,} records)")
+        except Exception as e:
+            k2_logger.error(f"Failed to refresh after AI data change: {e}", "ANALYSIS")
     
     def load_saved_models(self):
         """Load saved models into the left pane"""

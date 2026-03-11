@@ -825,6 +825,7 @@ class ChartWidget(QWidget):
         self.active_lines = {}
         self.indicator_panes = {}
         self.indicator_overlays = {}
+        self._indicator_full_data = {}
         self.drawings = []
         
         # UI element references
@@ -1626,6 +1627,24 @@ class ChartWidget(QWidget):
             y[np.isinf(y)] = np.nan
             item.setData(x=x_slice, y=y)
 
+    def _refresh_visible_indicators(self):
+        """Push only the visible window of data into each indicator overlay PlotDataItem."""
+        if self.x_values is None or len(self.x_values) == 0:
+            return
+        if not self._indicator_full_data:
+            return
+
+        lo, hi = self._visible_ohlc_range()
+        if lo >= hi:
+            return
+
+        x_slice = self.x_values[lo:hi]
+        for name, item in list(self.indicator_overlays.items()):
+            full_y = self._indicator_full_data.get(name)
+            if full_y is None:
+                continue
+            item.setData(x=x_slice, y=full_y[lo:hi])
+
     def _add_ohlc_line_optimized(self, column_name):
         """Add a single OHLC line and immediately populate it with visible data."""
         self._create_ohlc_plot_item(column_name)
@@ -1764,10 +1783,11 @@ class ChartWidget(QWidget):
                 lbl.setVisible(False)
             
     def _emit_viewport_changed(self):
-        """Emit viewport changed signal and refresh visible OHLC window."""
+        """Emit viewport changed signal and refresh visible data windows."""
         if self.data is None:
             return
         self._refresh_visible_ohlc()
+        self._refresh_visible_indicators()
         vb = self.main_plot.getViewBox()
         x_min, x_max = vb.viewRange()[0]
         start = int(max(0, round(x_min)))
@@ -2231,6 +2251,7 @@ class ChartWidget(QWidget):
             if overlay.scene():
                 self.main_plot.removeItem(overlay)
         self.indicator_overlays.clear()
+        self._indicator_full_data.clear()
         
         # Remove indicator panes
         for indicator_name in list(self.indicator_panes.keys()):
@@ -2287,16 +2308,18 @@ class ChartWidget(QWidget):
         y_aligned = np.clip(y_aligned, -1e6, 1e6)
         y_aligned[np.isinf(y_aligned)] = np.nan
 
-        # Create plot item with aligned data
-        plot_item = OptimizedPlotDataItem(
-            x=self.x_values,
-            y=y_aligned,
+        # Store full data for viewport-windowed rendering
+        self._indicator_full_data[indicator_name] = y_aligned
+
+        # Create empty plot item, then populate with visible window only
+        plot_item = pg.PlotDataItem(
             pen=pg.mkPen(color=color, width=2, style=Qt.PenStyle.DashLine),
             connect='finite'
         )
 
         self.main_plot.addItem(plot_item)
         self.indicator_overlays[indicator_name] = plot_item
+        self._refresh_visible_indicators()
         k2_logger.info(f"Added indicator overlay: {indicator_name} (aligned: {y_len} -> {x_len})", "CHART")
 
     def remove_indicator(self, indicator_name):
@@ -2304,6 +2327,7 @@ class ChartWidget(QWidget):
         if indicator_name in self.indicator_overlays:
             self.main_plot.removeItem(self.indicator_overlays[indicator_name])
             del self.indicator_overlays[indicator_name]
+            self._indicator_full_data.pop(indicator_name, None)
             k2_logger.info(f"Removed indicator: {indicator_name}", "CHART")
             
     def add_indicator_pane(self, indicator_name, data, chart_type='line', color='#ffffff'):

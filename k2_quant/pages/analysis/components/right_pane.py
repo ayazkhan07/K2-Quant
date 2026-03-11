@@ -1,11 +1,14 @@
 """
-Right Pane Component - Conversational AI with streaming
+Right Pane Component - Conversational AI with Agent Loop
 
-Contains AI chat interface for strategy development.
+Contains AI chat interface backed by an agent loop that can execute
+multiple tool calls (SQL, Python) per user message, showing intermediate
+steps as the agent works.
+
 Save as: k2_quant/pages/analysis/components/right_pane.py
 """
 
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from datetime import datetime
 import html as html_mod
 
@@ -20,25 +23,39 @@ from k2_quant.utilities.text.math_formatter import MathFormatter
 
 
 class CommandWorker(QThread):
-    """Worker to execute AI-driven table commands in background."""
+    """Worker to execute the agent loop in background."""
 
     result_ready = pyqtSignal(dict)
     error_occurred = pyqtSignal(str)
+    step_update = pyqtSignal(str)
 
-    def __init__(self, table_name: str, command_text: str, conversation_state: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self,
+        table_name: str,
+        command_text: str,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
+    ):
         super().__init__()
         self.table_name = table_name
         self.command_text = command_text
-        self.conversation_state = conversation_state or {}
+        self.conversation_history = conversation_history or []
 
     def run(self):
         try:
             if table_controller is None:
                 raise RuntimeError("table_controller service is not available")
-            result = table_controller.execute_command(self.table_name, self.command_text, self.conversation_state)
+            result = table_controller.execute_command(
+                self.table_name,
+                self.command_text,
+                self.conversation_history,
+                step_callback=self._on_step,
+            )
             self.result_ready.emit(result)
         except Exception as e:
             self.error_occurred.emit(str(e))
+
+    def _on_step(self, text: str):
+        self.step_update.emit(text)
 
 
 class RightPaneWidget(QFrame):
@@ -48,6 +65,7 @@ class RightPaneWidget(QFrame):
     message_sent = pyqtSignal(str)  # message
     strategy_generated = pyqtSignal(str, str)  # name, code
     projection_requested = pyqtSignal(dict)  # parameters
+    data_modified = pyqtSignal()  # emitted when the agent modifies table data
     
     def __init__(self):
         super().__init__()
@@ -55,7 +73,7 @@ class RightPaneWidget(QFrame):
         self.setObjectName("rightPane")
         
         self.current_context: Optional[Dict[str, Any]] = None
-        self.conversation_history = []
+        self.conversation_history: List[Dict[str, str]] = []
         self.worker: Optional[CommandWorker] = None
         self.streaming_timer = None
         self.streaming_text = ""
@@ -117,12 +135,12 @@ class RightPaneWidget(QFrame):
         layout.addWidget(input_widget)
     
     def send_ai_message(self):
-        """Send message to AI and execute via controller"""
+        """Send message to AI and execute via agent loop"""
         message = self.ai_input.text().strip()
         if not message:
             return
         
-        # Add user message to chat (right-aligned via block format)
+        # Add user message to chat (right-aligned)
         cursor = self.chat_display.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
 
@@ -161,7 +179,7 @@ class RightPaneWidget(QFrame):
             self.stream_response("Please load a model first so I know which table to operate on.")
             return
 
-        # Launch background worker
+        # Prevent concurrent requests
         if self.worker and self.worker.isRunning():
             self.stream_response("Previous command is still executing. Please wait.")
             return
@@ -169,42 +187,52 @@ class RightPaneWidget(QFrame):
         # Show loading indicator
         self.loading_bar.show()
         
-        # Build structured conversation_state for LLM follow-ups
-        structured_answers = [
-            {
-                'label': h.get('label', ''),
-                'value': h.get('value'),
-                'column': h.get('column')
-            }
-            for h in self.conversation_history if h.get('role') == 'answer'
-        ][-5:]
-        # Fallback to assistant text if no structured answers yet
-        if not structured_answers:
-            structured_answers = [
-                {'label': '', 'value': h.get('content')}
-                for h in self.conversation_history if h.get('role') == 'assistant'
-            ][-5:]
-        conversation_state = {'last_answers': structured_answers}
+        # Build clean history for the agent (exclude the message we just added)
+        history_for_agent = [
+            {"role": h["role"], "content": h["content"]}
+            for h in self.conversation_history
+            if h.get("role") in ("user", "assistant") and h.get("content")
+        ][:-1]
 
-        self.worker = CommandWorker(table_name, message, conversation_state)
+        self.worker = CommandWorker(table_name, message, history_for_agent)
         self.worker.result_ready.connect(self._on_worker_result)
         self.worker.error_occurred.connect(self._on_worker_error)
+        self.worker.step_update.connect(self._on_step_update)
         self.worker.start()
 
-        # Emit signal for external listeners if needed
         self.message_sent.emit(message)
     
+    # ── intermediate step display ──────────────────────────────────
+
+    def _on_step_update(self, text: str):
+        """Display an intermediate agent step in subdued style."""
+        cursor = self.chat_display.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+
+        block_fmt = QTextBlockFormat()
+        block_fmt.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        block_fmt.setTopMargin(2)
+        block_fmt.setBottomMargin(2)
+        cursor.insertBlock(block_fmt)
+
+        step_fmt = QTextCharFormat()
+        step_fmt.setForeground(QColor("#666666"))
+        cursor.insertText(f"  {text}", step_fmt)
+
+        self.chat_display.setTextCursor(cursor)
+        self.chat_display.ensureCursorVisible()
+
+    # ── response rendering ─────────────────────────────────────────
+
     def stream_response(self, text: str, prefix: str = "AI: "):
         """Stream text with markdown table support."""
         if '|' in text and '\n|' in text and '---' in text:
             self._render_formatted_response(text)
             return
 
-        # Apply math formatting only within explicit delimiters; keep others intact
         self.streaming_text = self.math_formatter.format_full(text)
         self.streaming_index = 0
 
-        # Insert left-aligned AI block via block format; streaming appends into this block
         cursor = self.chat_display.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
 
@@ -218,7 +246,6 @@ class RightPaneWidget(QFrame):
         label_fmt.setForeground(QColor("#666666"))
         cursor.insertText(prefix, label_fmt)
 
-        # Set char format to white for the streamed content
         text_fmt = QTextCharFormat()
         text_fmt.setForeground(QColor("#ffffff"))
         cursor.setCharFormat(text_fmt)
@@ -236,7 +263,6 @@ class RightPaneWidget(QFrame):
         cursor = self.chat_display.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
 
-        # Insert left-aligned AI block via block format
         block_fmt = QTextBlockFormat()
         block_fmt.setAlignment(Qt.AlignmentFlag.AlignLeft)
         block_fmt.setTopMargin(6)
@@ -306,11 +332,9 @@ class RightPaneWidget(QFrame):
     def _stream_next_chunk(self):
         """Stream next chunk of text"""
         if self.streaming_index < len(self.streaming_text):
-            # Stream 1-3 characters at a time for natural appearance
             chunk_size = min(2, len(self.streaming_text) - self.streaming_index)
             chunk = self.streaming_text[self.streaming_index:self.streaming_index + chunk_size]
             
-            # Move cursor to end and insert text with white color
             cursor = self.chat_display.textCursor()
             cursor.movePosition(QTextCursor.MoveOperation.End)
             fmt = QTextCharFormat()
@@ -318,86 +342,61 @@ class RightPaneWidget(QFrame):
             cursor.insertText(chunk, fmt)
             self.chat_display.setTextCursor(cursor)
             
-            # Ensure visible
             self.chat_display.ensureCursorVisible()
             
             self.streaming_index += chunk_size
         else:
-            # Streaming complete
             self.streaming_timer.stop()
             self.streaming_timer = None
+
+    # ── worker result handling ─────────────────────────────────────
     
     def _on_worker_result(self, result: Dict[str, Any]):
-        """Handle worker completion - show only natural language results"""
-        # Hide loading indicator
+        """Handle worker completion."""
         self.loading_bar.hide()
         
         if result.get('success'):
-            # Determine response text
-            if result.get('interpreted_result'):
-                response = result['interpreted_result']
-            elif result.get('query_result') is not None:
-                # Only use raw query_result as last resort
-                query_result = result['query_result']
-                response = str(query_result)
-            elif result.get('new_columns'):
-                cols = [c for c in result['new_columns'] if c]
-                response = f"Successfully added {len(cols)} new column{'s' if len(cols) != 1 else ''}: {', '.join(cols)}"
-            elif result.get('rows_deleted'):
-                response = f"Deleted {result['rows_deleted']:,} rows from the dataset"
-            elif result.get('rows_inserted'):
-                response = f"Inserted {result['rows_inserted']:,} new rows into the dataset"
-            elif result.get('rows_affected') is not None:
-                response = f"Operation completed. {result['rows_affected']:,} rows were affected"
-            else:
-                response = "Operation completed successfully"
-            
-            # Stream the response
+            response = result.get('display_message', 'Operation completed successfully.')
             self.stream_response(response)
 
-            # Capture structured answers for follow-up pronoun resolution
-            answer_to_remember = result.get('answer_to_remember')
-            if answer_to_remember:
-                self.conversation_history.append({
-                    'role': 'answer',
-                    'label': answer_to_remember.get('label', ''),
-                    'value': answer_to_remember.get('value'),
-                    'column': answer_to_remember.get('column'),
-                    'timestamp': datetime.now().isoformat()
-                })
+            self.conversation_history.append({
+                'role': 'assistant',
+                'content': response,
+                'timestamp': datetime.now().isoformat()
+            })
+
+            if result.get('data_modified'):
+                self.data_modified.emit()
         else:
             error = result.get('error', 'Operation failed')
             self.stream_response(f"Unable to complete that request. {error}")
 
-        # Add to history
-        self.conversation_history.append({
-            'role': 'assistant',
-            'content': response if result.get('success') else error,
-            'timestamp': datetime.now().isoformat()
-        })
+            self.conversation_history.append({
+                'role': 'assistant',
+                'content': f"Error: {error}",
+                'timestamp': datetime.now().isoformat()
+            })
 
         self.worker = None
 
     def _on_worker_error(self, error_msg: str):
         """Handle worker error"""
-        # Hide loading indicator
         self.loading_bar.hide()
-        
         self.stream_response(f"Unable to process that request. {error_msg}")
         self.worker = None
     
+    # ── context and state management ───────────────────────────────
+
     def set_data_context(self, context: Dict[str, Any]):
         """Set the data context for AI, saving and restoring chat per model."""
         new_table = context.get('table_name') if context else None
 
-        # Save current model's chat before switching
         if self._active_table:
             self._chat_store[self._active_table] = {
                 'html': self.chat_display.toHtml(),
                 'history': list(self.conversation_history),
             }
 
-        # Restore or start fresh for the new model
         if new_table and new_table in self._chat_store:
             saved = self._chat_store[new_table]
             self.chat_display.setHtml(saved['html'])
