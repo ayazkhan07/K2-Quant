@@ -687,6 +687,47 @@ class DatabaseManager:
         k2_logger.database_operation("All tables dropped", f"{len(tables)} tables")
         return len(tables)
 
+    # ── Tab data persistence (forecast / workspace) ─────────────────
+
+    def _ensure_tab_data_table(self):
+        """Create the k2_tab_data table if it doesn't exist."""
+        with self.get_connection() as conn:
+            with self.get_cursor(conn) as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS k2_tab_data (
+                        id SERIAL PRIMARY KEY,
+                        scope VARCHAR(512) NOT NULL UNIQUE,
+                        data JSONB NOT NULL DEFAULT '{}',
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                conn.commit()
+
+    def save_tab_data(self, scope: str, data: dict):
+        """Upsert a JSON blob keyed by *scope* (e.g. 'forecast:table', 'workspace:table')."""
+        import json as _json
+        self._ensure_tab_data_table()
+        with self.get_connection() as conn:
+            with self.get_cursor(conn) as cur:
+                cur.execute("""
+                    INSERT INTO k2_tab_data (scope, data, updated_at)
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (scope) DO UPDATE SET
+                        data = EXCLUDED.data,
+                        updated_at = CURRENT_TIMESTAMP
+                """, (scope, _json.dumps(data)))
+                conn.commit()
+        k2_logger.info(f"Tab data saved: {scope}", "DB")
+
+    def load_tab_data(self, scope: str) -> Optional[dict]:
+        """Load a previously saved JSON blob by *scope* (returns None if absent)."""
+        self._ensure_tab_data_table()
+        with self.get_connection() as conn:
+            with self.get_cursor(conn) as cur:
+                cur.execute("SELECT data FROM k2_tab_data WHERE scope = %s", (scope,))
+                row = cur.fetchone()
+                return row[0] if row else None
+
     def close(self):
         self.pool.closeall()
 

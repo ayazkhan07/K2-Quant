@@ -70,6 +70,7 @@ class TableController(QObject):
             messages.append({"role": "user", "content": command})
 
             data_modified = False
+            tab_writes: list = []
             iterations = 0
 
             while iterations < MAX_AGENT_ITERATIONS:
@@ -102,7 +103,7 @@ class TableController(QObject):
                         if fn_name == "run_sql":
                             tool_result = self._tool_run_sql(fn_args.get("sql", ""))
                         elif fn_name == "run_python":
-                            tool_result = self._tool_run_python(table, fn_args.get("code", ""))
+                            tool_result = self._tool_run_python(table, fn_args.get("code", ""), tab_writes)
                             if tool_result.get("_data_modified"):
                                 data_modified = True
                         else:
@@ -129,6 +130,7 @@ class TableController(QObject):
                     "display_message": final_text,
                     "data_modified": data_modified,
                     "iterations": iterations,
+                    "_tab_writes": tab_writes,
                 }
                 self.operation_complete.emit(result)
                 return result
@@ -138,6 +140,7 @@ class TableController(QObject):
                 "display_message": "I've completed my analysis. Please check the intermediate steps above.",
                 "data_modified": data_modified,
                 "iterations": iterations,
+                "_tab_writes": tab_writes,
             }
             self.operation_complete.emit(result)
             return result
@@ -227,9 +230,18 @@ INSTRUCTIONS:
 - When finished, provide a clear natural-language answer summarizing what you found or did.
 - Show your reasoning and key numbers so the user can verify.
 - For conversational messages (greetings, clarifications), respond naturally without running tools.
-- When creating new columns or projection rows, use run_python so changes persist to the database.
-- For projection rows, include a unique 'timestamp' for each new row.
 - When modifying data, briefly describe what changed so the user knows to check the dataframe.
+
+TAB SYSTEM — The UI has three data tabs the user can see:
+  Tab 1 (Current Data): Read-only stock data. Refreshes automatically.
+  Tab 2 (Forecast Data): Pre-generated future timestamps for price projections.
+  Tab 3 (Working Data): Editable workspace for intermediate results.
+
+ROUTING RULES (important):
+- Intermediate computation results (elasticity, pattern matches, filtered lists, etc.)
+  MUST go to Tab 3 via to_working(). Do NOT add intermediate columns to the main DB table.
+- Final price projections MUST go to Tab 2 via to_forecast().
+- Only use direct df column modifications when the user explicitly asks to alter the main dataset.
 
 SQL NOTES:
 - Table name is: {table}
@@ -241,7 +253,21 @@ PYTHON NOTES:
 - 'pd', 'np', 'datetime' are available.
 - Only numeric columns (float/int) will be persisted. Non-numeric new columns are ignored.
 - The DataFrame must always retain a 'timestamp' column.
-- To return a computed value without modifying the table, assign to 'result' variable."""
+- To return a computed value without modifying the table, assign to 'result' variable.
+
+TAB HELPER FUNCTIONS (available inside run_python):
+- to_working(column_name, values, scope='model')
+    Write a column to the Working Data tab (Tab 3).
+    column_name: string label for the column.
+    values: list, Series, or ndarray of values.
+    scope: 'model' (per-model workspace) or 'global' (shared workspace).
+    For large columns (>2000 values), send first 2000 with a note.
+
+- to_forecast(set_index, open_values=None, high_values=None, low_values=None, close_values=None)
+    Write price projections to the Forecast Data tab (Tab 2).
+    set_index: integer (1, 2, 3…) identifying the forecast scenario.
+    Each list should align with the pre-generated future timestamps (up to 500 values).
+    You may provide any subset of OHLC columns."""
 
         except Exception as e:
             k2_logger.error(f"Failed to build system prompt: {e}", "TABLE_CTRL")
@@ -347,7 +373,7 @@ PYTHON NOTES:
         except Exception as e:
             return {"error": str(e), "type": "error"}
 
-    def _tool_run_python(self, table: str, code: str) -> Dict[str, Any]:
+    def _tool_run_python(self, table: str, code: str, tab_writes: list = None) -> Dict[str, Any]:
         """Execute Python and return structured result for the LLM."""
         try:
             df = db_manager.fetch_dataframe(table)
@@ -355,12 +381,60 @@ PYTHON NOTES:
             original_cols = set(df.columns)
             original_len = len(df)
 
+            if tab_writes is None:
+                tab_writes = []
+
+            def _to_working(column_name, values, scope='model'):
+                if isinstance(values, (pd.Series, np.ndarray)):
+                    values = values.tolist()
+                cleaned = []
+                for v in values:
+                    if v is None:
+                        cleaned.append(None)
+                    elif isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
+                        cleaned.append(None)
+                    else:
+                        cleaned.append(v)
+                tab_writes.append({
+                    "type": "working",
+                    "column_name": str(column_name),
+                    "values": cleaned[:2000],
+                    "scope": str(scope),
+                })
+
+            def _to_forecast(set_index, open_values=None, high_values=None,
+                             low_values=None, close_values=None):
+                def _clean(vals):
+                    if vals is None:
+                        return None
+                    if isinstance(vals, (pd.Series, np.ndarray)):
+                        vals = vals.tolist()
+                    out = []
+                    for v in vals:
+                        if v is None:
+                            out.append(None)
+                        elif isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
+                            out.append(None)
+                        else:
+                            out.append(float(v))
+                    return out[:500]
+                tab_writes.append({
+                    "type": "forecast",
+                    "set_index": int(set_index),
+                    "open_values": _clean(open_values),
+                    "high_values": _clean(high_values),
+                    "low_values": _clean(low_values),
+                    "close_values": _clean(close_values),
+                })
+
             exec_globals = {
                 "df": df,
                 "pd": pd,
                 "np": np,
                 "datetime": datetime,
                 "result": None,
+                "to_working": _to_working,
+                "to_forecast": _to_forecast,
             }
             exec(code, exec_globals)
 

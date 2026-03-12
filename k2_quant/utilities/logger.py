@@ -44,7 +44,9 @@ class K2QuantLogger:
         file_handler.setFormatter(detailed_formatter)
         file_handler.setLevel(logging.DEBUG)
 
-        self.console_handler = logging.StreamHandler(sys.stdout)
+        self.console_handler = logging.StreamHandler(
+            open(sys.stdout.fileno(), mode='w', encoding='utf-8', closefd=False)
+        )
         self.console_handler.setFormatter(console_formatter)
         self.console_handler.setLevel(log_level)
 

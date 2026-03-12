@@ -181,12 +181,14 @@ class AnalysisPageWidget(QWidget):
         self.middle_pane.projection_requested.connect(self.on_projection_requested)
         self.middle_pane.indicator_applied.connect(self.on_indicator_applied_from_middle)
         self.middle_pane.data_exported.connect(self.on_data_exported)
+        self.middle_pane.forecast_apply.connect(self.on_forecast_apply)
         
         # Right pane connections
         self.right_pane.message_sent.connect(self.on_ai_message_sent)
         self.right_pane.strategy_generated.connect(self.on_strategy_generated)
         self.right_pane.projection_requested.connect(self.on_projection_requested_from_ai)
         self.right_pane.data_modified.connect(self._on_ai_data_modified)
+        self.right_pane.tab_writes_ready.connect(self._on_tab_writes)
     
     def refresh_left_pane_data(self):
         """Refresh all data in the left pane"""
@@ -210,6 +212,10 @@ class AnalysisPageWidget(QWidget):
     def load_model_by_table(self, table_name: str):
         """Load model by table name"""
         k2_logger.info(f"Loading model: {table_name}", "ANALYSIS")
+        
+        # Persist tab data for the previous model before switching
+        if self.current_model:
+            self.middle_pane.persist_tab_data(self.current_model)
         
         try:
             rows, total_count = stock_service.get_display_data(table_name, limit=500)
@@ -236,6 +242,9 @@ class AnalysisPageWidget(QWidget):
                 
                 # Load into middle pane (chart uses limited data; table uses limited data)
                 self.middle_pane.load_data(rows, self.current_metadata)
+                
+                # Restore saved forecast / working-data tabs
+                self.middle_pane.restore_tab_data(table_name)
                 
                 ctx = {
                     'symbol': self.current_metadata.get('symbol', table_name),
@@ -697,6 +706,16 @@ class AnalysisPageWidget(QWidget):
         """Handle view mode change"""
         k2_logger.info(f"View mode changed to {mode}", "ANALYSIS")
     
+    def on_forecast_apply(self, forecast_data: dict):
+        """Render forecast data as dashed OHLC lines on the chart."""
+        k2_logger.info(
+            f"Forecast apply received: {len(forecast_data)} set(s)", "ANALYSIS")
+        cw = getattr(self.middle_pane, "chart_widget", None)
+        if cw is None:
+            k2_logger.warning("No chart widget — cannot render forecast lines", "ANALYSIS")
+            return
+        cw.add_forecast_data(forecast_data)
+
     def on_projection_requested(self):
         """Handle projection request from middle pane"""
         k2_logger.info("Projection requested from middle pane", "ANALYSIS")
@@ -741,6 +760,42 @@ class AnalysisPageWidget(QWidget):
                 self.model_label.setText(f"Model: {self.current_model} ({total_count:,} records)")
         except Exception as e:
             k2_logger.error(f"Failed to refresh after AI data change: {e}", "ANALYSIS")
+
+    def _on_tab_writes(self, writes: list):
+        """Route AI-generated data to the correct UI tabs."""
+        if not writes:
+            return
+        tabs = getattr(self.middle_pane, "data_tabs", None)
+        if tabs is None:
+            k2_logger.warning("DataTabsWidget not available for tab writes", "ANALYSIS")
+            return
+
+        for w in writes:
+            try:
+                wtype = w.get("type")
+                if wtype == "working":
+                    scope = w.get("scope", "model")
+                    col = w.get("column_name", "result")
+                    vals = w.get("values", [])
+                    tabs.add_working_column(scope, col, vals)
+                    k2_logger.info(
+                        f"AI wrote '{col}' ({len(vals)} rows) to working tab [{scope}]",
+                        "ANALYSIS")
+                elif wtype == "forecast":
+                    set_idx = w.get("set_index", 1)
+                    while tabs._forecast_sets < set_idx:
+                        tabs.add_forecast_set()
+                    for ohlc, key in [("Open", "open_values"), ("High", "high_values"),
+                                      ("Low", "low_values"), ("Close", "close_values")]:
+                        vals = w.get(key)
+                        if vals:
+                            col_name = f"{ohlc}_P{set_idx}"
+                            tabs.set_forecast_values(col_name, vals)
+                    k2_logger.info(
+                        f"AI wrote forecast set P{set_idx} to forecast tab",
+                        "ANALYSIS")
+            except Exception as e:
+                k2_logger.error(f"Failed to process tab write: {e}", "ANALYSIS")
     
     def load_saved_models(self):
         """Load saved models into the left pane"""

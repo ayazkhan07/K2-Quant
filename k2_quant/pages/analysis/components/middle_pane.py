@@ -38,14 +38,14 @@ import numpy as np
 
 from PyQt6.QtWidgets import (QFrame, QVBoxLayout, QHBoxLayout, QWidget,
                              QPushButton, QComboBox, QLabel, QSplitter,
-                             QTableWidget, QTableWidgetItem, QProgressBar)
+                             QProgressBar)
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QFont
 
 from k2_quant.utilities.logger import k2_logger
 
 # Updated import path for ChartWidget facade
 from k2_quant.pages.analysis.widgets.chart import ChartWidget
+from k2_quant.pages.analysis.widgets.data_tabs_widget import DataTabsWidget
 
 
 class MiddlePaneWidget(QFrame):
@@ -58,6 +58,7 @@ class MiddlePaneWidget(QFrame):
     projection_requested = pyqtSignal()
     indicator_applied = pyqtSignal(str, dict)  # indicator_type, params
     data_exported = pyqtSignal(str, pd.DataFrame)  # format, data
+    forecast_apply = pyqtSignal(dict)  # forwarded from DataTabsWidget
     
     def __init__(self):
         super().__init__()
@@ -72,7 +73,7 @@ class MiddlePaneWidget(QFrame):
         
         # Create widgets
         self.chart_widget = None
-        self.data_table = None
+        self.data_tabs = None
         self.view_selector = None
         self.controls_bar = None
         self.splitter = None
@@ -174,16 +175,10 @@ class MiddlePaneWidget(QFrame):
             
             self.splitter.addWidget(self.chart_widget)
             
-            # Create data table widget
-            self.data_table = QTableWidget()
-            self.data_table.setAlternatingRowColors(True)
-            self.data_table.horizontalHeader().setStretchLastSection(True)
-            # Apply small-caps to header titles
-            header = self.data_table.horizontalHeader()
-            header_font = header.font()
-            header_font.setCapitalization(QFont.Capitalization.SmallCaps)
-            header.setFont(header_font)
-            self.splitter.addWidget(self.data_table)
+            # Create tabbed data widget (Current / Forecast / Working)
+            self.data_tabs = DataTabsWidget()
+            self.data_tabs.forecast_apply.connect(self.forecast_apply)
+            self.splitter.addWidget(self.data_tabs)
             
             # Set initial sizes (60/40 split)
             self.splitter.setSizes([360, 240])
@@ -192,18 +187,18 @@ class MiddlePaneWidget(QFrame):
     
     def change_view(self, view_type: str):
         """Change the middle pane view"""
-        if not self.chart_widget or not self.data_table:
+        if not self.chart_widget or not self.data_tabs:
             return
             
         if view_type == "Chart":
             self.chart_widget.setVisible(True)
-            self.data_table.setVisible(False)
+            self.data_tabs.setVisible(False)
         elif view_type == "Data Table":
             self.chart_widget.setVisible(False)
-            self.data_table.setVisible(True)
+            self.data_tabs.setVisible(True)
         elif view_type == "Both":
             self.chart_widget.setVisible(True)
-            self.data_table.setVisible(True)
+            self.data_tabs.setVisible(True)
             self.splitter.setSizes([360, 240])
         
         self.view_mode_changed.emit(view_type)
@@ -253,6 +248,18 @@ class MiddlePaneWidget(QFrame):
         # Table: limited data
         self.load_data_into_table(self.current_data)
         
+        # Setup forecast timestamps for Tab 2
+        if self.data_tabs and self.current_data is not None and len(self.current_data) > 0:
+            last_row = self.current_data.iloc[-1]
+            self.data_tabs.set_model_context(self.current_table_name)
+            self.data_tabs.setup_forecast(
+                last_date=last_row.get('Date', last_row.iloc[0]),
+                last_time=last_row.get('Time', last_row.iloc[1]),
+                timespan=self.current_metadata.get('timespan', 'minute'),
+                frequency=self.current_metadata.get('frequency', '1'),
+                market_hours_only=self.current_metadata.get('market_hours_only', False),
+            )
+        
         # Initial status
         if self.status_label and self.total_records > 0:
             table_rows = len(self.current_data) if self.current_data is not None else 0
@@ -272,7 +279,7 @@ class MiddlePaneWidget(QFrame):
         EXPECTATION: MUST merge active indicator data into the table DataFrame.
         MUST include indicator columns in the table display.
         """
-        if data is None or not self.data_table:
+        if data is None or not self.data_tabs:
             return
         
         # Convert to DataFrame if needed
@@ -294,7 +301,6 @@ class MiddlePaneWidget(QFrame):
         if self.active_indicators:
             table_len = len(df)
 
-            # Build a datetime index for the table rows (timezone-naive)
             table_index = None
             try:
                 if 'Date' in df.columns and 'Time' in df.columns:
@@ -318,7 +324,6 @@ class MiddlePaneWidget(QFrame):
                     if series.empty:
                         continue
 
-                    # Ensure timezone-naive for alignment with table datetimes
                     if isinstance(series.index, pd.DatetimeIndex) and series.index.tz is not None:
                         series = series.copy()
                         series.index = series.index.tz_localize(None)
@@ -327,7 +332,6 @@ class MiddlePaneWidget(QFrame):
                         aligned = series.reindex(table_index)
                         df[indicator_name] = aligned.values
                     else:
-                        # Fallback: positional alignment (best-effort)
                         indicator_values = series.values
                         if len(indicator_values) >= table_len:
                             df[indicator_name] = indicator_values[:table_len]
@@ -338,51 +342,8 @@ class MiddlePaneWidget(QFrame):
                 except Exception as e:
                     k2_logger.warning(f"Could not align indicator {indicator_name}: {e}", "MIDDLE_PANE")
         
-        # Convert to rows and columns for table widget
-        rows = df.values.tolist()
-        columns = list(df.columns)
-        
-        # Set up table
-        self.data_table.setRowCount(len(rows))
-        self.data_table.setColumnCount(len(columns))
-        self.data_table.setHorizontalHeaderLabels(columns)
-        
-        # Populate table
-        for i, row in enumerate(rows):
-            for j, value in enumerate(row):
-                col_name = columns[j]
-                
-                # Format value based on column type
-                if pd.isna(value):
-                    text = ""
-                elif col_name in ['Open', 'High', 'Low', 'Close', 'VWAP']:
-                    try:
-                        text = f"{float(value):.2f}"
-                    except:
-                        text = str(value)
-                elif col_name == 'Volume':
-                    try:
-                        text = f"{int(value):,}"
-                    except:
-                        text = str(value)
-                elif col_name in self.active_indicators:
-                    # Format indicator values
-                    try:
-                        if isinstance(value, (int, np.integer)):
-                            text = f"{value:,}"
-                        elif isinstance(value, (float, np.floating)):
-                            if abs(value) < 10000 and abs(value) > 0.01:
-                                text = f"{value:.2f}"
-                            else:
-                                text = f"{value:.4f}"
-                        else:
-                            text = str(value)
-                    except:
-                        text = str(value)
-                else:
-                    text = str(value)
-                
-                self.data_table.setItem(i, j, QTableWidgetItem(text))
+        # Delegate display to the DataTabsWidget (Tab 1 – Current Data)
+        self.data_tabs.load_current_data(df, self.active_indicators)
     
     def add_indicator(self, indicator_name: str, indicator_data: pd.Series, color: str = '#ffff00'):
         """
@@ -500,12 +461,12 @@ class MiddlePaneWidget(QFrame):
             self.chart_widget.deleteLater()
             self.chart_widget = None
         
-        # Clean up table
-        if self.data_table:
-            self.data_table.clear()
-            self.data_table.setParent(None)
-            self.data_table.deleteLater()
-            self.data_table = None
+        # Clean up tabbed data widget
+        if self.data_tabs:
+            self.data_tabs.cleanup()
+            self.data_tabs.setParent(None)
+            self.data_tabs.deleteLater()
+            self.data_tabs = None
         
         # Clean up controls and splitter
         if self.controls_bar:
@@ -616,10 +577,64 @@ class MiddlePaneWidget(QFrame):
             }
         """)
     
+    # ── Tab data persistence (called by analysis page) ──────────────
+
+    def persist_tab_data(self, table_name: str):
+        """Save Tab 2 (forecast) and Tab 3 (model workspace) to the DB."""
+        if not self.data_tabs:
+            return
+        from k2_quant.utilities.data.db_manager import db_manager
+        try:
+            fc = self.data_tabs.serialise_forecast()
+            if fc:
+                db_manager.save_tab_data(f"forecast:{table_name}", fc)
+
+            wm = self.data_tabs.get_working_data('model')
+            ws = DataTabsWidget.serialise_working(wm)
+            if ws:
+                db_manager.save_tab_data(f"workspace:{table_name}", ws)
+
+            wg = self.data_tabs.get_working_data('global')
+            gs = DataTabsWidget.serialise_working(wg)
+            if gs:
+                db_manager.save_tab_data("workspace:global", gs)
+
+            k2_logger.info(f"Tab data persisted for {table_name}", "MIDDLE_PANE")
+        except Exception as e:
+            k2_logger.error(f"Failed to persist tab data: {e}", "MIDDLE_PANE")
+
+    def restore_tab_data(self, table_name: str):
+        """Restore Tab 2 and Tab 3 from the DB."""
+        if not self.data_tabs:
+            return
+        from k2_quant.utilities.data.db_manager import db_manager
+        try:
+            fc = db_manager.load_tab_data(f"forecast:{table_name}")
+            if fc:
+                self.data_tabs.restore_forecast(fc)
+
+            wm = db_manager.load_tab_data(f"workspace:{table_name}")
+            if wm:
+                df_m = DataTabsWidget.deserialise_working(wm)
+                if df_m is not None:
+                    self.data_tabs.set_working_data('model', df_m)
+
+            wg = db_manager.load_tab_data("workspace:global")
+            if wg:
+                df_g = DataTabsWidget.deserialise_working(wg)
+                if df_g is not None:
+                    self.data_tabs.set_working_data('global', df_g)
+
+            k2_logger.info(f"Tab data restored for {table_name}", "MIDDLE_PANE")
+        except Exception as e:
+            k2_logger.error(f"Failed to restore tab data: {e}", "MIDDLE_PANE")
+
     def cleanup(self):
         """Cleanup resources"""
         if self.chart_widget:
             self.chart_widget.cleanup()
+        if self.data_tabs:
+            self.data_tabs.cleanup()
         self.current_data = None
         self.current_metadata = None
         self.current_table_name = None

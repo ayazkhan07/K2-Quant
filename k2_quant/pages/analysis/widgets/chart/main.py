@@ -826,6 +826,7 @@ class ChartWidget(QWidget):
         self.indicator_panes = {}
         self.indicator_overlays = {}
         self._indicator_full_data = {}
+        self._forecast_lines = {}
         self.drawings = []
         
         # UI element references
@@ -1422,22 +1423,24 @@ class ChartWidget(QWidget):
         
         # Set limits with appropriate padding
         x_max = len(self.data) - 1
+        forecast_extra = 1500
+        x_max_with_forecast = x_max + forecast_extra
         y_min = max(0, y_min * 0.9)  # 10% padding below (but never negative)
         y_max = y_max * 1.2  # 20% padding above (not 2x!)
         
         # Set pyqtgraph hard limits generously; our _clamp_x/_clamp_y do the real work
-        overscroll_x = x_max * 0.5
+        overscroll_x = x_max_with_forecast * 0.25
         overscroll_y = (y_max - y_min) * 0.5
         vb.setLimits(
             xMin=-overscroll_x,
-            xMax=x_max + overscroll_x,
+            xMax=x_max_with_forecast + overscroll_x,
             yMin=max(0, y_min - overscroll_y),
             yMax=y_max + overscroll_y
         )
         
-        # Store data boundaries in ViewBox for clamping
+        # Store data boundaries in ViewBox for clamping (includes forecast space)
         if isinstance(vb, DiscreteViewBox):
-            vb.data_x_max = x_max
+            vb.data_x_max = x_max_with_forecast
             vb.data_y_min = y_min
             vb.data_y_max = y_max
             
@@ -1531,9 +1534,27 @@ class ChartWidget(QWidget):
         self.x_values = np.arange(len(self.data), dtype=np.float32)
         if self.date_column in self.data.columns:
             self._dt_cache = self.data[self.date_column].values.astype('datetime64[ns]')
+            self._extend_dt_cache()
         else:
             self._dt_cache = None
         
+    def _extend_dt_cache(self, extra_points: int = 1500):
+        """Extrapolate future dates so the x-axis shows labels beyond the last bar."""
+        cache = self._dt_cache
+        if cache is None or len(cache) < 2:
+            return
+        n = min(50, len(cache) - 1)
+        total_span = cache[-1] - cache[-1 - n]
+        avg_delta = total_span / n
+        if avg_delta <= np.timedelta64(0):
+            return
+        base = cache[-1]
+        extension = np.array(
+            [base + avg_delta * (i + 1) for i in range(extra_points)],
+            dtype='datetime64[ns]',
+        )
+        self._dt_cache = np.concatenate([cache, extension])
+
     def _resample_df(self, df: pd.DataFrame) -> pd.DataFrame:
         """Aggregate *df* into coarser bars using dt.floor() for grouping.
         Preserves real trading timestamps (last in each bar) so the X-axis
@@ -2116,8 +2137,10 @@ class ChartWidget(QWidget):
     # -- axis rects (cached per call for readability) --------------------
 
     def _axis_rects(self):
-        y = self.y_axis
-        x = self.x_axis
+        y = getattr(self, 'y_axis', None)
+        x = getattr(self, 'x_axis', None)
+        if y is None or x is None:
+            return QRectF(), QRectF()
         y_rect = QRectF(y.pos(), QPointF(y.pos().x() + y._width, y.pos().y() + y._height))
         x_rect = QRectF(x.pos(), QPointF(x.pos().x() + x._width, x.pos().y() + x._height))
         return y_rect, x_rect
@@ -2252,7 +2275,9 @@ class ChartWidget(QWidget):
                 self.main_plot.removeItem(overlay)
         self.indicator_overlays.clear()
         self._indicator_full_data.clear()
-        
+
+        self.clear_forecast_data()
+
         # Remove indicator panes
         for indicator_name in list(self.indicator_panes.keys()):
             self.remove_indicator_pane(indicator_name)
@@ -2329,7 +2354,80 @@ class ChartWidget(QWidget):
             del self.indicator_overlays[indicator_name]
             self._indicator_full_data.pop(indicator_name, None)
             k2_logger.info(f"Removed indicator: {indicator_name}", "CHART")
-            
+
+    # ── Forecast (dashed) lines ──────────────────────────────────────
+
+    def add_forecast_data(self, forecast_data: dict):
+        """Render dashed OHLC lines for each forecast set.
+
+        Args:
+            forecast_data: {set_index: DataFrame} where DataFrame columns
+                           are Open_Px, High_Px, Low_Px, Close_Px and rows
+                           are the projected bars.
+        """
+        self.clear_forecast_data()
+        if not forecast_data or self.data is None or len(self.data) == 0:
+            return
+
+        base_x = len(self.data)
+
+        for set_idx, df in forecast_data.items():
+            for ohlc_col in ['Open', 'High', 'Low', 'Close']:
+                src_col = f"{ohlc_col}_P{set_idx}"
+                if src_col not in df.columns:
+                    continue
+                series = df[src_col].dropna()
+                if series.empty:
+                    continue
+
+                color = OHLC_COLORS.get(ohlc_col, '#ffffff')
+                y = np.array(series.values, dtype=np.float64)
+
+                y_start = np.empty(len(y) + 1, dtype=np.float64)
+                x_start = np.empty(len(y) + 1, dtype=np.float64)
+
+                last_val = None
+                if ohlc_col in self.data.columns:
+                    col_vals = self.data[ohlc_col].dropna()
+                    if len(col_vals) > 0:
+                        last_val = float(col_vals.iloc[-1])
+
+                if last_val is not None:
+                    x_start[0] = base_x - 1
+                    y_start[0] = last_val
+                    x_start[1:] = np.arange(base_x, base_x + len(y), dtype=np.float64)
+                    y_start[1:] = y
+                else:
+                    x_start = np.arange(base_x, base_x + len(y), dtype=np.float64)
+                    y_start = y
+
+                plot_item = pg.PlotDataItem(
+                    x=x_start, y=y_start,
+                    pen=pg.mkPen(color=color, width=2,
+                                 style=Qt.PenStyle.DashLine),
+                    connect='finite',
+                )
+                self.main_plot.addItem(plot_item)
+                key = f"P{set_idx}_{ohlc_col}"
+                self._forecast_lines[key] = plot_item
+
+        total = len(self._forecast_lines)
+        if total:
+            k2_logger.info(f"Added {total} forecast line(s) to chart", "CHART")
+
+    def clear_forecast_data(self):
+        """Remove all forecast (dashed) lines from the chart."""
+        for key, item in list(self._forecast_lines.items()):
+            if item.scene():
+                self.main_plot.removeItem(item)
+        self._forecast_lines.clear()
+
+    def toggle_forecast_line(self, key: str, visible: bool):
+        """Show/hide a single forecast line by key (e.g. 'P1_Open')."""
+        item = self._forecast_lines.get(key)
+        if item:
+            item.setVisible(visible)
+
     def add_indicator_pane(self, indicator_name, data, chart_type='line', color='#ffffff'):
         """
         Add indicator in a separate pane below the main chart.

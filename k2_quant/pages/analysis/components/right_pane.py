@@ -66,6 +66,7 @@ class RightPaneWidget(QFrame):
     strategy_generated = pyqtSignal(str, str)  # name, code
     projection_requested = pyqtSignal(dict)  # parameters
     data_modified = pyqtSignal()  # emitted when the agent modifies table data
+    tab_writes_ready = pyqtSignal(list)  # emitted when agent routes data to Tab 2/3
     
     def __init__(self):
         super().__init__()
@@ -367,6 +368,8 @@ class RightPaneWidget(QFrame):
 
             if result.get('data_modified'):
                 self.data_modified.emit()
+            if result.get('_tab_writes'):
+                self.tab_writes_ready.emit(result['_tab_writes'])
         else:
             error = result.get('error', 'Operation failed')
             self.stream_response(f"Unable to complete that request. {error}")
