@@ -1,18 +1,21 @@
 """
-Table Controller - Agent Loop Architecture
+Table Controller - Agent Loop Architecture (Persistent Engine)
 
 Implements an iterative agent loop where the LLM can:
 1. Execute SQL queries against the database
-2. Execute Python code against pandas DataFrames
-3. Inspect results and decide next steps
-4. Compose a final natural language response
+2. Execute Python code in a persistent namespace (variables survive across calls)
+3. Read/write the Working Data workspace directly
+4. Inspect results and decide next steps
+5. Compose a final natural language response
 
-The loop continues until the LLM provides a final text response
-or hits the maximum iteration limit.
+The Python environment persists for the duration of one execute_command() call,
+so computed variables, df modifications, and workspace state carry across
+successive run_python tool invocations within the same agent turn.
 """
 
 import json
 import re
+import requests
 from decimal import Decimal
 from typing import Dict, Any, Optional, List, Callable
 from datetime import datetime
@@ -29,7 +32,7 @@ MAX_AGENT_ITERATIONS = 15
 
 
 class TableController(QObject):
-    """Agent-loop driven table manipulation"""
+    """Agent-loop driven table manipulation with persistent Python engine."""
 
     operation_complete = pyqtSignal(dict)
     operation_failed = pyqtSignal(str)
@@ -45,8 +48,24 @@ class TableController(QObject):
         command: str,
         conversation_history: Optional[List[Dict[str, str]]] = None,
         step_callback: Optional[Callable[[str], None]] = None,
+        initial_workspace: Optional[Dict[str, pd.DataFrame]] = None,
     ) -> Dict[str, Any]:
-        """Run the agent loop: plan, tool, observe, repeat, respond."""
+        """Run the agent loop with a persistent Python namespace.
+
+        Parameters
+        ----------
+        table : str
+            Database table backing the current model.
+        command : str
+            User message / instruction.
+        conversation_history : list, optional
+            Prior chat messages for context.
+        step_callback : callable, optional
+            Called with a short string for each intermediate tool step.
+        initial_workspace : dict, optional
+            ``{'model': DataFrame, 'global': DataFrame}`` — current state of
+            the Working Data tab so the AI can read what is already displayed.
+        """
         try:
             api_key = api_config.openai_api_key
             if not api_key:
@@ -55,13 +74,13 @@ class TableController(QObject):
             from openai import OpenAI
             client = OpenAI(api_key=api_key)
 
-            system_prompt = self._build_system_prompt(table)
+            system_prompt = self._build_system_prompt(table, initial_workspace)
             tools = self._build_tools(table)
 
             messages: list = [{"role": "system", "content": system_prompt}]
 
             if conversation_history:
-                for msg in conversation_history[-20:]:
+                for msg in conversation_history[-200:]:
                     role = msg.get("role", "user")
                     content = msg.get("content", "")
                     if role in ("user", "assistant") and content:
@@ -71,16 +90,130 @@ class TableController(QObject):
 
             data_modified = False
             tab_writes: list = []
+
+            # ── Persistent engine: load data & workspace once ────────
+            df = db_manager.fetch_dataframe(table)
+
+            workspace: Dict[str, Dict[str, list]] = {'model': {}, 'global': {}}
+            if initial_workspace:
+                for scope in ('model', 'global'):
+                    ws_df = initial_workspace.get(scope)
+                    if ws_df is not None and not ws_df.empty:
+                        workspace[scope] = {
+                            str(col): ws_df[col].tolist()
+                            for col in ws_df.columns
+                        }
+
+            # ── Helper closures ──────────────────────────────────────
+
+            def _clean_values(values):
+                if isinstance(values, (pd.Series, np.ndarray)):
+                    values = values.tolist()
+                out = []
+                for v in values:
+                    if v is None:
+                        out.append(None)
+                    elif isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
+                        out.append(None)
+                    else:
+                        out.append(v)
+                return out
+
+            write_verifications: list = []
+
+            def _to_working(column_name, values, scope='model'):
+                cleaned = _clean_values(values)
+                workspace.setdefault(scope, {})[str(column_name)] = cleaned
+                tab_writes.append({
+                    "type": "working",
+                    "column_name": str(column_name),
+                    "values": cleaned,
+                    "scope": str(scope),
+                })
+                preview_n = min(10, len(cleaned))
+                write_verifications.append({
+                    "column": str(column_name),
+                    "scope": str(scope),
+                    "total_values": len(cleaned),
+                    "first_values": cleaned[:preview_n],
+                })
+
+            def _read_working(scope='model', columns=None, head=None, tail=None):
+                cols = workspace.get(scope, {})
+                if not cols:
+                    return pd.DataFrame()
+                max_len = max(len(v) for v in cols.values())
+                padded = {}
+                target_cols = columns if columns else list(cols.keys())
+                for k in target_cols:
+                    if k in cols:
+                        v = cols[k]
+                        padded[k] = v + [None] * (max_len - len(v))
+                ws_df = pd.DataFrame(padded)
+                if head is not None:
+                    ws_df = ws_df.head(head)
+                if tail is not None:
+                    ws_df = ws_df.tail(tail)
+                return ws_df
+
+            def _delete_working(column_name, scope='model'):
+                workspace.get(scope, {}).pop(str(column_name), None)
+                tab_writes.append({
+                    "type": "delete_working",
+                    "column_name": str(column_name),
+                    "scope": str(scope),
+                })
+
+            def _to_forecast(set_index, open_values=None, high_values=None,
+                             low_values=None, close_values=None):
+                def _clean_forecast(vals):
+                    if vals is None:
+                        return None
+                    if isinstance(vals, (pd.Series, np.ndarray)):
+                        vals = vals.tolist()
+                    out = []
+                    for v in vals:
+                        if v is None:
+                            out.append(None)
+                        elif isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
+                            out.append(None)
+                        else:
+                            out.append(float(v))
+                    return out[:500]
+                tab_writes.append({
+                    "type": "forecast",
+                    "set_index": int(set_index),
+                    "open_values": _clean_forecast(open_values),
+                    "high_values": _clean_forecast(high_values),
+                    "low_values": _clean_forecast(low_values),
+                    "close_values": _clean_forecast(close_values),
+                })
+
+            # Persistent namespace shared across all run_python calls
+            exec_globals = {
+                "df": df,
+                "pd": pd,
+                "np": np,
+                "datetime": datetime,
+                "result": None,
+                "to_working": _to_working,
+                "read_working": _read_working,
+                "to_forecast": _to_forecast,
+                "delete_working": _delete_working,
+                "_write_verifications": write_verifications,
+            }
+
+            # ── Agent loop ───────────────────────────────────────────
             iterations = 0
 
             while iterations < MAX_AGENT_ITERATIONS:
                 iterations += 1
 
                 response = client.chat.completions.create(
-                    model="gpt-4o",
+                    model="o3",
                     messages=messages,
                     tools=tools,
-                    temperature=0.1,
+                    temperature=1,
                 )
 
                 choice = response.choices[0]
@@ -103,14 +236,20 @@ class TableController(QObject):
                         if fn_name == "run_sql":
                             tool_result = self._tool_run_sql(fn_args.get("sql", ""))
                         elif fn_name == "run_python":
-                            tool_result = self._tool_run_python(table, fn_args.get("code", ""), tab_writes)
+                            tool_result = self._tool_run_python(
+                                table, fn_args.get("code", ""), exec_globals)
                             if tool_result.get("_data_modified"):
                                 data_modified = True
+                        elif fn_name == "run_web_search":
+                            tool_result = self._tool_run_web_search(
+                                fn_args.get("query", ""),
+                                fn_args.get("max_results", 5))
                         else:
                             tool_result = {"error": f"Unknown tool: {fn_name}"}
 
                         result_str = json.dumps(
-                            {k: v for k, v in tool_result.items() if not k.startswith("_")},
+                            {k: v for k, v in tool_result.items()
+                             if not k.startswith("_")},
                             default=str,
                             indent=2,
                         )
@@ -118,7 +257,7 @@ class TableController(QObject):
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call.id,
-                            "content": result_str[:8000],
+                            "content": result_str[:50000],
                         })
 
                     continue
@@ -137,7 +276,8 @@ class TableController(QObject):
 
             result = {
                 "success": True,
-                "display_message": "I've completed my analysis. Please check the intermediate steps above.",
+                "display_message": "I've completed my analysis. "
+                                   "Please check the intermediate steps above.",
                 "data_modified": data_modified,
                 "iterations": iterations,
                 "_tab_writes": tab_writes,
@@ -153,8 +293,9 @@ class TableController(QObject):
 
     # ── system prompt ──────────────────────────────────────────────
 
-    def _build_system_prompt(self, table: str) -> str:
-        """Build system prompt with schema, sample data, and summary stats."""
+    def _build_system_prompt(self, table: str,
+                             initial_workspace: Optional[Dict] = None) -> str:
+        """Build system prompt with schema, sample data, summary stats, and workspace state."""
         try:
             with db_manager.get_connection() as conn:
                 with db_manager.get_cursor(conn) as cur:
@@ -224,7 +365,7 @@ SUMMARY STATISTICS:
 {stats_text}
 
 INSTRUCTIONS:
-- You have two tools: run_sql (execute SQL against PostgreSQL) and run_python (execute Python/pandas code).
+- You have three tools: run_sql (execute SQL against PostgreSQL), run_python (execute Python/pandas code), and run_web_search (search the web for news, events, and qualitative data).
 - Break complex tasks into steps. After each step, inspect the result before continuing.
 - Validate your results. If a count seems implausible given the summary stats, double-check.
 - When finished, provide a clear natural-language answer summarizing what you found or did.
@@ -251,9 +392,25 @@ SQL NOTES:
 PYTHON NOTES:
 - 'df' is the full table as a pandas DataFrame.
 - 'pd', 'np', 'datetime' are available.
+- The Python environment is PERSISTENT across tool calls within this conversation turn.
+  Variables, computed results, and workspace data survive between run_python calls.
+  You do NOT need to re-derive values that were computed in a previous step.
 - Only numeric columns (float/int) will be persisted. Non-numeric new columns are ignored.
 - The DataFrame must always retain a 'timestamp' column.
 - To return a computed value without modifying the table, assign to 'result' variable.
+
+VERIFICATION:
+- After every to_working() call, the system automatically returns a verification summary
+  showing the column name and the first values written. ALWAYS inspect this verification
+  to confirm the data looks correct before reporting success to the user.
+- If the verification values look wrong, investigate and fix BEFORE moving on.
+
+WEB SEARCH NOTES:
+- Use run_web_search for qualitative analysis: news events, economic data, Fed decisions,
+  geopolitical events, earnings, or any context requiring real-world information.
+- Be specific in queries — include dates, ticker symbols, event names for best results.
+- Results include source URLs. ALWAYS cite sources when presenting qualitative analysis.
+- For historical date analysis, search for events around the specific date.
 
 TAB HELPER FUNCTIONS (available inside run_python):
 - to_working(column_name, values, scope='model')
@@ -262,6 +419,16 @@ TAB HELPER FUNCTIONS (available inside run_python):
     values: list, Series, or ndarray of values.
     scope: 'model' (per-model workspace) or 'global' (shared workspace).
     All values will be displayed; no row limit.
+
+- read_working(scope='model', columns=None, head=None, tail=None)
+    Read the current state of the Working Data tab (Tab 3) as a pandas DataFrame.
+    scope: 'model' or 'global'.
+    columns: optional list of column names to include (None = all columns).
+    head: optional int, return only the first N rows.
+    tail: optional int, return only the last N rows.
+    Returns a DataFrame with the current workspace contents.
+    IMPORTANT: Always use read_working() to answer questions about workspace data
+    instead of re-querying the database.
 
 - to_forecast(set_index, open_values=None, high_values=None, low_values=None, close_values=None)
     Write price projections to the Forecast Data tab (Tab 2).
@@ -272,7 +439,9 @@ TAB HELPER FUNCTIONS (available inside run_python):
 - delete_working(column_name, scope='model')
     Remove a column from the Working Data tab (Tab 3).
     column_name: exact name of the column to delete.
-    scope: 'model' or 'global'."""
+    scope: 'model' or 'global'.
+
+{self._format_workspace_snapshot(initial_workspace)}"""
 
         except Exception as e:
             k2_logger.error(f"Failed to build system prompt: {e}", "TABLE_CTRL")
@@ -311,9 +480,10 @@ TAB HELPER FUNCTIONS (available inside run_python):
                 "function": {
                     "name": "run_python",
                     "description": (
-                        f"Execute Python code on the '{table}' data. The full table is loaded "
-                        f"as 'df' (pandas DataFrame). 'pd', 'np', 'datetime' are available. "
-                        f"Changes to df are persisted back to the database (numeric columns only). "
+                        f"Execute Python code on the '{table}' data. The environment "
+                        f"is persistent — variables, 'df', and workspace state survive "
+                        f"between calls. 'pd', 'np', 'datetime' are available. "
+                        f"Use read_working()/to_working() for workspace I/O. "
                         f"Assign to 'result' variable to return a computed value."
                     ),
                     "parameters": {
@@ -332,6 +502,40 @@ TAB HELPER FUNCTIONS (available inside run_python):
                             },
                         },
                         "required": ["code", "purpose"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "run_web_search",
+                    "description": (
+                        "Search the web for real-time information using Tavily. "
+                        "Use this for qualitative research: news events, economic data, "
+                        "Fed announcements, geopolitical events, earnings reports, "
+                        "or any context that requires current or historical web data. "
+                        "Returns sourced results with URLs for citation."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": (
+                                    "The search query. Be specific — include dates, "
+                                    "ticker symbols, or event names for best results."
+                                ),
+                            },
+                            "purpose": {
+                                "type": "string",
+                                "description": "One-line explanation of what this search is for",
+                            },
+                            "max_results": {
+                                "type": "integer",
+                                "description": "Number of results to return (default 5, max 10)",
+                            },
+                        },
+                        "required": ["query", "purpose"],
                     },
                 },
             },
@@ -378,81 +582,22 @@ TAB HELPER FUNCTIONS (available inside run_python):
         except Exception as e:
             return {"error": str(e), "type": "error"}
 
-    def _tool_run_python(self, table: str, code: str, tab_writes: list = None) -> Dict[str, Any]:
-        """Execute Python and return structured result for the LLM."""
+    def _tool_run_python(self, table: str, code: str,
+                         exec_globals: dict) -> Dict[str, Any]:
+        """Execute Python code in the persistent namespace."""
         try:
-            df = db_manager.fetch_dataframe(table)
-            original = df.copy(deep=True)
-            original_cols = set(df.columns)
-            original_len = len(df)
+            df_before = exec_globals["df"].copy(deep=True)
+            original_cols = set(df_before.columns)
+            original_len = len(df_before)
 
-            if tab_writes is None:
-                tab_writes = []
+            exec_globals["result"] = None
 
-            def _to_working(column_name, values, scope='model'):
-                if isinstance(values, (pd.Series, np.ndarray)):
-                    values = values.tolist()
-                cleaned = []
-                for v in values:
-                    if v is None:
-                        cleaned.append(None)
-                    elif isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
-                        cleaned.append(None)
-                    else:
-                        cleaned.append(v)
-                tab_writes.append({
-                    "type": "working",
-                    "column_name": str(column_name),
-                    "values": cleaned,
-                    "scope": str(scope),
-                })
-
-            def _to_forecast(set_index, open_values=None, high_values=None,
-                             low_values=None, close_values=None):
-                def _clean(vals):
-                    if vals is None:
-                        return None
-                    if isinstance(vals, (pd.Series, np.ndarray)):
-                        vals = vals.tolist()
-                    out = []
-                    for v in vals:
-                        if v is None:
-                            out.append(None)
-                        elif isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
-                            out.append(None)
-                        else:
-                            out.append(float(v))
-                    return out[:500]
-                tab_writes.append({
-                    "type": "forecast",
-                    "set_index": int(set_index),
-                    "open_values": _clean(open_values),
-                    "high_values": _clean(high_values),
-                    "low_values": _clean(low_values),
-                    "close_values": _clean(close_values),
-                })
-
-            def _delete_working(column_name, scope='model'):
-                tab_writes.append({
-                    "type": "delete_working",
-                    "column_name": str(column_name),
-                    "scope": str(scope),
-                })
-
-            exec_globals = {
-                "df": df,
-                "pd": pd,
-                "np": np,
-                "datetime": datetime,
-                "result": None,
-                "to_working": _to_working,
-                "to_forecast": _to_forecast,
-                "delete_working": _delete_working,
-            }
             exec(code, exec_globals)
 
-            df_result = exec_globals.get("df", df)
+            df_result = exec_globals.get("df", df_before)
             explicit_result = exec_globals.get("result")
+
+            exec_globals["df"] = df_result
 
             data_modified = False
             modifications: List[str] = []
@@ -466,7 +611,7 @@ TAB HELPER FUNCTIONS (available inside run_python):
                     }
                 raise ValueError("DataFrame must contain 'timestamp' column")
 
-            original_ts = set(original["timestamp"].tolist())
+            original_ts = set(df_before["timestamp"].tolist())
             result_ts = set(df_result["timestamp"].tolist())
             new_ts = sorted(result_ts - original_ts)
             deleted_ts = sorted(original_ts - result_ts)
@@ -518,9 +663,9 @@ TAB HELPER FUNCTIONS (available inside run_python):
                     or pd.api.types.is_integer_dtype(df_result[col])
                 ):
                     continue
-                if col in original.columns:
+                if col in df_before.columns:
                     try:
-                        if original[col].equals(df_result[col]):
+                        if df_before[col].equals(df_result[col]):
                             continue
                     except Exception:
                         pass
@@ -545,12 +690,95 @@ TAB HELPER FUNCTIONS (available inside run_python):
             if skipped_cols:
                 resp["skipped_non_numeric_columns"] = skipped_cols
 
+            verifications = exec_globals.get("_write_verifications", [])
+            if verifications:
+                pending = list(verifications)
+                verifications.clear()
+                resp["workspace_writes_verification"] = pending
+
             return resp
 
         except Exception as e:
             return {"error": str(e), "type": "error", "_data_modified": False}
 
+    # ── web search executor ─────────────────────────────────────────
+
+    def _tool_run_web_search(self, query: str,
+                             max_results: int = 5) -> Dict[str, Any]:
+        """Execute a Tavily web search and return structured results."""
+        try:
+            tavily_key = api_config.tavily_api_key
+            if not tavily_key:
+                return {"error": "TAVILY_API_KEY not configured", "type": "error"}
+
+            max_results = min(max(1, max_results), 10)
+
+            resp = requests.post(
+                "https://api.tavily.com/search",
+                json={
+                    "api_key": tavily_key,
+                    "query": query,
+                    "max_results": max_results,
+                    "include_answer": True,
+                    "search_depth": "advanced",
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            results = []
+            for r in data.get("results", []):
+                results.append({
+                    "title": r.get("title", ""),
+                    "url": r.get("url", ""),
+                    "content": r.get("content", "")[:1500],
+                })
+
+            return {
+                "type": "web_search",
+                "query": query,
+                "answer": data.get("answer", ""),
+                "results": results,
+                "result_count": len(results),
+            }
+        except requests.exceptions.Timeout:
+            return {"error": "Web search timed out after 30s", "type": "error"}
+        except requests.exceptions.RequestException as e:
+            return {"error": f"Web search failed: {e}", "type": "error"}
+        except Exception as e:
+            return {"error": f"Web search error: {e}", "type": "error"}
+
     # ── helpers ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _format_workspace_snapshot(initial_workspace: Optional[Dict] = None) -> str:
+        """Format current workspace state for inclusion in the system prompt."""
+        if not initial_workspace:
+            return "CURRENT WORKSPACE STATE: Empty (no columns in Working Data tab)."
+
+        parts = ["CURRENT WORKSPACE STATE (Tab 3 — Working Data):"]
+        for scope in ('model', 'global'):
+            ws_df = initial_workspace.get(scope)
+            if ws_df is None or (hasattr(ws_df, 'empty') and ws_df.empty):
+                continue
+            if isinstance(ws_df, pd.DataFrame):
+                cols = list(ws_df.columns)
+                nrows = len(ws_df)
+                parts.append(f"\n  [{scope.upper()}] {nrows} rows, columns: {cols}")
+                head = ws_df.head(5).to_string(index=False, max_colwidth=30)
+                parts.append(f"  First 5 rows:\n{head}")
+                if nrows > 5:
+                    tail = ws_df.tail(3).to_string(index=False, max_colwidth=30)
+                    parts.append(f"  Last 3 rows:\n{tail}")
+
+        if len(parts) == 1:
+            return "CURRENT WORKSPACE STATE: Empty (no columns in Working Data tab)."
+        parts.append(
+            "\nIMPORTANT: The workspace already contains the columns listed above. "
+            "Use read_working() to access this data. Do NOT recompute columns that "
+            "already exist unless the user explicitly asks you to.")
+        return "\n".join(parts)
 
     def _serialize(self, value: Any) -> Any:
         """Make a value JSON-safe."""

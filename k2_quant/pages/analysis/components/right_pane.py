@@ -35,11 +35,13 @@ class CommandWorker(QThread):
         table_name: str,
         command_text: str,
         conversation_history: Optional[List[Dict[str, str]]] = None,
+        initial_workspace: Optional[Dict] = None,
     ):
         super().__init__()
         self.table_name = table_name
         self.command_text = command_text
         self.conversation_history = conversation_history or []
+        self.initial_workspace = initial_workspace
 
     def run(self):
         try:
@@ -50,6 +52,7 @@ class CommandWorker(QThread):
                 self.command_text,
                 self.conversation_history,
                 step_callback=self._on_step,
+                initial_workspace=self.initial_workspace,
             )
             self.result_ready.emit(result)
         except Exception as e:
@@ -81,6 +84,9 @@ class RightPaneWidget(QFrame):
         self.streaming_text = ""
         self.streaming_index = 0
         self.math_formatter = MathFormatter(use_block_markers=True)
+        self.workspace_provider: Optional[callable] = None
+        self.save_chat_callback: Optional[callable] = None
+        self.load_chat_callback: Optional[callable] = None
 
         # Per-model chat persistence: {table_name: {'html': str, 'history': list}}
         self._chat_store: Dict[str, Dict[str, Any]] = {}
@@ -96,10 +102,19 @@ class RightPaneWidget(QFrame):
         layout.setSpacing(10)
         self.setLayout(layout)
         
-        # Header
+        # Header row
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
         ai_label = QLabel("CONVERSATIONAL AI")
         ai_label.setObjectName("sectionTitle")
-        layout.addWidget(ai_label)
+        header_row.addWidget(ai_label)
+        header_row.addStretch()
+        self.clear_btn = QPushButton("Clear")
+        self.clear_btn.setObjectName("clearChatBtn")
+        self.clear_btn.setFixedHeight(24)
+        self.clear_btn.clicked.connect(self.clear_chat)
+        header_row.addWidget(self.clear_btn)
+        layout.addLayout(header_row)
         
         # Chat display
         self.chat_display = QTextEdit()
@@ -209,7 +224,15 @@ class RightPaneWidget(QFrame):
             if h.get("role") in ("user", "assistant") and h.get("content")
         ][:-1]
 
-        self.worker = CommandWorker(table_name, message, history_for_agent)
+        initial_workspace = None
+        if self.workspace_provider:
+            try:
+                initial_workspace = self.workspace_provider()
+            except Exception:
+                pass
+
+        self.worker = CommandWorker(
+            table_name, message, history_for_agent, initial_workspace)
         self.worker.result_ready.connect(self._on_worker_result)
         self.worker.error_occurred.connect(self._on_worker_error)
         self.worker.step_update.connect(self._on_step_update)
@@ -409,15 +432,37 @@ class RightPaneWidget(QFrame):
         new_table = context.get('table_name') if context else None
 
         if self._active_table:
-            self._chat_store[self._active_table] = {
+            chat_state = {
                 'html': self.chat_display.toHtml(),
                 'history': list(self.conversation_history),
             }
+            self._chat_store[self._active_table] = chat_state
+            if self.save_chat_callback:
+                try:
+                    self.save_chat_callback(
+                        self._active_table,
+                        chat_state['html'],
+                        chat_state['history'])
+                except Exception:
+                    pass
 
         if new_table and new_table in self._chat_store:
             saved = self._chat_store[new_table]
             self.chat_display.setHtml(saved['html'])
             self.conversation_history = list(saved['history'])
+        elif new_table and self.load_chat_callback:
+            try:
+                saved = self.load_chat_callback(new_table)
+                if saved and saved.get('html'):
+                    self.chat_display.setHtml(saved['html'])
+                    self.conversation_history = list(saved.get('history', []))
+                    self._chat_store[new_table] = saved
+                else:
+                    self.chat_display.clear()
+                    self.conversation_history.clear()
+            except Exception:
+                self.chat_display.clear()
+                self.conversation_history.clear()
         else:
             self.chat_display.clear()
             self.conversation_history.clear()
@@ -426,11 +471,16 @@ class RightPaneWidget(QFrame):
         self.current_context = context
     
     def clear_chat(self):
-        """Clear chat history for the active model"""
+        """Clear chat history for the active model and persist the empty state."""
         self.chat_display.clear()
         self.conversation_history.clear()
         if self._active_table and self._active_table in self._chat_store:
             del self._chat_store[self._active_table]
+        if self._active_table and self.save_chat_callback:
+            try:
+                self.save_chat_callback(self._active_table, '', [])
+            except Exception:
+                pass
         k2_logger.info("Chat cleared", "AI_CHAT")
     
     # ── auto-growing input ───────────────────────────────────────────
@@ -521,12 +571,34 @@ class RightPaneWidget(QFrame):
             #sendBtn:hover {
                 background-color: #2a2a2a;
             }
+            
+            #clearChatBtn {
+                background-color: transparent;
+                color: #666;
+                border: 1px solid #2a2a2a;
+                padding: 2px 10px;
+                border-radius: 3px;
+                font-size: 11px;
+            }
+            
+            #clearChatBtn:hover {
+                background-color: #2a2a2a;
+                color: #fff;
+            }
         """)
     
     def cleanup(self):
-        """Cleanup resources"""
+        """Cleanup resources, persisting active chat before clearing."""
         if self.streaming_timer:
             self.streaming_timer.stop()
+        if self._active_table and self.save_chat_callback:
+            try:
+                self.save_chat_callback(
+                    self._active_table,
+                    self.chat_display.toHtml(),
+                    list(self.conversation_history))
+            except Exception:
+                pass
         self.chat_display.clear()
         self.conversation_history.clear()
         self._chat_store.clear()

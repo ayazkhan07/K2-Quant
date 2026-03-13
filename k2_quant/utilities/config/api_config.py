@@ -104,6 +104,10 @@ class APIConfig:
     def github_token(self) -> Optional[str]:
         return os.getenv('GITHUB_TOKEN')
 
+    @property
+    def tavily_api_key(self) -> Optional[str]:
+        return os.getenv('TAVILY_API_KEY')
+
     def validate_keys(self) -> Dict[str, bool]:
         return {
             'polygon': bool(self.polygon_api_key),
@@ -113,6 +117,7 @@ class APIConfig:
             'fred': bool(self.fred_api_key),
             'grok': bool(self.grok_api_key),
             'github': bool(self.github_token),
+            'tavily': bool(self.tavily_api_key),
         }
 
     def get_polygon_config(self) -> Dict[str, str]:

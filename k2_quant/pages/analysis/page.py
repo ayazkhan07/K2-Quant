@@ -189,6 +189,9 @@ class AnalysisPageWidget(QWidget):
         self.right_pane.projection_requested.connect(self.on_projection_requested_from_ai)
         self.right_pane.data_modified.connect(self._on_ai_data_modified)
         self.right_pane.tab_writes_ready.connect(self._on_tab_writes)
+        self.right_pane.workspace_provider = self._get_workspace_state
+        self.right_pane.save_chat_callback = self._save_chat
+        self.right_pane.load_chat_callback = self._load_chat
     
     def refresh_left_pane_data(self):
         """Refresh all data in the left pane"""
@@ -760,6 +763,26 @@ class AnalysisPageWidget(QWidget):
                 self.model_label.setText(f"Model: {self.current_model} ({total_count:,} records)")
         except Exception as e:
             k2_logger.error(f"Failed to refresh after AI data change: {e}", "ANALYSIS")
+
+    def _get_workspace_state(self) -> Optional[Dict]:
+        """Return current workspace DataFrames for the AI persistent engine."""
+        tabs = getattr(self.middle_pane, "data_tabs", None)
+        if tabs is None:
+            return None
+        result = {}
+        for scope in ('model', 'global'):
+            ws_df = tabs.get_working_data(scope)
+            if ws_df is not None and not ws_df.empty:
+                result[scope] = ws_df
+        return result if result else None
+
+    def _save_chat(self, table_name: str, html: str, history: list):
+        """Persist chat to the database."""
+        saved_models_manager.save_chat_history(table_name, html, history)
+
+    def _load_chat(self, table_name: str) -> Optional[Dict]:
+        """Load chat from the database."""
+        return saved_models_manager.get_chat_history(table_name)
 
     def _on_tab_writes(self, writes: list):
         """Route AI-generated data to the correct UI tabs."""

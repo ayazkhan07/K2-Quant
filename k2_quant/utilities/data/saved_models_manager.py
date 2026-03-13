@@ -49,18 +49,20 @@ class SavedModelsManager:
 							created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 						)
 					""")
-					# Per-model UI state
-					cur.execute("""
-						CREATE TABLE IF NOT EXISTS model_state (
-							id SERIAL PRIMARY KEY,
-							table_name VARCHAR(255) UNIQUE NOT NULL,
-							indicators_json TEXT DEFAULT '{}',
-							active_strategy TEXT,
-							chart_range TEXT,
-							updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-						)
-					""")
-					conn.commit()
+				# Per-model UI state
+				cur.execute("""
+					CREATE TABLE IF NOT EXISTS model_state (
+						id SERIAL PRIMARY KEY,
+						table_name VARCHAR(255) UNIQUE NOT NULL,
+						indicators_json TEXT DEFAULT '{}',
+						active_strategy TEXT,
+						chart_range TEXT,
+						updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+					)
+				""")
+				cur.execute("ALTER TABLE model_state ADD COLUMN IF NOT EXISTS chat_html TEXT DEFAULT ''")
+				cur.execute("ALTER TABLE model_state ADD COLUMN IF NOT EXISTS chat_history_json TEXT DEFAULT '[]'")
+				conn.commit()
 			k2_logger.info("Saved models tables ready", "SAVED_MODELS")
 		except Exception as e:
 			k2_logger.error(f"Failed ensuring saved_models/model_state tables: {e}", "SAVED_MODELS")
@@ -383,6 +385,58 @@ class SavedModelsManager:
 		except Exception as e:
 			k2_logger.error(f"set_model_state failed: {e}", "SAVED_MODELS")
 			return False
+
+
+	# -------- Chat persistence APIs --------
+
+	def save_chat_history(self, table_name: str, html: str, history: list) -> bool:
+		"""Upsert chat HTML and conversation history for a model."""
+		try:
+			import json
+			with self.db.get_connection() as conn:
+				with self.db.get_cursor(conn) as cur:
+					cur.execute("""
+						INSERT INTO model_state (table_name, chat_html, chat_history_json, updated_at)
+						VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
+						ON CONFLICT (table_name) DO UPDATE SET
+						  chat_html = EXCLUDED.chat_html,
+						  chat_history_json = EXCLUDED.chat_history_json,
+						  updated_at = CURRENT_TIMESTAMP
+					""", (
+						table_name,
+						html or '',
+						json.dumps(history or []),
+					))
+				conn.commit()
+			return True
+		except Exception as e:
+			k2_logger.error(f"save_chat_history failed: {e}", "SAVED_MODELS")
+			return False
+
+	def get_chat_history(self, table_name: str) -> Optional[Dict[str, Any]]:
+		"""Return saved chat for a model: {'html': str, 'history': list} or None."""
+		try:
+			import json
+			with self.db.get_connection() as conn:
+				with self.db.get_cursor(conn, RealDictCursor) as cur:
+					cur.execute("""
+						SELECT chat_html, chat_history_json
+						FROM model_state WHERE table_name = %s
+					""", (table_name,))
+					row = cur.fetchone()
+			if not row:
+				return None
+			html = row.get("chat_html") or ''
+			history_raw = row.get("chat_history_json") or '[]'
+			if not html and history_raw == '[]':
+				return None
+			return {
+				'html': html,
+				'history': json.loads(history_raw),
+			}
+		except Exception as e:
+			k2_logger.error(f"get_chat_history failed: {e}", "SAVED_MODELS")
+			return None
 
 
 # Singleton instance
