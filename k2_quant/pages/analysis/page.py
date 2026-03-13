@@ -781,6 +781,14 @@ class AnalysisPageWidget(QWidget):
                     k2_logger.info(
                         f"AI wrote '{col}' ({len(vals)} rows) to working tab [{scope}]",
                         "ANALYSIS")
+                elif wtype == "delete_working":
+                    scope = w.get("scope", "model")
+                    col = w.get("column_name", "")
+                    if col:
+                        tabs.delete_working_column(scope, col)
+                        k2_logger.info(
+                            f"AI deleted '{col}' from working tab [{scope}]",
+                            "ANALYSIS")
                 elif wtype == "forecast":
                     set_idx = w.get("set_index", 1)
                     while tabs._forecast_sets < set_idx:

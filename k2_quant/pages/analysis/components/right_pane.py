@@ -13,9 +13,10 @@ from datetime import datetime
 import html as html_mod
 
 from PyQt6.QtWidgets import (QFrame, QVBoxLayout, QHBoxLayout, QTextEdit,
-                             QLineEdit, QPushButton, QLabel, QWidget, QProgressBar)
-from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer
-from PyQt6.QtGui import QTextCursor, QTextBlockFormat, QTextCharFormat, QColor
+                             QLineEdit, QPushButton, QLabel, QWidget, QProgressBar,
+                             QSizePolicy)
+from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer, QEvent
+from PyQt6.QtGui import QTextCursor, QTextBlockFormat, QTextCharFormat, QColor, QFontMetrics
 
 from k2_quant.utilities.logger import k2_logger
 from k2_quant.utilities.services import table_controller
@@ -122,10 +123,21 @@ class RightPaneWidget(QFrame):
         input_layout.setContentsMargins(0, 0, 0, 0)
         input_widget.setLayout(input_layout)
         
-        self.ai_input = QLineEdit()
+        self.ai_input = QTextEdit()
         self.ai_input.setPlaceholderText("Type your message...")
-        self.ai_input.returnPressed.connect(self.send_ai_message)
         self.ai_input.setObjectName("chatInput")
+        self.ai_input.setAcceptRichText(False)
+        self.ai_input.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self.ai_input.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.ai_input.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.ai_input.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.ai_input.document().setDocumentMargin(4)
+        self._input_line_height = QFontMetrics(self.ai_input.font()).lineSpacing()
+        self._input_max_lines = 5
+        self._input_padding = 28
+        self.ai_input.setFixedHeight(self._input_line_height + self._input_padding)
+        self.ai_input.textChanged.connect(self._adjust_input_height)
+        self.ai_input.installEventFilter(self)
         input_layout.addWidget(self.ai_input)
         
         send_btn = QPushButton("Send")
@@ -137,7 +149,7 @@ class RightPaneWidget(QFrame):
     
     def send_ai_message(self):
         """Send message to AI and execute via agent loop"""
-        message = self.ai_input.text().strip()
+        message = self.ai_input.toPlainText().strip()
         if not message:
             return
         
@@ -161,9 +173,11 @@ class RightPaneWidget(QFrame):
 
         self.chat_display.setTextCursor(cursor)
         
-        # Clear input
+        # Clear input and reset height
         self.ai_input.clear()
-        
+        self.ai_input.setFixedHeight(self._input_line_height + self._input_padding)
+        self.ai_input.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
         # Add to history
         self.conversation_history.append({
             'role': 'user',
@@ -419,6 +433,33 @@ class RightPaneWidget(QFrame):
             del self._chat_store[self._active_table]
         k2_logger.info("Chat cleared", "AI_CHAT")
     
+    # ── auto-growing input ───────────────────────────────────────────
+
+    def eventFilter(self, obj, event):
+        """Enter sends the message; Shift+Enter inserts a newline."""
+        if obj is self.ai_input and event.type() == QEvent.Type.KeyPress:
+            if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    return False
+                self.send_ai_message()
+                return True
+        return super().eventFilter(obj, event)
+
+    def _adjust_input_height(self):
+        doc = self.ai_input.document()
+        doc.setTextWidth(self.ai_input.viewport().width())
+        content_h = int(doc.size().height())
+        pad = self._input_padding
+        one_line = self._input_line_height + pad
+        max_h = self._input_line_height * self._input_max_lines + pad
+        new_h = max(one_line, min(content_h + pad, max_h))
+        self.ai_input.setFixedHeight(new_h)
+
+        if content_h + pad > max_h:
+            self.ai_input.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        else:
+            self.ai_input.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
     def setup_styling(self):
         """Apply styling to the pane"""
         self.setStyleSheet("""

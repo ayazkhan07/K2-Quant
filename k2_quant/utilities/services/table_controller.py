@@ -261,13 +261,18 @@ TAB HELPER FUNCTIONS (available inside run_python):
     column_name: string label for the column.
     values: list, Series, or ndarray of values.
     scope: 'model' (per-model workspace) or 'global' (shared workspace).
-    For large columns (>2000 values), send first 2000 with a note.
+    All values will be displayed; no row limit.
 
 - to_forecast(set_index, open_values=None, high_values=None, low_values=None, close_values=None)
     Write price projections to the Forecast Data tab (Tab 2).
     set_index: integer (1, 2, 3…) identifying the forecast scenario.
     Each list should align with the pre-generated future timestamps (up to 500 values).
-    You may provide any subset of OHLC columns."""
+    You may provide any subset of OHLC columns.
+
+- delete_working(column_name, scope='model')
+    Remove a column from the Working Data tab (Tab 3).
+    column_name: exact name of the column to delete.
+    scope: 'model' or 'global'."""
 
         except Exception as e:
             k2_logger.error(f"Failed to build system prompt: {e}", "TABLE_CTRL")
@@ -398,7 +403,7 @@ TAB HELPER FUNCTIONS (available inside run_python):
                 tab_writes.append({
                     "type": "working",
                     "column_name": str(column_name),
-                    "values": cleaned[:2000],
+                    "values": cleaned,
                     "scope": str(scope),
                 })
 
@@ -427,6 +432,13 @@ TAB HELPER FUNCTIONS (available inside run_python):
                     "close_values": _clean(close_values),
                 })
 
+            def _delete_working(column_name, scope='model'):
+                tab_writes.append({
+                    "type": "delete_working",
+                    "column_name": str(column_name),
+                    "scope": str(scope),
+                })
+
             exec_globals = {
                 "df": df,
                 "pd": pd,
@@ -435,6 +447,7 @@ TAB HELPER FUNCTIONS (available inside run_python):
                 "result": None,
                 "to_working": _to_working,
                 "to_forecast": _to_forecast,
+                "delete_working": _delete_working,
             }
             exec(code, exec_globals)
 

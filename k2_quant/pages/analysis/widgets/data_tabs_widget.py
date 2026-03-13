@@ -18,7 +18,7 @@ from typing import Dict, List, Optional, Tuple, Any
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QTableWidget,
     QTableWidgetItem, QPushButton, QLabel, QHeaderView, QMessageBox,
-    QInputDialog,
+    QInputDialog, QMenu,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont, QColor
@@ -282,10 +282,12 @@ class DataTabsWidget(QWidget):
 
         self.working_model_table = QTableWidget()
         self._setup_editable_table(self.working_model_table)
+        self._enable_column_context_menu(self.working_model_table, 'model')
         self.working_tabs.addTab(self.working_model_table, "Model Workspace")
 
         self.working_global_table = QTableWidget()
         self._setup_editable_table(self.working_global_table)
+        self._enable_column_context_menu(self.working_global_table, 'global')
         self.working_tabs.addTab(self.working_global_table, "Global Workspace")
 
         vl.addWidget(self.working_tabs)
@@ -669,6 +671,83 @@ class DataTabsWidget(QWidget):
             table = self._working_table(scope)
             rows = max(table.rowCount(), 100)
             self.add_working_column(scope, name.strip(), [None] * rows)
+
+    def delete_working_column(self, scope: str, column_name: str) -> bool:
+        """Remove a named column from the working table. Returns True on success."""
+        table = self._working_table(scope)
+        data_cols = self._data_col_count(table)
+
+        col_idx = None
+        for c in range(data_cols):
+            h = table.horizontalHeaderItem(c)
+            if h and h.text() == column_name:
+                col_idx = c
+                break
+
+        if col_idx is None:
+            k2_logger.warning(
+                f"Cannot delete '{column_name}' from working [{scope}]: not found",
+                "DATA_TABS")
+            return False
+
+        table.removeColumn(col_idx)
+        new_data_cols = data_cols - 1
+        table.setProperty("_data_cols", max(new_data_cols, 0))
+
+        if new_data_cols > 0:
+            self._pad_empty_columns(table)
+        else:
+            table.setColumnCount(0)
+            table.setRowCount(0)
+
+        self._update_working_info()
+        k2_logger.info(
+            f"Deleted working column '{column_name}' from [{scope}]", "DATA_TABS")
+        return True
+
+    def _enable_column_context_menu(self, table: QTableWidget, scope: str):
+        """Wire up right-click on the horizontal header for column operations."""
+        header = table.horizontalHeader()
+        header.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        header.customContextMenuRequested.connect(
+            lambda pos, t=table, s=scope: self._on_header_context_menu(pos, t, s))
+
+    def _on_header_context_menu(self, pos, table: QTableWidget, scope: str):
+        logical_idx = table.horizontalHeader().logicalIndexAt(pos)
+        data_cols = self._data_col_count(table)
+        if logical_idx < 0 or logical_idx >= data_cols:
+            return
+
+        h = table.horizontalHeaderItem(logical_idx)
+        col_name = h.text() if h else f"Col_{logical_idx}"
+
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background-color: #1a1a1a;
+                color: #e0e0e0;
+                border: 1px solid #2a2a2a;
+                padding: 4px;
+            }
+            QMenu::item {
+                padding: 6px 20px;
+            }
+            QMenu::item:selected {
+                background-color: #2a3f5f;
+            }
+        """)
+
+        delete_action = menu.addAction(f"Delete \"{col_name}\"")
+        action = menu.exec(table.horizontalHeader().mapToGlobal(pos))
+
+        if action == delete_action:
+            reply = QMessageBox.question(
+                self, "Delete Column",
+                f"Delete column \"{col_name}\" from {scope} workspace?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.Yes:
+                self.delete_working_column(scope, col_name)
 
     def _clear_working(self, scope: str):
         table = self._working_table(scope)
