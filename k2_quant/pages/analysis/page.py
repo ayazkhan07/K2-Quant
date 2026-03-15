@@ -800,9 +800,12 @@ class AnalysisPageWidget(QWidget):
                     scope = w.get("scope", "model")
                     col = w.get("column_name", "result")
                     vals = w.get("values", [])
-                    tabs.add_working_column(scope, col, vals)
+                    grid_col = w.get("column")
+                    tabs.add_working_column(scope, col, vals, column=grid_col)
+                    letter_info = f" col {grid_col}" if grid_col else ""
                     k2_logger.info(
-                        f"AI wrote '{col}' ({len(vals)} rows) to working tab [{scope}]",
+                        f"AI wrote '{col}' ({len(vals)} rows){letter_info}"
+                        f" to working tab [{scope}]",
                         "ANALYSIS")
                 elif wtype == "delete_working":
                     scope = w.get("scope", "model")

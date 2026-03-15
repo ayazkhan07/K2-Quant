@@ -4,7 +4,8 @@ Data Tabs Widget for K2 Quant Analysis
 Tabbed data interface with three tabs:
   Tab 1 – Current Data   : Read-only model OHLCV data with indicator columns
   Tab 2 – Forecast Data   : Pre-generated future timestamps with editable projection columns
-  Tab 3 – Working Data    : Dynamic editable workspace (per-model + global scopes)
+  Tab 3 – Working Data    : Spreadsheet-style workspace with independent columns
+                            (per-model + global scopes)
 
 Save as: k2_quant/pages/analysis/widgets/data_tabs_widget.py
 """
@@ -18,9 +19,9 @@ from typing import Dict, List, Optional, Tuple, Any
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QTableWidget,
     QTableWidgetItem, QPushButton, QLabel, QHeaderView, QMessageBox,
-    QInputDialog, QMenu,
+    QInputDialog, QMenu, QTableView, QAbstractItemView, QStyledItemDelegate,
 )
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal, QAbstractTableModel, QModelIndex
 from PyQt6.QtGui import QFont, QColor
 
 from k2_quant.utilities.logger import k2_logger
@@ -130,6 +131,300 @@ def _format_cell(value, col_name: str, indicator_names: set = None) -> str:
     if isinstance(value, (float, np.floating)):
         return f"{value:.2f}" if 0.01 < abs(value) < 10000 else f"{value:.4f}"
     return str(value)
+
+
+# ---------------------------------------------------------------------------
+# Spreadsheet model for Tab 3 (Working Data)
+# ---------------------------------------------------------------------------
+
+def _col_letter(index: int) -> str:
+    """Convert a 0-based column index to an Excel-style letter (A, B, … Z, AA, AB, …)."""
+    result = ""
+    while True:
+        result = chr(ord('A') + index % 26) + result
+        index = index // 26 - 1
+        if index < 0:
+            break
+    return result
+
+
+def _letter_to_index(letter: str) -> int:
+    """Convert an Excel-style column letter to a 0-based index."""
+    letter = letter.upper().strip()
+    result = 0
+    for ch in letter:
+        result = result * 26 + (ord(ch) - ord('A') + 1)
+    return result - 1
+
+
+_DEFAULT_VISIBLE_COLS = 30
+_DEFAULT_VISIBLE_ROWS = 50
+
+
+class SpreadsheetModel(QAbstractTableModel):
+    """Virtual table model with Excel-style letter columns and numbered rows.
+
+    Row 0 is the header row (column names). Data starts at row 1.
+    Columns are addressed by letter (A, B, C …). Each column stores data
+    independently and may have a different number of populated rows.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # {col_index: {'name': str, 'values': list[str]}}
+        self._columns: Dict[int, Dict[str, Any]] = {}
+        self._visible_cols = _DEFAULT_VISIBLE_COLS
+        self._visible_rows = _DEFAULT_VISIBLE_ROWS
+
+    # ── QAbstractTableModel interface ─────────────────────────────
+
+    def rowCount(self, parent=QModelIndex()):
+        if parent.isValid():
+            return 0
+        max_data_rows = 0
+        for col_data in self._columns.values():
+            max_data_rows = max(max_data_rows, len(col_data['values']))
+        return max(self._visible_rows, max_data_rows + 1)
+
+    def columnCount(self, parent=QModelIndex()):
+        if parent.isValid():
+            return 0
+        max_col = -1
+        for ci in self._columns:
+            max_col = max(max_col, ci)
+        return max(self._visible_cols, max_col + 2)
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid():
+            return None
+
+        row, col = index.row(), index.column()
+
+        if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole):
+            col_data = self._columns.get(col)
+            if col_data is None:
+                return ""
+            if row == 0:
+                return col_data.get('name', '')
+            data_row = row - 1
+            values = col_data['values']
+            if data_row < len(values):
+                return str(values[data_row]) if values[data_row] is not None else ""
+            return ""
+
+        if role == Qt.ItemDataRole.ForegroundRole:
+            if row == 0 and col in self._columns:
+                return QColor("#4a9eff")
+            return QColor("#e0e0e0")
+
+        if role == Qt.ItemDataRole.FontRole:
+            if row == 0 and col in self._columns:
+                f = QFont()
+                f.setBold(True)
+                return f
+            return None
+
+        if role == Qt.ItemDataRole.TextAlignmentRole:
+            if row == 0:
+                return int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+            return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        if role == Qt.ItemDataRole.BackgroundRole:
+            if row == 0:
+                return QColor("#151515")
+            return None
+
+        return None
+
+    def setData(self, index, value, role=Qt.ItemDataRole.EditRole):
+        if not index.isValid() or role != Qt.ItemDataRole.EditRole:
+            return False
+
+        row, col = index.row(), index.column()
+        text = str(value).strip() if value is not None else ""
+
+        if row == 0:
+            if col not in self._columns:
+                if not text:
+                    return False
+                self._columns[col] = {'name': text, 'values': []}
+            else:
+                self._columns[col]['name'] = text
+            self.dataChanged.emit(index, index, [role])
+            return True
+
+        data_row = row - 1
+        if col not in self._columns:
+            if not text:
+                return False
+            self._columns[col] = {'name': '', 'values': []}
+
+        values = self._columns[col]['values']
+        while len(values) <= data_row:
+            values.append(None)
+        values[data_row] = text if text else None
+        self.dataChanged.emit(index, index, [role])
+        return True
+
+    def flags(self, index):
+        if not index.isValid():
+            return Qt.ItemFlag.NoItemFlags
+        return (Qt.ItemFlag.ItemIsEnabled |
+                Qt.ItemFlag.ItemIsSelectable |
+                Qt.ItemFlag.ItemIsEditable)
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if role == Qt.ItemDataRole.DisplayRole:
+            if orientation == Qt.Orientation.Horizontal:
+                return _col_letter(section)
+            else:
+                return str(section + 1)
+        if role == Qt.ItemDataRole.TextAlignmentRole:
+            return int(Qt.AlignmentFlag.AlignCenter)
+        return None
+
+    # ── Column operations ─────────────────────────────────────────
+
+    def set_column(self, col_index: int, name: str, values: list):
+        """Write a named column at the given index. Row 0 = name, rows 1+ = values."""
+        old_row_count = self.rowCount()
+        old_col_count = self.columnCount()
+
+        cleaned = []
+        for v in values:
+            if v is None:
+                cleaned.append(None)
+            elif isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
+                cleaned.append(None)
+            else:
+                s = str(v).strip()
+                cleaned.append(s if s else None)
+
+        needed_rows = max(self._visible_rows, len(cleaned) + 1)
+        max_existing_col = max(self._columns.keys()) if self._columns else -1
+        needed_cols = max(self._visible_cols, max(max_existing_col, col_index) + 2)
+
+        if needed_cols > old_col_count:
+            self.beginInsertColumns(QModelIndex(), old_col_count, needed_cols - 1)
+            self._columns[col_index] = {'name': name, 'values': cleaned}
+            self.endInsertColumns()
+        else:
+            self._columns[col_index] = {'name': name, 'values': cleaned}
+
+        new_row_count = self.rowCount()
+        if new_row_count > old_row_count:
+            self.beginInsertRows(QModelIndex(), old_row_count, new_row_count - 1)
+            self.endInsertRows()
+
+        top_left = self.index(0, col_index)
+        bottom_right = self.index(len(cleaned), col_index)
+        self.dataChanged.emit(top_left, bottom_right)
+
+    def remove_column_data(self, col_index: int):
+        """Clear a column's name and data (the letter remains)."""
+        if col_index not in self._columns:
+            return
+        del self._columns[col_index]
+        top_left = self.index(0, col_index)
+        bottom_right = self.index(self.rowCount() - 1, col_index)
+        self.dataChanged.emit(top_left, bottom_right)
+
+    def find_column_by_name(self, name: str) -> Optional[int]:
+        """Return the column index for a given name, or None."""
+        for ci, col_data in self._columns.items():
+            if col_data.get('name') == name:
+                return ci
+        return None
+
+    def next_free_column(self) -> int:
+        """Return the first column index that has no data."""
+        if not self._columns:
+            return 0
+        return max(self._columns.keys()) + 1
+
+    def get_column_info(self) -> Dict[int, Dict[str, Any]]:
+        """Return {col_index: {'name': str, 'letter': str, 'populated_rows': int}}."""
+        info = {}
+        for ci, col_data in sorted(self._columns.items()):
+            populated = sum(
+                1 for v in col_data['values']
+                if v is not None and str(v).strip() != ''
+            )
+            info[ci] = {
+                'name': col_data['name'],
+                'letter': _col_letter(ci),
+                'populated_rows': populated,
+            }
+        return info
+
+    def clear_all(self):
+        """Remove all column data and reset to empty grid."""
+        self.beginResetModel()
+        self._columns.clear()
+        self.endResetModel()
+
+    def to_dataframe(self) -> Optional[pd.DataFrame]:
+        """Export populated columns as a DataFrame with column names as headers.
+
+        Each column is exported at its full length; shorter columns are
+        NOT padded to match the longest. The resulting DataFrame uses
+        the column letter + name mapping preserved in metadata.
+        """
+        if not self._columns:
+            return None
+
+        col_frames = {}
+        col_letters = {}
+        for ci in sorted(self._columns.keys()):
+            col_data = self._columns[ci]
+            name = col_data['name'] or _col_letter(ci)
+            values = col_data['values']
+            populated = [v if v is not None else "" for v in values]
+            while populated and populated[-1] == "":
+                populated.pop()
+            if populated:
+                col_frames[name] = populated
+                col_letters[name] = _col_letter(ci)
+
+        if not col_frames:
+            return None
+
+        max_len = max(len(v) for v in col_frames.values())
+        for name in col_frames:
+            vals = col_frames[name]
+            col_frames[name] = vals + [""] * (max_len - len(vals))
+
+        df = pd.DataFrame(col_frames)
+        df.attrs['_col_letters'] = col_letters
+        return df
+
+    def from_serialised(self, state: Dict):
+        """Load from serialised state: {col_index: {name, values}}."""
+        self.beginResetModel()
+        self._columns.clear()
+        for ci_str, col_data in state.items():
+            ci = int(ci_str)
+            self._columns[ci] = {
+                'name': col_data.get('name', ''),
+                'values': col_data.get('values', []),
+            }
+        self.endResetModel()
+
+    def to_serialised(self) -> Optional[Dict]:
+        """Serialise to a dict preserving column letter positions."""
+        if not self._columns:
+            return None
+        result = {}
+        for ci, col_data in self._columns.items():
+            values = col_data['values']
+            while values and (values[-1] is None or str(values[-1]).strip() == ''):
+                values = values[:-1]
+            if col_data['name'] or values:
+                result[str(ci)] = {
+                    'name': col_data['name'],
+                    'values': [v if v is not None else '' for v in values],
+                }
+        return result if result else None
 
 
 # ---------------------------------------------------------------------------
@@ -280,18 +575,46 @@ class DataTabsWidget(QWidget):
         self.working_tabs = QTabWidget()
         self.working_tabs.setDocumentMode(True)
 
-        self.working_model_table = QTableWidget()
-        self._setup_editable_table(self.working_model_table)
-        self._enable_column_context_menu(self.working_model_table, 'model')
+        self.working_model_model = SpreadsheetModel()
+        self.working_model_table = self._create_spreadsheet_view(
+            self.working_model_model, 'model')
         self.working_tabs.addTab(self.working_model_table, "Model Workspace")
 
-        self.working_global_table = QTableWidget()
-        self._setup_editable_table(self.working_global_table)
-        self._enable_column_context_menu(self.working_global_table, 'global')
+        self.working_global_model = SpreadsheetModel()
+        self.working_global_table = self._create_spreadsheet_view(
+            self.working_global_model, 'global')
         self.working_tabs.addTab(self.working_global_table, "Global Workspace")
 
         vl.addWidget(self.working_tabs)
         self.tab_widget.addTab(container, "Working Data")
+
+    def _create_spreadsheet_view(self, model: SpreadsheetModel,
+                                  scope: str) -> QTableView:
+        """Create a QTableView configured as a spreadsheet grid."""
+        view = QTableView()
+        view.setModel(model)
+        view.setAlternatingRowColors(True)
+        view.setSelectionMode(QAbstractItemView.SelectionMode.ContiguousSelection)
+        view.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        view.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+
+        view.verticalHeader().setVisible(True)
+        view.verticalHeader().setDefaultSectionSize(24)
+        view.verticalHeader().setMinimumSectionSize(20)
+
+        view.horizontalHeader().setDefaultSectionSize(90)
+        view.horizontalHeader().setMinimumSectionSize(50)
+        view.horizontalHeader().setStretchLastSection(False)
+        hdr_font = view.horizontalHeader().font()
+        hdr_font.setCapitalization(QFont.Capitalization.SmallCaps)
+        view.horizontalHeader().setFont(hdr_font)
+
+        view.horizontalHeader().setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        view.horizontalHeader().customContextMenuRequested.connect(
+            lambda pos, v=view, s=scope: self._on_spreadsheet_header_menu(pos, v, s))
+
+        return view
 
     # -- shared helpers -------------------------------------------------
 
@@ -346,8 +669,7 @@ class DataTabsWidget(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        for table in [self.current_table, self.forecast_table,
-                      self.working_model_table, self.working_global_table]:
+        for table in [self.current_table, self.forecast_table]:
             if table.property("_data_cols"):
                 self._pad_empty_columns(table)
 
@@ -579,110 +901,83 @@ class DataTabsWidget(QWidget):
         k2_logger.info(f"Forecast applied: {len(data)} set(s)", "DATA_TABS")
 
     # ==================================================================
-    # Tab 3 – Working Data
+    # Tab 3 – Working Data (spreadsheet grid)
     # ==================================================================
 
-    def _working_table(self, scope: str) -> QTableWidget:
+    def _spreadsheet_model(self, scope: str) -> SpreadsheetModel:
+        return self.working_model_model if scope == 'model' else self.working_global_model
+
+    def _spreadsheet_view(self, scope: str) -> QTableView:
         return self.working_model_table if scope == 'model' else self.working_global_table
 
     def set_working_data(self, scope: str, df: pd.DataFrame):
-        """Replace the working table for *scope* with *df*."""
-        table = self._working_table(scope)
+        """Replace the working grid for *scope* with *df*."""
+        model = self._spreadsheet_model(scope)
         if df is None or df.empty:
-            table.setRowCount(0)
-            table.setColumnCount(0)
-            table.setProperty("_data_cols", 0)
+            model.clear_all()
+            self._update_working_info()
             return
-        table.blockSignals(True)
-        table.setRowCount(len(df))
-        table.setColumnCount(len(df.columns))
-        table.setHorizontalHeaderLabels([str(c) for c in df.columns])
-        for r in range(len(df)):
-            for c in range(len(df.columns)):
-                val = df.iloc[r, c]
-                text = "" if pd.isna(val) else str(val)
-                item = QTableWidgetItem(text)
-                item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-                table.setItem(r, c, item)
-        table.resizeColumnsToContents()
-        table.setProperty("_data_cols", len(df.columns))
-        self._pad_empty_columns(table)
-        table.blockSignals(False)
+
+        model.beginResetModel()
+        model._columns.clear()
+        col_letters = getattr(df, 'attrs', {}).get('_col_letters', {})
+        for i, col_name in enumerate(df.columns):
+            letter = col_letters.get(col_name)
+            col_idx = _letter_to_index(letter) if letter else i
+            values = []
+            for v in df[col_name]:
+                s = "" if pd.isna(v) else str(v)
+                values.append(s if s.strip() else None)
+            while values and values[-1] is None:
+                values.pop()
+            if values or col_name:
+                model._columns[col_idx] = {'name': str(col_name), 'values': values}
+        model.endResetModel()
         self._update_working_info()
 
     def get_working_data(self, scope: str) -> Optional[pd.DataFrame]:
-        """Read the working table back as a DataFrame (None if empty)."""
-        table = self._working_table(scope)
-        data_cols = self._data_col_count(table)
-        if data_cols == 0:
-            return None
-        columns = []
-        for c in range(data_cols):
-            h = table.horizontalHeaderItem(c)
-            columns.append(h.text() if h else f"Col_{c}")
-        data = []
-        for r in range(table.rowCount()):
-            row = []
-            for c in range(data_cols):
-                item = table.item(r, c)
-                row.append(item.text() if item else "")
-            data.append(row)
-        return pd.DataFrame(data, columns=columns) if data else pd.DataFrame(columns=columns)
+        """Read the working grid as a DataFrame (None if empty)."""
+        model = self._spreadsheet_model(scope)
+        return model.to_dataframe()
 
-    def add_working_column(self, scope: str, name: str, values: list):
-        """Add or replace a named column in the working table."""
-        table = self._working_table(scope)
-        data_cols = self._data_col_count(table)
+    def add_working_column(self, scope: str, name: str, values: list,
+                           column: Optional[str] = None):
+        """Add or replace a named column in the working grid.
 
-        existing_col = None
-        for c in range(data_cols):
-            h = table.horizontalHeaderItem(c)
-            if h and h.text() == name:
-                existing_col = c
-                break
+        Parameters
+        ----------
+        scope : 'model' or 'global'
+        name : column name (displayed in row 1 of the grid)
+        values : data values (placed starting at row 2)
+        column : optional Excel-style letter (e.g. 'A', 'H', 'AA') for explicit
+                 placement. If None, reuses the existing column with the same name
+                 or appends to the next free column.
+        """
+        model = self._spreadsheet_model(scope)
 
-        col_idx = existing_col if existing_col is not None else data_cols
-        if existing_col is None:
-            data_cols += 1
-            table.setColumnCount(max(table.columnCount(), data_cols))
-            table.setHorizontalHeaderItem(col_idx, QTableWidgetItem(name))
+        if column is not None:
+            col_idx = _letter_to_index(column)
+        else:
+            existing = model.find_column_by_name(name)
+            col_idx = existing if existing is not None else model.next_free_column()
 
-        if table.rowCount() < len(values):
-            table.setRowCount(len(values))
-        for r, val in enumerate(values):
-            text = ""
-            if val is not None and not (isinstance(val, float) and np.isnan(val)):
-                text = str(val)
-            item = QTableWidgetItem(text)
-            item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            table.setItem(r, col_idx, item)
-
-        for c in range(data_cols):
-            table.resizeColumnToContents(c)
-        table.setProperty("_data_cols", data_cols)
-        self._pad_empty_columns(table)
+        model.set_column(col_idx, name, values)
         self._update_working_info()
-        k2_logger.info(f"Working column '{name}' -> {scope} ({len(values)} vals)", "DATA_TABS")
+        letter = _col_letter(col_idx)
+        k2_logger.info(
+            f"Working column '{name}' -> {scope} col {letter} ({len(values)} vals)",
+            "DATA_TABS")
 
     def _add_working_column_dialog(self):
         scope = 'model' if self.working_tabs.currentIndex() == 0 else 'global'
         name, ok = QInputDialog.getText(self, "Add Column", "Column name:")
         if ok and name.strip():
-            table = self._working_table(scope)
-            rows = max(table.rowCount(), 100)
-            self.add_working_column(scope, name.strip(), [None] * rows)
+            self.add_working_column(scope, name.strip(), [])
 
     def delete_working_column(self, scope: str, column_name: str) -> bool:
-        """Remove a named column from the working table. Returns True on success."""
-        table = self._working_table(scope)
-        data_cols = self._data_col_count(table)
-
-        col_idx = None
-        for c in range(data_cols):
-            h = table.horizontalHeaderItem(c)
-            if h and h.text() == column_name:
-                col_idx = c
-                break
+        """Remove a named column from the working grid. Returns True on success."""
+        model = self._spreadsheet_model(scope)
+        col_idx = model.find_column_by_name(column_name)
 
         if col_idx is None:
             k2_logger.warning(
@@ -690,36 +985,26 @@ class DataTabsWidget(QWidget):
                 "DATA_TABS")
             return False
 
-        table.removeColumn(col_idx)
-        new_data_cols = data_cols - 1
-        table.setProperty("_data_cols", max(new_data_cols, 0))
-
-        if new_data_cols > 0:
-            self._pad_empty_columns(table)
-        else:
-            table.setColumnCount(0)
-            table.setRowCount(0)
-
+        model.remove_column_data(col_idx)
         self._update_working_info()
         k2_logger.info(
             f"Deleted working column '{column_name}' from [{scope}]", "DATA_TABS")
         return True
 
-    def _enable_column_context_menu(self, table: QTableWidget, scope: str):
-        """Wire up right-click on the horizontal header for column operations."""
-        header = table.horizontalHeader()
-        header.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        header.customContextMenuRequested.connect(
-            lambda pos, t=table, s=scope: self._on_header_context_menu(pos, t, s))
-
-    def _on_header_context_menu(self, pos, table: QTableWidget, scope: str):
-        logical_idx = table.horizontalHeader().logicalIndexAt(pos)
-        data_cols = self._data_col_count(table)
-        if logical_idx < 0 or logical_idx >= data_cols:
+    def _on_spreadsheet_header_menu(self, pos, view: QTableView, scope: str):
+        """Right-click context menu on spreadsheet column header."""
+        logical_idx = view.horizontalHeader().logicalIndexAt(pos)
+        if logical_idx < 0:
             return
 
-        h = table.horizontalHeaderItem(logical_idx)
-        col_name = h.text() if h else f"Col_{logical_idx}"
+        model = self._spreadsheet_model(scope)
+        col_data = model._columns.get(logical_idx)
+        if col_data is None:
+            return
+
+        col_name = col_data.get('name', '')
+        letter = _col_letter(logical_idx)
+        display = f"{letter}: \"{col_name}\"" if col_name else letter
 
         menu = QMenu(self)
         menu.setStyleSheet("""
@@ -737,34 +1022,38 @@ class DataTabsWidget(QWidget):
             }
         """)
 
-        delete_action = menu.addAction(f"Delete \"{col_name}\"")
-        action = menu.exec(table.horizontalHeader().mapToGlobal(pos))
+        delete_action = menu.addAction(f"Delete {display}")
+        action = menu.exec(view.horizontalHeader().mapToGlobal(pos))
 
         if action == delete_action:
             reply = QMessageBox.question(
                 self, "Delete Column",
-                f"Delete column \"{col_name}\" from {scope} workspace?",
+                f"Delete column {display} from {scope} workspace?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No)
             if reply == QMessageBox.StandardButton.Yes:
-                self.delete_working_column(scope, col_name)
+                if col_name:
+                    self.delete_working_column(scope, col_name)
+                else:
+                    model.remove_column_data(logical_idx)
+                    self._update_working_info()
 
     def _clear_working(self, scope: str):
-        table = self._working_table(scope)
-        table.setRowCount(0)
-        table.setColumnCount(0)
-        table.setProperty("_data_cols", 0)
+        model = self._spreadsheet_model(scope)
+        model.clear_all()
         self._update_working_info()
         k2_logger.info(f"Working data cleared ({scope})", "DATA_TABS")
 
     def _update_working_info(self):
         parts = []
-        mt_cols = self._data_col_count(self.working_model_table)
-        gt_cols = self._data_col_count(self.working_global_table)
-        if mt_cols:
-            parts.append(f"Model: {self.working_model_table.rowCount()}x{mt_cols}")
-        if gt_cols:
-            parts.append(f"Global: {self.working_global_table.rowCount()}x{gt_cols}")
+        for label, mdl in [("Model", self.working_model_model),
+                           ("Global", self.working_global_model)]:
+            info = mdl.get_column_info()
+            if info:
+                col_count = len(info)
+                max_rows = max(
+                    (ci['populated_rows'] for ci in info.values()), default=0)
+                parts.append(f"{label}: {col_count} cols, {max_rows} max rows")
         self.working_info.setText(" | ".join(parts) if parts else "Working Data")
 
     # ==================================================================
@@ -787,12 +1076,14 @@ class DataTabsWidget(QWidget):
         self.forecast_table.setProperty("_data_cols", None)
         self.forecast_info.setText("No model loaded")
 
-        self._clear_working('model')
+        self.working_model_model.clear_all()
+        self._update_working_info()
         self._model_table_name = None
 
     def cleanup(self):
         self.clear_all()
-        self._clear_working('global')
+        self.working_global_model.clear_all()
+        self._update_working_info()
 
     # ==================================================================
     # Persistence  (serialise ↔ dict  for DB storage)
@@ -879,11 +1170,43 @@ class DataTabsWidget(QWidget):
             f"Forecast restored: {len(data)} rows, {self._forecast_sets} sets",
             "DATA_TABS")
 
+    def serialise_working_grid(self, scope: str) -> Optional[Dict]:
+        """Serialise the spreadsheet model, preserving column letter positions."""
+        model = self._spreadsheet_model(scope)
+        return model.to_serialised()
+
+    def restore_working_grid(self, scope: str, state: Optional[Dict]):
+        """Restore the spreadsheet model from a previously serialised dict."""
+        model = self._spreadsheet_model(scope)
+        if not state:
+            model.clear_all()
+        else:
+            model.from_serialised(state)
+        self._update_working_info()
+
     @staticmethod
     def serialise_working(df: Optional[pd.DataFrame]) -> Optional[Dict]:
-        """Convert a working-data DataFrame to a JSON-serialisable dict."""
+        """Convert a working-data DataFrame to a JSON-serialisable dict.
+
+        Preserves column letter positions if _col_letters metadata is present.
+        """
         if df is None or df.empty:
             return None
+        col_letters = getattr(df, 'attrs', {}).get('_col_letters', {})
+        if col_letters:
+            result = {}
+            for col_name in df.columns:
+                letter = col_letters.get(col_name)
+                ci = _letter_to_index(letter) if letter else None
+                values = df[col_name].fillna("").tolist()
+                while values and str(values[-1]).strip() == '':
+                    values.pop()
+                if ci is not None and (col_name or values):
+                    result[str(ci)] = {
+                        'name': str(col_name),
+                        'values': values,
+                    }
+            return result if result else None
         return {
             'columns': [str(c) for c in df.columns],
             'data': df.fillna("").values.tolist(),
@@ -891,14 +1214,44 @@ class DataTabsWidget(QWidget):
 
     @staticmethod
     def deserialise_working(state: Optional[Dict]) -> Optional[pd.DataFrame]:
-        """Reconstruct a working-data DataFrame from a serialised dict."""
+        """Reconstruct a working-data DataFrame from a serialised dict.
+
+        Handles both the new grid format (keyed by column index) and the
+        legacy flat format (columns + data lists).
+        """
         if not state:
             return None
-        cols = state.get('columns', [])
-        data = state.get('data', [])
-        if not cols:
+
+        if 'columns' in state and 'data' in state:
+            cols = state.get('columns', [])
+            data = state.get('data', [])
+            if not cols:
+                return None
+            return pd.DataFrame(data, columns=cols)
+
+        col_frames = {}
+        col_letters = {}
+        for ci_str, col_data in state.items():
+            try:
+                ci = int(ci_str)
+            except (ValueError, TypeError):
+                continue
+            name = col_data.get('name', _col_letter(ci))
+            values = col_data.get('values', [])
+            col_frames[name] = values
+            col_letters[name] = _col_letter(ci)
+
+        if not col_frames:
             return None
-        return pd.DataFrame(data, columns=cols)
+
+        max_len = max(len(v) for v in col_frames.values())
+        for name in col_frames:
+            vals = col_frames[name]
+            col_frames[name] = vals + [""] * (max_len - len(vals))
+
+        df = pd.DataFrame(col_frames)
+        df.attrs['_col_letters'] = col_letters
+        return df
 
     # ==================================================================
     # Styling
@@ -950,7 +1303,7 @@ class DataTabsWidget(QWidget):
             }
 
             /* ── Tables ──────────────────────────────── */
-            QTableWidget {
+            QTableWidget, QTableView {
                 background-color: #0a0a0a;
                 alternate-background-color: #111111;
                 gridline-color: #1a1a1a;
@@ -960,16 +1313,16 @@ class DataTabsWidget(QWidget):
                 border: none;
                 outline: none;
             }
-            QTableWidget::item {
+            QTableWidget::item, QTableView::item {
                 padding: 5px 8px;
                 border: none;
                 border-bottom: 1px solid rgba(42, 42, 42, 0.3);
             }
-            QTableWidget::item:selected {
+            QTableWidget::item:selected, QTableView::item:selected {
                 background-color: #2a3f5f;
                 color: #ffffff;
             }
-            QTableWidget::item:hover {
+            QTableWidget::item:hover, QTableView::item:hover {
                 background-color: #1e1e1e;
             }
             QHeaderView::section {

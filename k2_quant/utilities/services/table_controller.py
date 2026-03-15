@@ -121,21 +121,25 @@ class TableController(QObject):
 
             write_verifications: list = []
 
-            def _to_working(column_name, values, scope='model'):
+            def _to_working(column_name, values, scope='model', column=None):
                 cleaned = _clean_values(values)
                 workspace.setdefault(scope, {})[str(column_name)] = cleaned
-                tab_writes.append({
+                write_entry = {
                     "type": "working",
                     "column_name": str(column_name),
                     "values": cleaned,
                     "scope": str(scope),
-                })
+                }
+                if column is not None:
+                    write_entry["column"] = str(column).upper().strip()
+                tab_writes.append(write_entry)
                 preview_n = min(10, len(cleaned))
                 write_verifications.append({
                     "column": str(column_name),
                     "scope": str(scope),
                     "total_values": len(cleaned),
                     "first_values": cleaned[:preview_n],
+                    "grid_column": str(column).upper().strip() if column else "auto",
                 })
 
             def _read_working(scope='model', columns=None, head=None, tail=None):
@@ -163,6 +167,25 @@ class TableController(QObject):
                     "column_name": str(column_name),
                     "scope": str(scope),
                 })
+
+            def _workspace_info(scope='model'):
+                cols = workspace.get(scope, {})
+                if not cols:
+                    return {}
+                col_names = list(cols.keys())
+                info = {}
+                for idx, name in enumerate(col_names):
+                    values = cols[name]
+                    populated = sum(
+                        1 for v in values
+                        if v is not None and str(v).strip() != ''
+                    )
+                    info[name] = {
+                        'letter': TableController._col_letter(idx),
+                        'populated_rows': populated,
+                        'first_3': values[:3] if values else [],
+                    }
+                return info
 
             def _to_forecast(set_index, open_values=None, high_values=None,
                              low_values=None, close_values=None):
@@ -200,6 +223,7 @@ class TableController(QObject):
                 "read_working": _read_working,
                 "to_forecast": _to_forecast,
                 "delete_working": _delete_working,
+                "workspace_info": _workspace_info,
                 "_write_verifications": write_verifications,
             }
 
@@ -376,7 +400,12 @@ INSTRUCTIONS:
 TAB SYSTEM — The UI has three data tabs the user can see:
   Tab 1 (Current Data): Read-only stock data. Refreshes automatically.
   Tab 2 (Forecast Data): Pre-generated future timestamps for price projections.
-  Tab 3 (Working Data): Editable workspace for intermediate results.
+  Tab 3 (Working Data): Editable grid workspace for intermediate results.
+    IMPORTANT: Tab 3 works like a spreadsheet. Each column is INDEPENDENT and may
+    have a different number of populated rows. A column with 370 values and a column
+    with 5,000 values coexist in the same grid — they are NOT row-aligned.
+    Always consult the WORKSPACE GRID MAP (below) to see each column's position,
+    name, and populated row count before operating on workspace data.
 
 ROUTING RULES (important):
 - Intermediate computation results (elasticity, pattern matches, filtered lists, etc.)
@@ -413,12 +442,17 @@ WEB SEARCH NOTES:
 - For historical date analysis, search for events around the specific date.
 
 TAB HELPER FUNCTIONS (available inside run_python):
-- to_working(column_name, values, scope='model')
+- to_working(column_name, values, scope='model', column=None)
     Write a column to the Working Data tab (Tab 3).
-    column_name: string label for the column.
-    values: list, Series, or ndarray of values.
+    column_name: string label for the column (written to row 1).
+    values: list, Series, or ndarray of values (written starting at row 2).
     scope: 'model' (per-model workspace) or 'global' (shared workspace).
-    All values will be displayed; no row limit.
+    column: optional Excel-style letter (e.g. 'A', 'H', 'AA') to place the data
+    in a specific grid column. If None, auto-assigns to the next free column
+    (or replaces an existing column with the same name).
+    ALIGNMENT: Match the length of values to the source column you are deriving
+    from. If computing from a 370-row column, write exactly 370 values — not the
+    full grid row count. Check workspace_info() to verify dimensions before writing.
 
 - read_working(scope='model', columns=None, head=None, tail=None)
     Read the current state of the Working Data tab (Tab 3) as a pandas DataFrame.
@@ -426,9 +460,17 @@ TAB HELPER FUNCTIONS (available inside run_python):
     columns: optional list of column names to include (None = all columns).
     head: optional int, return only the first N rows.
     tail: optional int, return only the last N rows.
-    Returns a DataFrame with the current workspace contents.
+    Returns a DataFrame padded to a uniform row count. Shorter columns will have
+    empty/None values at the end. Use workspace_info() to know each column's
+    actual populated row count.
     IMPORTANT: Always use read_working() to answer questions about workspace data
     instead of re-querying the database.
+
+- workspace_info(scope='model')
+    Returns per-column metadata as a dict:
+    {{column_name: {{'letter': 'A', 'populated_rows': int, 'first_3': list}}, ...}}
+    Use this BEFORE computing derived columns to check how many populated rows
+    the source column actually has. This prevents row-count mismatches.
 
 - to_forecast(set_index, open_values=None, high_values=None, low_values=None, close_values=None)
     Write price projections to the Forecast Data tab (Tab 2).
@@ -752,32 +794,68 @@ TAB HELPER FUNCTIONS (available inside run_python):
     # ── helpers ─────────────────────────────────────────────────────
 
     @staticmethod
-    def _format_workspace_snapshot(initial_workspace: Optional[Dict] = None) -> str:
-        """Format current workspace state for inclusion in the system prompt."""
-        if not initial_workspace:
-            return "CURRENT WORKSPACE STATE: Empty (no columns in Working Data tab)."
+    def _col_letter(index: int) -> str:
+        """Convert a 0-based column index to an Excel-style letter (A, B, … Z, AA, AB, …)."""
+        result = ""
+        while True:
+            result = chr(ord('A') + index % 26) + result
+            index = index // 26 - 1
+            if index < 0:
+                break
+        return result
 
-        parts = ["CURRENT WORKSPACE STATE (Tab 3 — Working Data):"]
+    @staticmethod
+    def _format_workspace_snapshot(initial_workspace: Optional[Dict] = None) -> str:
+        """Format workspace as a column grid map for AI spatial awareness."""
+        if not initial_workspace:
+            return "WORKSPACE GRID MAP: Empty (no columns in Working Data tab)."
+
+        parts = ["WORKSPACE GRID MAP (Tab 3 — Working Data):"]
+        parts.append("  Row 1 = column name (header).  Data starts at row 2.")
+        has_content = False
+
         for scope in ('model', 'global'):
             ws_df = initial_workspace.get(scope)
             if ws_df is None or (hasattr(ws_df, 'empty') and ws_df.empty):
                 continue
-            if isinstance(ws_df, pd.DataFrame):
-                cols = list(ws_df.columns)
-                nrows = len(ws_df)
-                parts.append(f"\n  [{scope.upper()}] {nrows} rows, columns: {cols}")
-                head = ws_df.head(5).to_string(index=False, max_colwidth=30)
-                parts.append(f"  First 5 rows:\n{head}")
-                if nrows > 5:
-                    tail = ws_df.tail(3).to_string(index=False, max_colwidth=30)
-                    parts.append(f"  Last 3 rows:\n{tail}")
+            if not isinstance(ws_df, pd.DataFrame):
+                continue
 
-        if len(parts) == 1:
-            return "CURRENT WORKSPACE STATE: Empty (no columns in Working Data tab)."
+            has_content = True
+            col_letters = getattr(ws_df, 'attrs', {}).get('_col_letters', {})
+            parts.append(f"\n  [{scope.upper()}]")
+
+            for col_name in ws_df.columns:
+                letter = col_letters.get(col_name,
+                         TableController._col_letter(
+                             list(ws_df.columns).index(col_name)))
+                populated = int(
+                    (ws_df[col_name].astype(str).str.strip() != '').sum()
+                )
+                if populated > 0:
+                    range_str = f"{letter}2:{letter}{populated + 1}"
+                    parts.append(
+                        f"    {letter}1: {col_name:<40s} [{range_str}, {populated} values]")
+                else:
+                    parts.append(
+                        f"    {letter}1: {col_name:<40s} [empty]")
+
+        if not has_content:
+            return "WORKSPACE GRID MAP: Empty (no columns in Working Data tab)."
+
         parts.append(
-            "\nIMPORTANT: The workspace already contains the columns listed above. "
-            "Use read_working() to access this data. Do NOT recompute columns that "
-            "already exist unless the user explicitly asks you to.")
+            "\n  WORKSPACE RULES:"
+            "\n  - The grid uses Excel-style addressing: column letters (A, B, …) are static,"
+            "\n    row 1 holds the column name, data starts at row 2."
+            "\n  - Each column is INDEPENDENT and may have a different number of populated rows."
+            "\n  - When the user references a column (e.g. 'for each Key Date'), operate on"
+            "\n    THAT column's populated rows — not the total grid row count."
+            "\n  - When writing derived columns, match the row count to the source column."
+            "\n  - Columns at adjacent positions with the same row count are likely related."
+            "\n  - Use workspace_info() at runtime to check per-column populated row counts."
+            "\n  - Use read_working() to access data. Do NOT recompute existing columns"
+            "\n    unless the user explicitly asks."
+        )
         return "\n".join(parts)
 
     def _serialize(self, value: Any) -> Any:
