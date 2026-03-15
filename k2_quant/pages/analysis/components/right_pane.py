@@ -11,6 +11,7 @@ Save as: k2_quant/pages/analysis/components/right_pane.py
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 import html as html_mod
+import re
 
 from PyQt6.QtWidgets import (QFrame, QVBoxLayout, QHBoxLayout, QTextEdit,
                              QLineEdit, QPushButton, QLabel, QWidget, QProgressBar,
@@ -74,7 +75,7 @@ class RightPaneWidget(QFrame):
     
     def __init__(self):
         super().__init__()
-        self.setFixedWidth(570)
+        self.setFixedWidth(998)
         self.setObjectName("rightPane")
         
         self.current_context: Optional[Dict[str, Any]] = None
@@ -262,9 +263,30 @@ class RightPaneWidget(QFrame):
 
     # ── response rendering ─────────────────────────────────────────
 
+    # ── markdown table helpers ─────────────────────────────────────
+
+    @staticmethod
+    def _is_separator_line(line: str) -> bool:
+        """True for markdown table separators like |---|---| or :---: | :---:"""
+        stripped = line.strip()
+        if not stripped or '|' not in stripped:
+            return False
+        return bool(re.match(r'^[\|\s\-:]+$', stripped) and '--' in stripped)
+
+    def _has_markdown_table(self, text: str) -> bool:
+        """Check whether *text* contains at least one markdown-style table."""
+        lines = [l.strip() for l in text.split('\n') if l.strip()]
+        has_sep = any(self._is_separator_line(l) for l in lines)
+        pipe_data = sum(
+            1 for l in lines if '|' in l and not self._is_separator_line(l)
+        )
+        return has_sep and pipe_data >= 2
+
+    # ── response rendering ─────────────────────────────────────────
+
     def stream_response(self, text: str, prefix: str = "AI: "):
         """Stream text with markdown table support."""
-        if '|' in text and '\n|' in text and '---' in text:
+        if self._has_markdown_table(text):
             self._render_formatted_response(text)
             return
 
@@ -297,7 +319,7 @@ class RightPaneWidget(QFrame):
         self.streaming_timer.start(20)
 
     def _render_formatted_response(self, text: str):
-        """Render response with markdown table formatting."""
+        """Render response converting markdown tables to proper HTML tables."""
         cursor = self.chat_display.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
 
@@ -314,57 +336,93 @@ class RightPaneWidget(QFrame):
         text_fmt = QTextCharFormat()
         text_fmt.setForeground(QColor("#ffffff"))
         cursor.setCharFormat(text_fmt)
-        
-        parts = text.split('\n')
-        in_table = False
-        table_rows = []
-        
-        for line in parts:
-            if '|' in line and not line.strip().startswith('|--') and not set(line.strip()) == {'|'}:
-                if not in_table:
-                    in_table = True
-                    table_rows = []
-                cells = [cell.strip() for cell in line.split('|') if cell.strip()]
-                if cells:
-                    table_rows.append(cells)
-            elif '|--' in line or '---' in line:
-                continue
-            else:
-                if in_table and table_rows:
-                    self._insert_table(cursor, table_rows)
-                    table_rows = []
-                    in_table = False
-                if line.strip():
-                    cursor.insertText(line + '\n')
-        
-        if in_table and table_rows:
-            self._insert_table(cursor, table_rows)
-        
+
+        lines = text.split('\n')
+        i = 0
+
+        while i < len(lines):
+            stripped = lines[i].strip()
+
+            if '|' in stripped and not self._is_separator_line(stripped):
+                table_lines = [stripped]
+                j = i + 1
+                found_separator = False
+
+                while j < len(lines):
+                    s = lines[j].strip()
+                    if not s:
+                        j += 1
+                        continue
+                    if self._is_separator_line(s):
+                        found_separator = True
+                        j += 1
+                        continue
+                    if '|' in s:
+                        table_lines.append(s)
+                        j += 1
+                        continue
+                    break
+
+                if found_separator and len(table_lines) >= 2:
+                    rows = []
+                    for tl in table_lines:
+                        cells = [c.strip() for c in tl.split('|')]
+                        if cells and cells[0] == '':
+                            cells = cells[1:]
+                        if cells and cells[-1] == '':
+                            cells = cells[:-1]
+                        if cells:
+                            rows.append(cells)
+                    if rows:
+                        self._insert_table(cursor, rows)
+                    i = j
+                    continue
+
+            if stripped:
+                cursor.insertText(stripped + '\n')
+            i += 1
+
         self.chat_display.ensureCursorVisible()
 
     def _insert_table(self, cursor, rows):
-        """Insert a formatted table into the chat."""
+        """Insert a well-formatted HTML table into the chat display."""
         if not rows:
             return
-        
-        table_html = """
-        <table style='border-collapse: collapse; margin: 10px 0; font-family: monospace;'>
-        """
-        
-        # Header
-        table_html += "<tr style='background: #2a2a2a;'>"
+
+        num_cols = max(len(r) for r in rows)
+        for r in rows:
+            while len(r) < num_cols:
+                r.append('')
+
+        hdr = (
+            "border-collapse:collapse; margin:8px 0; width:100%;"
+            "font-family:'Consolas','Courier New',monospace; font-size:12px;"
+        )
+        th = (
+            "padding:6px 12px; border:1px solid #333; background:#1e1e1e;"
+            "color:#e0e0e0; text-align:left; font-weight:600; white-space:nowrap;"
+        )
+        td = (
+            "padding:5px 12px; border:1px solid #2a2a2a;"
+            "color:#ccc; white-space:nowrap;"
+        )
+        td_alt = td + "background:#131313;"
+
+        table_html = f"<table style='{hdr}'><thead><tr>"
         for cell in rows[0]:
-            table_html += f"<th style='padding: 5px 10px; border: 1px solid #444; color: #fff; text-align: left;'>{cell}</th>"
-        table_html += "</tr>"
-        
-        # Body
-        for row in rows[1:]:
+            safe = html_mod.escape(cell)
+            table_html += f"<th style='{th}'>{safe}</th>"
+        table_html += "</tr></thead><tbody>"
+
+        for idx, row in enumerate(rows[1:]):
+            row_style = td_alt if idx % 2 else td
             table_html += "<tr>"
             for cell in row:
-                table_html += f"<td style='padding: 5px 10px; border: 1px solid #444; color: #ccc;'>{cell}</td>"
+                safe = html_mod.escape(cell)
+                table_html += f"<td style='{row_style}'>{safe}</td>"
             table_html += "</tr>"
-        
-        table_html += "</table>"
+
+        table_html += "</tbody></table>"
         cursor.insertHtml(table_html)
     
     def _stream_next_chunk(self):
@@ -524,6 +582,7 @@ class RightPaneWidget(QFrame):
                 letter-spacing: 1px;
                 color: #999;
                 font-weight: 600;
+                font-family: 'Inter', 'Segoe UI', Arial, sans-serif;
                 background-color: #1a1a1a;
                 padding: 5px 10px;
                 border-radius: 3px;
@@ -535,7 +594,7 @@ class RightPaneWidget(QFrame):
                 border: 1px solid #1a1a1a;
                 border-radius: 4px;
                 padding: 10px;
-                font-family: 'Segoe UI', Arial, sans-serif;
+                font-family: 'Inter', 'Segoe UI', Arial, sans-serif;
                 font-size: 13px;
                 line-height: 1.6;
             }
@@ -556,6 +615,7 @@ class RightPaneWidget(QFrame):
                 border: 1px solid #2a2a2a;
                 padding: 8px;
                 border-radius: 3px;
+                font-family: 'Inter', 'Segoe UI', Arial, sans-serif;
                 font-size: 13px;
             }
             
