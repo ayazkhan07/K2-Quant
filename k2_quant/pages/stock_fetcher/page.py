@@ -694,7 +694,7 @@ class StockFetcherWidget(QMainWindow):
             time_item = QTableWidgetItem(time_text)
             time_item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
             self.data_table.setItem(i, 1, time_item)
-            for j, value in enumerate(row[2:], 2):
+            for j, value in enumerate(row[2:8], 2):
                 if j == 6:
                     item = QTableWidgetItem(f"{int(value):,}")
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)

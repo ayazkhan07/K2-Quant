@@ -86,7 +86,13 @@ class DatabaseManager:
                         close NUMERIC(12, 4),
                         volume BIGINT,
                         vwap NUMERIC(12, 4),
-                        transactions INTEGER
+                        transactions INTEGER,
+                        open_pct DOUBLE PRECISION,
+                        high_pct DOUBLE PRECISION,
+                        low_pct DOUBLE PRECISION,
+                        close_pct DOUBLE PRECISION,
+                        elasticity DOUBLE PRECISION,
+                        close_open_pct DOUBLE PRECISION
                     )
                     """
                 )
@@ -216,7 +222,56 @@ class DatabaseManager:
         self.bulk_insert_stock_data(table_name, data, market_hours_only=market_hours_only)
         self.convert_to_logged_table(table_name)
         self.create_indexes(table_name)
+        self.compute_derived_columns(table_name)
         return table_name
+
+    def compute_derived_columns(self, table_name: str):
+        """Populate open_pct, high_pct, low_pct, close_pct, elasticity, close_open_pct.
+
+        Uses window functions against the chronologically ordered rows.
+        The first row in each table will have NULL for the four pct-change
+        columns (no prior row to compare against).
+        """
+        with self.get_connection() as conn:
+            with self.get_cursor(conn) as cur:
+                cur.execute(f"""
+                    WITH computed AS (
+                        SELECT
+                            timestamp,
+                            CASE WHEN LAG(open)  OVER w <> 0
+                                 THEN ((open  - LAG(open)  OVER w) / LAG(open)  OVER w) * 100
+                            END AS open_pct,
+                            CASE WHEN LAG(high)  OVER w <> 0
+                                 THEN ((high  - LAG(high)  OVER w) / LAG(high)  OVER w) * 100
+                            END AS high_pct,
+                            CASE WHEN LAG(low)   OVER w <> 0
+                                 THEN ((low   - LAG(low)   OVER w) / LAG(low)   OVER w) * 100
+                            END AS low_pct,
+                            CASE WHEN LAG(close) OVER w <> 0
+                                 THEN ((close - LAG(close) OVER w) / LAG(close) OVER w) * 100
+                            END AS close_pct,
+                            CASE WHEN low <> 0
+                                 THEN ((high - low) / low) * 100
+                            END AS elasticity,
+                            CASE WHEN open <> 0
+                                 THEN ((close - open) / open) * 100
+                            END AS close_open_pct
+                        FROM {table_name}
+                        WINDOW w AS (ORDER BY timestamp)
+                    )
+                    UPDATE {table_name} t
+                    SET open_pct      = c.open_pct,
+                        high_pct      = c.high_pct,
+                        low_pct       = c.low_pct,
+                        close_pct     = c.close_pct,
+                        elasticity    = c.elasticity,
+                        close_open_pct = c.close_open_pct
+                    FROM computed c
+                    WHERE t.timestamp = c.timestamp
+                """)
+                conn.commit()
+        k2_logger.info(
+            f"Derived columns computed for {table_name}", "DATABASE")
 
     # Projection helpers
     def ensure_projection_columns(self, table_name: str) -> None:
@@ -411,19 +466,24 @@ class DatabaseManager:
                 
                 # Check if we have the new columns
                 has_new_columns = self._check_column_exists(table_name, 'market_date')
+                has_derived = self._check_column_exists(table_name, 'open_pct')
+                
+                derived_clause = ""
+                if has_derived:
+                    derived_clause = ", open_pct, high_pct, low_pct, close_pct, elasticity, close_open_pct"
                 
                 # Build appropriate SELECT clause based on table schema
                 if has_new_columns:
-                    select_clause = """
+                    select_clause = f"""
                         market_date,
                         market_time,
-                        open, high, low, close, volume, vwap
+                        open, high, low, close, volume, vwap{derived_clause}
                     """
                 else:
-                    select_clause = """
+                    select_clause = f"""
                         DATE(date_time_market) AS market_date,
                         CAST(date_time_market AS TIME) AS market_time,
-                        open, high, low, close, volume, vwap
+                        open, high, low, close, volume, vwap{derived_clause}
                     """
                 
                 where_clause = f"WHERE {self._get_market_hours_where_clause(table_name)}" if market_hours_only else ""

@@ -214,7 +214,8 @@ class MiddlePaneWidget(QFrame):
         
         # Convert to DataFrame if needed (limited data for table)
         if isinstance(data, list) and len(data) > 0:
-            columns = ['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'VWAP']
+            columns = ['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'VWAP',
+                        'Open_%', 'High_%', 'Low_%', 'Close_%', 'Elasticity', 'Close-Open_%']
             df = pd.DataFrame(data, columns=columns[:len(data[0])])
             self.current_data = df
         elif isinstance(data, pd.DataFrame):
@@ -286,7 +287,8 @@ class MiddlePaneWidget(QFrame):
         if isinstance(data, pd.DataFrame):
             df = data.copy()
         elif isinstance(data, list):
-            columns = ['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'VWAP']
+            columns = ['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'VWAP',
+                        'Open_%', 'High_%', 'Low_%', 'Close_%', 'Elasticity', 'Close-Open_%']
             df = pd.DataFrame(data, columns=columns[:len(data[0])] if data else columns)
         else:
             return

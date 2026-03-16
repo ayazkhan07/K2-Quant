@@ -28,6 +28,7 @@ from k2_quant.utilities.logger import k2_logger
 
 
 PRICE_COLUMNS = {'open', 'high', 'low', 'close', 'vwap'}
+PERCENT_COLUMNS = {'open_%', 'high_%', 'low_%', 'close_%', 'elasticity', 'close-open_%'}
 FORECAST_OHLC = ['Open', 'High', 'Low', 'Close']
 
 
@@ -113,6 +114,11 @@ def _format_cell(value, col_name: str, indicator_names: set = None) -> str:
         except (ValueError, TypeError):
             return str(value)
     if col_lower in PRICE_COLUMNS:
+        try:
+            return f"{float(value):.2f}"
+        except (ValueError, TypeError):
+            return str(value)
+    if col_lower in PERCENT_COLUMNS:
         try:
             return f"{float(value):.2f}"
         except (ValueError, TypeError):

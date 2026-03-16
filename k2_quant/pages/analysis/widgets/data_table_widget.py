@@ -192,8 +192,10 @@ class DataTableWidget(QWidget):
             if len(data) > 0:
                 num_cols = len(data[0])
                 
-                if num_cols == 8:
-                    columns = ['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'VWAP']
+                all_columns = ['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'VWAP',
+                               'Open_%', 'High_%', 'Low_%', 'Close_%', 'Elasticity', 'Close-Open_%']
+                if num_cols <= len(all_columns):
+                    columns = all_columns[:num_cols]
                 elif num_cols == 7:
                     columns = ['date_time', 'open', 'high', 'low', 'close', 'volume', 'vwap']
                 else:

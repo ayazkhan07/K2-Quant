@@ -648,7 +648,9 @@ class AnalysisPageWidget(QWidget):
         
         # Load full dataset
         rows, _ = stock_service.get_display_data(table_name, limit=10**9)
-        df = pd.DataFrame(rows, columns=['Date','Time','Open','High','Low','Close','Volume','VWAP'])
+        all_columns = ['Date','Time','Open','High','Low','Close','Volume','VWAP',
+                        'Open_%','High_%','Low_%','Close_%','Elasticity','Close-Open_%']
+        df = pd.DataFrame(rows, columns=all_columns[:len(rows[0])] if rows else all_columns[:8])
         
         # Convert to strategy format
         df['date_time_market'] = pd.to_datetime(df['Date'].astype(str) + ' ' + df['Time'].astype(str))
