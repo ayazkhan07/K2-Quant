@@ -601,6 +601,7 @@ class DataTabsWidget(QWidget):
         view.verticalHeader().setVisible(True)
         view.verticalHeader().setDefaultSectionSize(24)
         view.verticalHeader().setMinimumSectionSize(20)
+        view.verticalHeader().setFixedWidth(30)
 
         view.horizontalHeader().setDefaultSectionSize(90)
         view.horizontalHeader().setMinimumSectionSize(50)
@@ -1328,7 +1329,7 @@ class DataTabsWidget(QWidget):
             QHeaderView::section {
                 background-color: #0a0a0a;
                 color: #888;
-                padding: 8px;
+                padding: 4px 2px;
                 border: none;
                 border-bottom: 2px solid #2a2a2a;
                 font-weight: 600;

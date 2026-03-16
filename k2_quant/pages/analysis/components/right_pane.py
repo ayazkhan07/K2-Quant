@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (QFrame, QVBoxLayout, QHBoxLayout, QTextEdit,
                              QLineEdit, QPushButton, QLabel, QWidget, QProgressBar,
                              QSizePolicy)
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer, QEvent
-from PyQt6.QtGui import QTextCursor, QTextBlockFormat, QTextCharFormat, QColor, QFontMetrics
+from PyQt6.QtGui import QTextCursor, QTextBlockFormat, QTextCharFormat, QColor, QFontMetrics, QTextOption
 
 from k2_quant.utilities.logger import k2_logger
 from k2_quant.utilities.services import table_controller
@@ -43,6 +43,13 @@ class CommandWorker(QThread):
         self.command_text = command_text
         self.conversation_history = conversation_history or []
         self.initial_workspace = initial_workspace
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def is_cancelled(self) -> bool:
+        return self._cancelled
 
     def run(self):
         try:
@@ -54,10 +61,27 @@ class CommandWorker(QThread):
                 self.conversation_history,
                 step_callback=self._on_step,
                 initial_workspace=self.initial_workspace,
+                cancel_check=self.is_cancelled,
             )
-            self.result_ready.emit(result)
+            if self._cancelled:
+                self.result_ready.emit({
+                    "success": True,
+                    "display_message": "Request cancelled.",
+                    "data_modified": False,
+                    "cancelled": True,
+                })
+            else:
+                self.result_ready.emit(result)
         except Exception as e:
-            self.error_occurred.emit(str(e))
+            if self._cancelled:
+                self.result_ready.emit({
+                    "success": True,
+                    "display_message": "Request cancelled.",
+                    "data_modified": False,
+                    "cancelled": True,
+                })
+            else:
+                self.error_occurred.emit(str(e))
 
     def _on_step(self, text: str):
         self.step_update.emit(text)
@@ -121,6 +145,14 @@ class RightPaneWidget(QFrame):
         self.chat_display = QTextEdit()
         self.chat_display.setReadOnly(True)
         self.chat_display.setObjectName("chatDisplay")
+        self.chat_display.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self.chat_display.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        self.chat_display.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.chat_display.document().setDefaultStyleSheet(
+            "body { word-wrap: break-word; }"
+            "table { table-layout: fixed; width: 100%; }"
+            "td, th { word-wrap: break-word; overflow-wrap: break-word; }"
+        )
         layout.addWidget(self.chat_display)
         
         # Loading indicator (initially hidden)
@@ -156,10 +188,10 @@ class RightPaneWidget(QFrame):
         self.ai_input.installEventFilter(self)
         input_layout.addWidget(self.ai_input)
         
-        send_btn = QPushButton("Send")
-        send_btn.clicked.connect(self.send_ai_message)
-        send_btn.setObjectName("sendBtn")
-        input_layout.addWidget(send_btn)
+        self.send_btn = QPushButton("Send")
+        self.send_btn.clicked.connect(self.send_ai_message)
+        self.send_btn.setObjectName("sendBtn")
+        input_layout.addWidget(self.send_btn)
         
         layout.addWidget(input_widget)
     
@@ -239,8 +271,32 @@ class RightPaneWidget(QFrame):
         self.worker.step_update.connect(self._on_step_update)
         self.worker.start()
 
+        self._set_cancel_mode(True)
         self.message_sent.emit(message)
-    
+
+    def _cancel_request(self):
+        """Cancel the running AI request."""
+        if self.worker and self.worker.isRunning():
+            self.worker.cancel()
+            k2_logger.info("AI request cancelled by user", "AI_CHAT")
+
+    def _set_cancel_mode(self, active: bool):
+        """Toggle the send button between Send and Cancel states."""
+        try:
+            self.send_btn.clicked.disconnect()
+        except TypeError:
+            pass
+        if active:
+            self.send_btn.setText("Cancel")
+            self.send_btn.setObjectName("cancelBtn")
+            self.send_btn.clicked.connect(self._cancel_request)
+        else:
+            self.send_btn.setText("Send")
+            self.send_btn.setObjectName("sendBtn")
+            self.send_btn.clicked.connect(self.send_ai_message)
+        self.send_btn.style().unpolish(self.send_btn)
+        self.send_btn.style().polish(self.send_btn)
+
     # ── intermediate step display ──────────────────────────────────
 
     def _on_step_update(self, text: str):
@@ -396,15 +452,17 @@ class RightPaneWidget(QFrame):
 
         hdr = (
             "border-collapse:collapse; margin:8px 0; width:100%;"
+            "table-layout:fixed; word-wrap:break-word;"
             "font-family:'Consolas','Courier New',monospace; font-size:12px;"
         )
         th = (
             "padding:6px 12px; border:1px solid #333; background:#1e1e1e;"
-            "color:#e0e0e0; text-align:left; font-weight:600; white-space:nowrap;"
+            "color:#e0e0e0; text-align:left; font-weight:600;"
+            "overflow:hidden; word-wrap:break-word;"
         )
         td = (
             "padding:5px 12px; border:1px solid #2a2a2a;"
-            "color:#ccc; white-space:nowrap;"
+            "color:#ccc; overflow:hidden; word-wrap:break-word;"
         )
         td_alt = td + "background:#131313;"
 
@@ -450,8 +508,16 @@ class RightPaneWidget(QFrame):
     def _on_worker_result(self, result: Dict[str, Any]):
         """Handle worker completion."""
         self.loading_bar.hide()
-        
-        if result.get('success'):
+        self._set_cancel_mode(False)
+
+        if result.get('cancelled'):
+            self.stream_response("Request cancelled.", prefix="")
+            self.conversation_history.append({
+                'role': 'assistant',
+                'content': "Request cancelled.",
+                'timestamp': datetime.now().isoformat()
+            })
+        elif result.get('success'):
             response = result.get('display_message', 'Operation completed successfully.')
             self.stream_response(response)
 
@@ -480,6 +546,7 @@ class RightPaneWidget(QFrame):
     def _on_worker_error(self, error_msg: str):
         """Handle worker error"""
         self.loading_bar.hide()
+        self._set_cancel_mode(False)
         self.stream_response(f"Unable to process that request. {error_msg}")
         self.worker = None
     
@@ -630,6 +697,20 @@ class RightPaneWidget(QFrame):
             
             #sendBtn:hover {
                 background-color: #2a2a2a;
+            }
+            
+            #cancelBtn {
+                background-color: #3a1a1a;
+                color: #ff6b6b;
+                border: 1px solid #5a2a2a;
+                padding: 8px 15px;
+                border-radius: 3px;
+                font-weight: bold;
+            }
+            
+            #cancelBtn:hover {
+                background-color: #4a2222;
+                border-color: #ff6b6b;
             }
             
             #clearChatBtn {

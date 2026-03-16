@@ -857,6 +857,13 @@ class AnalysisPageWidget(QWidget):
     def cleanup(self):
         """Clean up resources when closing tab"""
         try:
+            if self.current_model:
+                self.middle_pane.persist_tab_data(self.current_model)
+                self._save_chat(
+                    self.current_model,
+                    self.right_pane.chat_display.toHtml(),
+                    list(self.right_pane.conversation_history))
+
             # Clear left pane states
             self.left_pane.clear_all_indicators()
             self.left_pane.clear_all_strategies()

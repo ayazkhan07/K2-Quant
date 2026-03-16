@@ -49,6 +49,7 @@ class TableController(QObject):
         conversation_history: Optional[List[Dict[str, str]]] = None,
         step_callback: Optional[Callable[[str], None]] = None,
         initial_workspace: Optional[Dict[str, pd.DataFrame]] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
         """Run the agent loop with a persistent Python namespace.
 
@@ -65,6 +66,8 @@ class TableController(QObject):
         initial_workspace : dict, optional
             ``{'model': DataFrame, 'global': DataFrame}`` — current state of
             the Working Data tab so the AI can read what is already displayed.
+        cancel_check : callable, optional
+            Returns True when the user has requested cancellation.
         """
         try:
             api_key = api_config.openai_api_key
@@ -231,6 +234,15 @@ class TableController(QObject):
             iterations = 0
 
             while iterations < MAX_AGENT_ITERATIONS:
+                if cancel_check and cancel_check():
+                    return {
+                        "success": True,
+                        "display_message": "Request cancelled.",
+                        "data_modified": data_modified,
+                        "cancelled": True,
+                        "_tab_writes": tab_writes,
+                    }
+
                 iterations += 1
 
                 response = client.chat.completions.create(
@@ -247,6 +259,15 @@ class TableController(QObject):
                     messages.append(assistant_msg)
 
                     for tool_call in assistant_msg.tool_calls:
+                        if cancel_check and cancel_check():
+                            return {
+                                "success": True,
+                                "display_message": "Request cancelled.",
+                                "data_modified": data_modified,
+                                "cancelled": True,
+                                "_tab_writes": tab_writes,
+                            }
+
                         fn_name = tool_call.function.name
                         try:
                             fn_args = json.loads(tool_call.function.arguments)
@@ -396,6 +417,7 @@ INSTRUCTIONS:
 - Show your reasoning and key numbers so the user can verify.
 - For conversational messages (greetings, clarifications), respond naturally without running tools.
 - When modifying data, briefly describe what changed so the user knows to check the dataframe.
+- NEVER use emojis or emoticons in your responses. Keep all output plain text.
 
 TAB SYSTEM — The UI has three data tabs the user can see:
   Tab 1 (Current Data): Read-only stock data. Refreshes automatically.
