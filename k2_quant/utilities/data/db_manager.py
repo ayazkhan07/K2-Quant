@@ -788,6 +788,15 @@ class DatabaseManager:
                 row = cur.fetchone()
                 return row[0] if row else None
 
+    def delete_tab_data(self, scope: str):
+        """Remove a previously saved JSON blob by *scope*."""
+        self._ensure_tab_data_table()
+        with self.get_connection() as conn:
+            with self.get_cursor(conn) as cur:
+                cur.execute("DELETE FROM k2_tab_data WHERE scope = %s", (scope,))
+                conn.commit()
+        k2_logger.info(f"Tab data deleted: {scope}", "DB")
+
     def close(self):
         self.pool.closeall()
 

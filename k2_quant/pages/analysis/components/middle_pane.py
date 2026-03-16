@@ -582,7 +582,7 @@ class MiddlePaneWidget(QFrame):
     # ── Tab data persistence (called by analysis page) ──────────────
 
     def persist_tab_data(self, table_name: str):
-        """Save Tab 2 (forecast) and Tab 3 (model workspace) to the DB."""
+        """Save Tab 2 (forecast) and Tab 3 (working data) to the DB."""
         if not self.data_tabs:
             return
         from k2_quant.utilities.data.db_manager import db_manager
@@ -590,16 +590,15 @@ class MiddlePaneWidget(QFrame):
             fc = self.data_tabs.serialise_forecast()
             if fc:
                 db_manager.save_tab_data(f"forecast:{table_name}", fc)
+            else:
+                db_manager.delete_tab_data(f"forecast:{table_name}")
 
             wm = self.data_tabs.get_working_data('model')
             ws = DataTabsWidget.serialise_working(wm)
             if ws:
                 db_manager.save_tab_data(f"workspace:{table_name}", ws)
-
-            wg = self.data_tabs.get_working_data('global')
-            gs = DataTabsWidget.serialise_working(wg)
-            if gs:
-                db_manager.save_tab_data("workspace:global", gs)
+            else:
+                db_manager.delete_tab_data(f"workspace:{table_name}")
 
             k2_logger.info(f"Tab data persisted for {table_name}", "MIDDLE_PANE")
         except Exception as e:
@@ -615,17 +614,13 @@ class MiddlePaneWidget(QFrame):
             if fc:
                 self.data_tabs.restore_forecast(fc)
 
+            self.data_tabs.working_model_model.clear_all()
+
             wm = db_manager.load_tab_data(f"workspace:{table_name}")
             if wm:
                 df_m = DataTabsWidget.deserialise_working(wm)
                 if df_m is not None:
                     self.data_tabs.set_working_data('model', df_m)
-
-            wg = db_manager.load_tab_data("workspace:global")
-            if wg:
-                df_g = DataTabsWidget.deserialise_working(wg)
-                if df_g is not None:
-                    self.data_tabs.set_working_data('global', df_g)
 
             k2_logger.info(f"Tab data restored for {table_name}", "MIDDLE_PANE")
         except Exception as e:

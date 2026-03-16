@@ -771,12 +771,10 @@ class AnalysisPageWidget(QWidget):
         tabs = getattr(self.middle_pane, "data_tabs", None)
         if tabs is None:
             return None
-        result = {}
-        for scope in ('model', 'global'):
-            ws_df = tabs.get_working_data(scope)
-            if ws_df is not None and not ws_df.empty:
-                result[scope] = ws_df
-        return result if result else None
+        ws_df = tabs.get_working_data('model')
+        if ws_df is not None and not ws_df.empty:
+            return {'model': ws_df}
+        return None
 
     def _save_chat(self, table_name: str, html: str, history: list):
         """Persist chat to the database."""

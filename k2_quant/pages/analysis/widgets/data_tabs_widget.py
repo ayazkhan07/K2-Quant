@@ -4,8 +4,7 @@ Data Tabs Widget for K2 Quant Analysis
 Tabbed data interface with three tabs:
   Tab 1 – Current Data   : Read-only model OHLCV data with indicator columns
   Tab 2 – Forecast Data   : Pre-generated future timestamps with editable projection columns
-  Tab 3 – Working Data    : Spreadsheet-style workspace with independent columns
-                            (per-model + global scopes)
+  Tab 3 – Working Data    : Spreadsheet-style workspace with independent columns (per-model)
 
 Save as: k2_quant/pages/analysis/widgets/data_tabs_widget.py
 """
@@ -19,7 +18,7 @@ from typing import Dict, List, Optional, Tuple, Any
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QTableWidget,
     QTableWidgetItem, QPushButton, QLabel, QHeaderView, QMessageBox,
-    QInputDialog, QMenu, QTableView, QAbstractItemView, QStyledItemDelegate,
+    QMenu, QTableView, QAbstractItemView, QStyledItemDelegate,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QAbstractTableModel, QModelIndex
 from PyQt6.QtGui import QFont, QColor
@@ -489,7 +488,7 @@ class DataTabsWidget(QWidget):
         self.current_table.setVerticalScrollMode(QTableWidget.ScrollMode.ScrollPerPixel)
         self.current_table.setHorizontalScrollMode(QTableWidget.ScrollMode.ScrollPerPixel)
         self._apply_header_font(self.current_table)
-        self.tab_widget.addTab(self.current_table, "Current Data")
+        self.tab_widget.addTab(self.current_table, "Model Data")
 
     # -- Tab 2 ----------------------------------------------------------
 
@@ -563,35 +562,17 @@ class DataTabsWidget(QWidget):
         tl.addWidget(self.working_info)
         tl.addStretch()
 
-        btn_col = QPushButton("+ Column")
-        btn_col.setToolTip("Add a named column to the active workspace")
-        btn_col.clicked.connect(self._add_working_column_dialog)
-        tl.addWidget(btn_col)
-
         btn_clr_m = QPushButton("Clear Model")
         btn_clr_m.clicked.connect(lambda: self._clear_working('model'))
         tl.addWidget(btn_clr_m)
 
-        btn_clr_g = QPushButton("Clear Global")
-        btn_clr_g.clicked.connect(lambda: self._clear_working('global'))
-        tl.addWidget(btn_clr_g)
-
         vl.addWidget(toolbar)
-
-        self.working_tabs = QTabWidget()
-        self.working_tabs.setDocumentMode(True)
 
         self.working_model_model = SpreadsheetModel()
         self.working_model_table = self._create_spreadsheet_view(
             self.working_model_model, 'model')
-        self.working_tabs.addTab(self.working_model_table, "Model Workspace")
 
-        self.working_global_model = SpreadsheetModel()
-        self.working_global_table = self._create_spreadsheet_view(
-            self.working_global_model, 'global')
-        self.working_tabs.addTab(self.working_global_table, "Global Workspace")
-
-        vl.addWidget(self.working_tabs)
+        vl.addWidget(self.working_model_table)
         self.tab_widget.addTab(container, "Working Data")
 
     def _create_spreadsheet_view(self, model: SpreadsheetModel,
@@ -612,6 +593,7 @@ class DataTabsWidget(QWidget):
         view.horizontalHeader().setDefaultSectionSize(90)
         view.horizontalHeader().setMinimumSectionSize(50)
         view.horizontalHeader().setStretchLastSection(False)
+        view.horizontalHeader().setFixedHeight(20)
         hdr_font = view.horizontalHeader().font()
         hdr_font.setCapitalization(QFont.Capitalization.SmallCaps)
         view.horizontalHeader().setFont(hdr_font)
@@ -912,10 +894,10 @@ class DataTabsWidget(QWidget):
     # ==================================================================
 
     def _spreadsheet_model(self, scope: str) -> SpreadsheetModel:
-        return self.working_model_model if scope == 'model' else self.working_global_model
+        return self.working_model_model
 
     def _spreadsheet_view(self, scope: str) -> QTableView:
-        return self.working_model_table if scope == 'model' else self.working_global_table
+        return self.working_model_table
 
     def set_working_data(self, scope: str, df: pd.DataFrame):
         """Replace the working grid for *scope* with *df*."""
@@ -974,12 +956,6 @@ class DataTabsWidget(QWidget):
         k2_logger.info(
             f"Working column '{name}' -> {scope} col {letter} ({len(values)} vals)",
             "DATA_TABS")
-
-    def _add_working_column_dialog(self):
-        scope = 'model' if self.working_tabs.currentIndex() == 0 else 'global'
-        name, ok = QInputDialog.getText(self, "Add Column", "Column name:")
-        if ok and name.strip():
-            self.add_working_column(scope, name.strip(), [])
 
     def delete_working_column(self, scope: str, column_name: str) -> bool:
         """Remove a named column from the working grid. Returns True on success."""
@@ -1052,16 +1028,14 @@ class DataTabsWidget(QWidget):
         k2_logger.info(f"Working data cleared ({scope})", "DATA_TABS")
 
     def _update_working_info(self):
-        parts = []
-        for label, mdl in [("Model", self.working_model_model),
-                           ("Global", self.working_global_model)]:
-            info = mdl.get_column_info()
-            if info:
-                col_count = len(info)
-                max_rows = max(
-                    (ci['populated_rows'] for ci in info.values()), default=0)
-                parts.append(f"{label}: {col_count} cols, {max_rows} max rows")
-        self.working_info.setText(" | ".join(parts) if parts else "Working Data")
+        info = self.working_model_model.get_column_info()
+        if info:
+            col_count = len(info)
+            max_rows = max(
+                (ci['populated_rows'] for ci in info.values()), default=0)
+            self.working_info.setText(f"Model: {col_count} cols, {max_rows} max rows")
+        else:
+            self.working_info.setText("Working Data")
 
     # ==================================================================
     # Lifecycle
@@ -1089,8 +1063,6 @@ class DataTabsWidget(QWidget):
 
     def cleanup(self):
         self.clear_all()
-        self.working_global_model.clear_all()
-        self._update_working_info()
 
     # ==================================================================
     # Persistence  (serialise ↔ dict  for DB storage)
@@ -1335,7 +1307,8 @@ class DataTabsWidget(QWidget):
             QHeaderView::section {
                 background-color: #0a0a0a;
                 color: #888;
-                padding: 4px 2px;
+                padding: 0px;
+                margin: 0px;
                 border: none;
                 border-bottom: 2px solid #2a2a2a;
                 font-weight: 600;
