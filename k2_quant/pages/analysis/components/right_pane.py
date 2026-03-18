@@ -15,7 +15,7 @@ import json
 import re
 
 from PyQt6.QtWidgets import (QFrame, QVBoxLayout, QHBoxLayout, QTextEdit,
-                             QPushButton, QLabel, QWidget, QProgressBar,
+                             QPushButton, QLabel, QWidget,
                              QSizePolicy, QComboBox, QScrollArea)
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer, QEvent
 from PyQt6.QtGui import QColor, QFontMetrics, QPixmap
@@ -111,6 +111,8 @@ class RightPaneWidget(QFrame):
         self.conversation_history: List[Dict[str, str]] = []
         self.worker: Optional[CommandWorker] = None
         self.streaming_timer = None
+        self._typing_dot_timer: Optional[QTimer] = None
+        self._typing_dot_state = 0
         self.streaming_text = ""
         self.streaming_index = 0
         self._streaming_prefix = "AI: "
@@ -177,15 +179,13 @@ class RightPaneWidget(QFrame):
         self.scroll_area.setWidget(self.scroll_content)
         layout.addWidget(self.scroll_area)
 
-        # Loading indicator
-        self.loading_bar = QProgressBar()
-        self.loading_bar.setObjectName("loadingBar")
-        self.loading_bar.setMaximum(0)
-        self.loading_bar.setMinimum(0)
-        self.loading_bar.setTextVisible(False)
-        self.loading_bar.setFixedHeight(2)
-        self.loading_bar.hide()
-        layout.addWidget(self.loading_bar)
+        # Typing indicator
+        self.typing_indicator = QLabel("···")
+        self.typing_indicator.setObjectName("typingIndicator")
+        self.typing_indicator.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        self.typing_indicator.setFixedHeight(18)
+        self.typing_indicator.hide()
+        layout.addWidget(self.typing_indicator)
 
         # Input area
         input_widget = QWidget()
@@ -231,6 +231,25 @@ class RightPaneWidget(QFrame):
     def _add_widget(self, widget):
         self.chat_layout.addWidget(widget)
         self._scroll_to_bottom()
+
+    def _start_typing_indicator(self):
+        self._typing_dot_state = 0
+        self.typing_indicator.setText("·")
+        self.typing_indicator.show()
+        self._typing_dot_timer = QTimer()
+        self._typing_dot_timer.timeout.connect(self._update_typing_dots)
+        self._typing_dot_timer.start(400)
+
+    def _stop_typing_indicator(self):
+        if self._typing_dot_timer:
+            self._typing_dot_timer.stop()
+            self._typing_dot_timer = None
+        self.typing_indicator.hide()
+
+    def _update_typing_dots(self):
+        dots = ("·", "··", "···")
+        self._typing_dot_state = (self._typing_dot_state + 1) % 3
+        self.typing_indicator.setText(dots[self._typing_dot_state])
 
     def _make_user_bubble(self, text: str) -> QLabel:
         label = QLabel()
@@ -330,6 +349,93 @@ class RightPaneWidget(QFrame):
         return (f'{prefix_html}'
                 f'<span style="color:#ffffff;">{safe}</span>')
 
+    # ── code block helpers ────────────────────────────────────────
+
+    @staticmethod
+    def _has_code_blocks(text: str) -> bool:
+        return text.count('```') >= 2
+
+    @staticmethod
+    def _parse_code_blocks(text: str) -> list:
+        """Split *text* into ``('text', content)`` and
+        ``('code', content, lang)`` segments."""
+        segments: list = []
+        parts = re.split(r'```', text)
+        for i, part in enumerate(parts):
+            if i % 2 == 0:
+                if part.strip():
+                    segments.append(('text', part.strip()))
+            else:
+                lines = part.split('\n', 1)
+                lang_hint = lines[0].strip()
+                code = lines[1].rstrip() if len(lines) > 1 else ''
+                segments.append(('code', code, lang_hint))
+        return segments
+
+    def _make_code_block_widget(self, code: str, lang: str = '') -> QFrame:
+        container = QFrame()
+        container.setObjectName("codeBlock")
+        container.setStyleSheet(
+            "#codeBlock {"
+            "  background-color: #0d0d0d;"
+            "  border-left: 3px solid #2a6496;"
+            "  border-radius: 4px;"
+            "}")
+        v = QVBoxLayout(container)
+        v.setContentsMargins(14, 10, 14, 10)
+        v.setSpacing(2)
+
+        if lang:
+            lang_label = QLabel(lang.upper())
+            lang_label.setStyleSheet(
+                "color: #555; font-size: 10px; background: transparent;"
+                " letter-spacing: 0.5px; padding: 0; margin: 0;")
+            v.addWidget(lang_label)
+
+        code_label = QLabel()
+        code_label.setWordWrap(True)
+        code_label.setTextFormat(Qt.TextFormat.RichText)
+        code_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        safe = (html_mod.escape(code)
+                .replace('\t', '&nbsp;&nbsp;&nbsp;&nbsp;')
+                .replace(' ', '&nbsp;')
+                .replace('\n', '<br>'))
+        code_label.setText(
+            f'<span style="font-family: Consolas, monospace;'
+            f' font-size: 12px; color: #a8c7e8;">{safe}</span>')
+        code_label.setStyleSheet(
+            "background: transparent; padding: 0; margin: 0;")
+        v.addWidget(code_label)
+        return container
+
+    def _render_code_block_response(
+            self, text: str, prefix: str = "AI: "):
+        segments = self._parse_code_blocks(text)
+        is_first_text = True
+        for seg in segments:
+            if seg[0] == 'text':
+                p = prefix if is_first_text else ""
+                is_first_text = False
+                formatted = self.math_formatter.format_full(seg[1])
+                safe = html_mod.escape(formatted).replace('\n', '<br>')
+                prefix_html = (
+                    f'<span style="color:#666666;">'
+                    f'{html_mod.escape(p)}</span>') if p else ''
+                label = self._make_ai_bubble(
+                    f'{prefix_html}'
+                    f'<span style="color:#ffffff;">{safe}</span>')
+                self._add_widget(label)
+            elif seg[0] == 'code':
+                is_first_text = False
+                widget = self._make_code_block_widget(
+                    seg[1], seg[2] if len(seg) > 2 else '')
+                self._add_widget(widget)
+
+        if self._pending_charts:
+            self._insert_charts(self._pending_charts)
+            self._pending_charts = []
+
     # ── send message ─────────────────────────────────────────────
 
     def send_ai_message(self):
@@ -366,7 +472,7 @@ class RightPaneWidget(QFrame):
                 "Previous command is still executing. Please wait.")
             return
 
-        self.loading_bar.show()
+        self._start_typing_indicator()
 
         history_for_agent = [
             {"role": h["role"], "content": h["content"]}
@@ -396,6 +502,7 @@ class RightPaneWidget(QFrame):
     def _cancel_request(self):
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
+            self._stop_typing_indicator()
             k2_logger.info("AI request cancelled by user", "AI_CHAT")
 
     def _set_cancel_mode(self, active: bool):
@@ -487,6 +594,10 @@ class RightPaneWidget(QFrame):
 
         if self._has_markdown_table(text):
             self._render_formatted_response(text, prefix)
+            return
+
+        if self._has_code_blocks(text):
+            self._render_code_block_response(text, prefix)
             return
 
         self.streaming_text = self.math_formatter.format_full(text)
@@ -619,7 +730,7 @@ class RightPaneWidget(QFrame):
     # ── worker result handling ───────────────────────────────────
 
     def _on_worker_result(self, result: Dict[str, Any]):
-        self.loading_bar.hide()
+        self._stop_typing_indicator()
         self._set_cancel_mode(False)
         self._pending_charts = result.get('_charts', [])
 
@@ -661,7 +772,7 @@ class RightPaneWidget(QFrame):
         self.worker = None
 
     def _on_worker_error(self, error_msg: str):
-        self.loading_bar.hide()
+        self._stop_typing_indicator()
         self._set_cancel_mode(False)
         self._pending_charts = []
         self.stream_response(
@@ -829,7 +940,9 @@ class RightPaneWidget(QFrame):
     def setup_styling(self):
         self.setStyleSheet("""
             #rightPane {
-                background-color: #0f0f0f;
+                background: qlineargradient(
+                    x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #111111, stop:1 #0a0a0a);
                 border-left: 1px solid #1a1a1a;
             }
 
@@ -860,24 +973,28 @@ class RightPaneWidget(QFrame):
                 font-size: 13px;
             }
 
-            #loadingBar {
-                background-color: #0a0a0a;
-                border: none;
-            }
-
-            #loadingBar::chunk {
-                background-color: #ffffff;
-                border-radius: 1px;
+            #typingIndicator {
+                color: #666;
+                font-size: 18px;
+                letter-spacing: 4px;
+                background: transparent;
+                padding: 0 4px;
+                font-family: 'Inter', 'Segoe UI', Arial, sans-serif;
             }
 
             #chatInput {
                 background-color: #1a1a1a;
                 color: #fff;
                 border: 1px solid #2a2a2a;
-                padding: 8px;
-                border-radius: 3px;
+                padding: 10px 14px;
+                border-radius: 12px;
                 font-family: 'Inter', 'Segoe UI', Arial, sans-serif;
                 font-size: 13px;
+            }
+
+            #chatInput:focus {
+                border: 1px solid #2a6496;
+                background-color: #111;
             }
 
             #sendBtn {
@@ -952,6 +1069,7 @@ class RightPaneWidget(QFrame):
     # ── cleanup ──────────────────────────────────────────────────
 
     def cleanup(self):
+        self._stop_typing_indicator()
         if self.streaming_timer:
             self.streaming_timer.stop()
         if self._active_table and self.save_chat_callback:
