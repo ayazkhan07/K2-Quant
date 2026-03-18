@@ -221,6 +221,7 @@ class AnalysisPageWidget(QWidget):
             self.middle_pane.persist_tab_data(self.current_model)
         
         try:
+            from k2_quant.utilities.data.db_manager import db_manager as _db
             rows, total_count = stock_service.get_display_data(table_name, limit=500)
             
             if rows:
@@ -230,6 +231,7 @@ class AnalysisPageWidget(QWidget):
                 base_metadata = saved_models_manager.get_model_metadata(table_name) or {'symbol': table_name}
                 parts = table_name.split('_')
                 symbol = parts[1].upper() if len(parts) > 1 else 'UNKNOWN'
+                has_row_number = _db._check_column_exists(table_name, '#')
 
                 self.current_metadata = dict(base_metadata)
                 self.current_metadata.update({
@@ -237,6 +239,7 @@ class AnalysisPageWidget(QWidget):
                     'table_name': table_name,
                     'total_records': total_count,
                     'symbol': symbol,
+                    'has_row_number': has_row_number,
                 })
                 
                 # Update status
@@ -648,9 +651,16 @@ class AnalysisPageWidget(QWidget):
         
         # Load full dataset
         rows, _ = stock_service.get_display_data(table_name, limit=10**9)
-        all_columns = ['Date','Time','Open','High','Low','Close','Volume','VWAP',
-                        'Open_%','High_%','Low_%','Close_%','Elasticity','Close-Open_%']
+        has_rn = self.current_metadata.get('has_row_number', False)
+        if has_rn:
+            all_columns = ['#','Date','Time','Open','High','Low','Close','Volume','VWAP',
+                            'Open_%','High_%','Low_%','Close_%','Elasticity','Close-Open_%']
+        else:
+            all_columns = ['Date','Time','Open','High','Low','Close','Volume','VWAP',
+                            'Open_%','High_%','Low_%','Close_%','Elasticity','Close-Open_%']
         df = pd.DataFrame(rows, columns=all_columns[:len(rows[0])] if rows else all_columns[:8])
+        if '#' in df.columns:
+            df = df.drop(columns=['#'])
         
         # Convert to strategy format
         df['date_time_market'] = pd.to_datetime(df['Date'].astype(str) + ' ' + df['Time'].astype(str))
@@ -771,10 +781,12 @@ class AnalysisPageWidget(QWidget):
         tabs = getattr(self.middle_pane, "data_tabs", None)
         if tabs is None:
             return None
-        ws_df = tabs.get_working_data('model')
-        if ws_df is not None and not ws_df.empty:
-            return {'model': ws_df}
-        return None
+        result = {}
+        for name in tabs.get_sheet_names():
+            ws_df = tabs.get_working_data('model', sheet=name)
+            if ws_df is not None and not ws_df.empty:
+                result[name] = ws_df
+        return {'sheets': result} if result else None
 
     def _save_chat(self, table_name: str, html: str, history: list):
         """Persist chat to the database."""
@@ -801,19 +813,22 @@ class AnalysisPageWidget(QWidget):
                     col = w.get("column_name", "result")
                     vals = w.get("values", [])
                     grid_col = w.get("column")
-                    tabs.add_working_column(scope, col, vals, column=grid_col)
+                    sheet = w.get("sheet")
+                    tabs.add_working_column(scope, col, vals, column=grid_col, sheet=sheet)
                     letter_info = f" col {grid_col}" if grid_col else ""
+                    sheet_info = f" sheet '{sheet}'" if sheet else ""
                     k2_logger.info(
-                        f"AI wrote '{col}' ({len(vals)} rows){letter_info}"
-                        f" to working tab [{scope}]",
+                        f"AI wrote '{col}' ({len(vals)} rows){letter_info}{sheet_info}",
                         "ANALYSIS")
                 elif wtype == "delete_working":
                     scope = w.get("scope", "model")
                     col = w.get("column_name", "")
+                    sheet = w.get("sheet")
                     if col:
-                        tabs.delete_working_column(scope, col)
+                        tabs.delete_working_column(scope, col, sheet=sheet)
+                        sheet_info = f" sheet '{sheet}'" if sheet else ""
                         k2_logger.info(
-                            f"AI deleted '{col}' from working tab [{scope}]",
+                            f"AI deleted '{col}'{sheet_info}",
                             "ANALYSIS")
                 elif wtype == "forecast":
                     set_idx = w.get("set_index", 1)

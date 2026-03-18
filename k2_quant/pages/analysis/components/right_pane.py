@@ -15,12 +15,13 @@ import re
 
 from PyQt6.QtWidgets import (QFrame, QVBoxLayout, QHBoxLayout, QTextEdit,
                              QLineEdit, QPushButton, QLabel, QWidget, QProgressBar,
-                             QSizePolicy)
+                             QSizePolicy, QComboBox)
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer, QEvent
 from PyQt6.QtGui import QTextCursor, QTextBlockFormat, QTextCharFormat, QColor, QFontMetrics, QTextOption
 
 from k2_quant.utilities.logger import k2_logger
 from k2_quant.utilities.services import table_controller
+from k2_quant.utilities.services.table_controller import AI_MODELS, DEFAULT_MODEL
 from k2_quant.utilities.text.math_formatter import MathFormatter
 
 
@@ -37,12 +38,14 @@ class CommandWorker(QThread):
         command_text: str,
         conversation_history: Optional[List[Dict[str, str]]] = None,
         initial_workspace: Optional[Dict] = None,
+        model_key: str = DEFAULT_MODEL,
     ):
         super().__init__()
         self.table_name = table_name
         self.command_text = command_text
         self.conversation_history = conversation_history or []
         self.initial_workspace = initial_workspace
+        self.model_key = model_key
         self._cancelled = False
 
     def cancel(self):
@@ -62,6 +65,7 @@ class CommandWorker(QThread):
                 step_callback=self._on_step,
                 initial_workspace=self.initial_workspace,
                 cancel_check=self.is_cancelled,
+                model_key=self.model_key,
             )
             if self._cancelled:
                 self.result_ready.emit({
@@ -134,6 +138,15 @@ class RightPaneWidget(QFrame):
         ai_label.setObjectName("sectionTitle")
         header_row.addWidget(ai_label)
         header_row.addStretch()
+
+        self.model_combo = QComboBox()
+        self.model_combo.setObjectName("modelCombo")
+        self.model_combo.setFixedHeight(24)
+        for name in AI_MODELS:
+            self.model_combo.addItem(name)
+        self.model_combo.setCurrentText(DEFAULT_MODEL)
+        header_row.addWidget(self.model_combo)
+
         self.clear_btn = QPushButton("Clear")
         self.clear_btn.setObjectName("clearChatBtn")
         self.clear_btn.setFixedHeight(24)
@@ -264,8 +277,10 @@ class RightPaneWidget(QFrame):
             except Exception:
                 pass
 
+        model_key = self.model_combo.currentText()
         self.worker = CommandWorker(
-            table_name, message, history_for_agent, initial_workspace)
+            table_name, message, history_for_agent, initial_workspace,
+            model_key)
         self.worker.result_ready.connect(self._on_worker_result)
         self.worker.error_occurred.connect(self._on_worker_error)
         self.worker.step_update.connect(self._on_step_update)
@@ -711,6 +726,33 @@ class RightPaneWidget(QFrame):
             #cancelBtn:hover {
                 background-color: #4a2222;
                 border-color: #ff6b6b;
+            }
+            
+            #modelCombo {
+                background-color: #1a1a1a;
+                color: #ccc;
+                border: 1px solid #2a2a2a;
+                padding: 2px 8px;
+                border-radius: 3px;
+                font-size: 11px;
+                font-family: 'Inter', 'Segoe UI', Arial, sans-serif;
+                min-width: 140px;
+            }
+            
+            #modelCombo:hover {
+                border-color: #444;
+            }
+            
+            #modelCombo QAbstractItemView {
+                background-color: #1a1a1a;
+                color: #ccc;
+                selection-background-color: #2a2a2a;
+                border: 1px solid #333;
+            }
+            
+            #modelCombo::drop-down {
+                border: none;
+                width: 20px;
             }
             
             #clearChatBtn {

@@ -103,6 +103,11 @@ def _format_cell(value, col_name: str, indicator_names: set = None) -> str:
     if pd.isna(value):
         return ""
     col_lower = str(col_name).lower()
+    if col_lower == '#':
+        try:
+            return str(int(float(value)))
+        except (ValueError, TypeError):
+            return str(value)
     if col_lower == 'date':
         return str(value)
     if col_lower == 'time':
@@ -452,6 +457,8 @@ class DataTabsWidget(QWidget):
         self._timespan = ''
         self._frequency = '1'
         self._market_hours_only = False
+        self._last_row_number: Optional[int] = None
+        self._forecast_data_col_start: int = 2
 
         self._init_ui()
         self._apply_styling()
@@ -550,33 +557,37 @@ class DataTabsWidget(QWidget):
         vl.setSpacing(0)
         container.setLayout(vl)
 
-        toolbar = QWidget()
-        toolbar.setFixedHeight(35)
-        toolbar.setObjectName("workingToolbar")
-        tl = QHBoxLayout()
-        tl.setContentsMargins(8, 0, 8, 0)
-        toolbar.setLayout(tl)
+        self._sheets: List[Dict[str, Any]] = []
+        self._sheet_tabs = QTabWidget()
+        self._sheet_tabs.setObjectName("sheetTabs")
+        self._sheet_tabs.setDocumentMode(True)
 
-        self.working_info = QLabel("Working Data")
-        self.working_info.setStyleSheet("color:#666;font-size:12px;")
-        tl.addWidget(self.working_info)
-        tl.addStretch()
+        corner = QWidget()
+        cl = QHBoxLayout()
+        cl.setContentsMargins(4, 0, 4, 0)
+        cl.setSpacing(4)
+        corner.setLayout(cl)
 
-        btn_clr_m = QPushButton("Clear Model")
-        btn_clr_m.clicked.connect(lambda: self._clear_working('model'))
-        tl.addWidget(btn_clr_m)
+        btn_add = QPushButton("+")
+        btn_add.setFixedSize(28, 22)
+        btn_add.setToolTip("Add a new sheet")
+        btn_add.clicked.connect(self._add_sheet)
+        cl.addWidget(btn_add)
 
-        vl.addWidget(toolbar)
+        btn_clr = QPushButton("Clear Sheet")
+        btn_clr.setToolTip("Clear all data in the active sheet")
+        btn_clr.clicked.connect(self._clear_active_sheet)
+        cl.addWidget(btn_clr)
 
-        self.working_model_model = SpreadsheetModel()
-        self.working_model_table = self._create_spreadsheet_view(
-            self.working_model_model, 'model')
+        self._sheet_tabs.setCornerWidget(corner, Qt.Corner.TopRightCorner)
+        vl.addWidget(self._sheet_tabs)
 
-        vl.addWidget(self.working_model_table)
+        self._create_sheet("Sheet 1")
+
         self.tab_widget.addTab(container, "Working Data")
 
     def _create_spreadsheet_view(self, model: SpreadsheetModel,
-                                  scope: str) -> QTableView:
+                                  sheet_name: str) -> QTableView:
         """Create a QTableView configured as a spreadsheet grid."""
         view = QTableView()
         view.setModel(model)
@@ -601,7 +612,7 @@ class DataTabsWidget(QWidget):
         view.horizontalHeader().setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu)
         view.horizontalHeader().customContextMenuRequested.connect(
-            lambda pos, v=view, s=scope: self._on_spreadsheet_header_menu(pos, v, s))
+            lambda pos, v=view, sn=sheet_name: self._on_spreadsheet_header_menu(pos, v, sn))
 
         return view
 
@@ -690,7 +701,7 @@ class DataTabsWidget(QWidget):
                 col_name = df.columns[c]
                 text = _format_cell(value, col_name, indicator_names)
                 item = QTableWidgetItem(text)
-                if str(col_name).lower() in ('date', 'time'):
+                if str(col_name).lower() in ('#', 'date', 'time'):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
                 else:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -710,7 +721,9 @@ class DataTabsWidget(QWidget):
             min_w = 80
             if i < len(headers):
                 h = headers[i].lower()
-                if h == 'date':
+                if h == '#':
+                    min_w = 50
+                elif h == 'date':
                     min_w = 100
                 elif h == 'time':
                     min_w = 90
@@ -730,12 +743,14 @@ class DataTabsWidget(QWidget):
         timespan: str,
         frequency: str,
         market_hours_only: bool,
+        last_row_number: Optional[int] = None,
     ):
         """Generate future timestamps and rebuild the forecast grid."""
         self._timespan = timespan
         self._frequency = frequency
         self._market_hours_only = market_hours_only
         self._forecast_sets = 0
+        self._last_row_number = last_row_number
         self._forecast_timestamps = generate_future_timestamps(
             last_date, last_time, timespan, frequency,
             market_hours_only, count=self.FORECAST_ROW_COUNT,
@@ -764,10 +779,17 @@ class DataTabsWidget(QWidget):
     def _rebuild_forecast_table(self):
         table = self.forecast_table
         ts = self._forecast_timestamps
-        cols = ['Date', 'Time']
+        has_hash = getattr(self, '_last_row_number', None) is not None
+        cols = []
+        if has_hash:
+            cols.append('#')
+        cols.extend(['Date', 'Time'])
         for s in range(1, self._forecast_sets + 1):
             for base in FORECAST_OHLC:
                 cols.append(f"{base}_P{s}")
+
+        prefix_len = 3 if has_hash else 2
+        self._forecast_data_col_start = prefix_len
 
         table.blockSignals(True)
         table.setSortingEnabled(False)
@@ -776,17 +798,27 @@ class DataTabsWidget(QWidget):
         table.setHorizontalHeaderLabels(cols)
 
         for r, (d, t) in enumerate(ts):
+            ci = 0
+            if has_hash:
+                num_item = QTableWidgetItem(str(self._last_row_number + r + 1))
+                num_item.setFlags(num_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                num_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+                table.setItem(r, ci, num_item)
+                ci += 1
+
             d_item = QTableWidgetItem(str(d))
             d_item.setFlags(d_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             d_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
-            table.setItem(r, 0, d_item)
+            table.setItem(r, ci, d_item)
+            ci += 1
 
             t_item = QTableWidgetItem(str(t)[:8])
             t_item.setFlags(t_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             t_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
-            table.setItem(r, 1, t_item)
+            table.setItem(r, ci, t_item)
+            ci += 1
 
-            for c in range(2, len(cols)):
+            for c in range(ci, len(cols)):
                 item = QTableWidgetItem("")
                 item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 table.setItem(r, c, item)
@@ -800,10 +832,11 @@ class DataTabsWidget(QWidget):
         table.blockSignals(False)
 
     def clear_forecast_values(self):
-        """Erase editable cells; keep timestamps intact."""
+        """Erase editable cells; keep timestamps and row numbers intact."""
         table = self.forecast_table
+        start = getattr(self, '_forecast_data_col_start', 2)
         for r in range(table.rowCount()):
-            for c in range(2, self._data_col_count(table)):
+            for c in range(start, self._data_col_count(table)):
                 item = table.item(r, c)
                 if item:
                     item.setText("")
@@ -890,21 +923,76 @@ class DataTabsWidget(QWidget):
         k2_logger.info(f"Forecast applied: {len(data)} set(s)", "DATA_TABS")
 
     # ==================================================================
-    # Tab 3 – Working Data (spreadsheet grid)
+    # Tab 3 – Working Data (multi-sheet spreadsheet)
     # ==================================================================
 
-    def _spreadsheet_model(self, scope: str) -> SpreadsheetModel:
-        return self.working_model_model
+    def _create_sheet(self, name: str) -> int:
+        """Create a new sheet tab and return its index."""
+        model = SpreadsheetModel()
+        view = self._create_spreadsheet_view(model, name)
+        self._sheets.append({'name': name, 'model': model, 'view': view})
+        self._sheet_tabs.addTab(view, name)
+        return len(self._sheets) - 1
 
-    def _spreadsheet_view(self, scope: str) -> QTableView:
-        return self.working_model_table
+    def _add_sheet(self):
+        """Handler for the '+' button — adds a new empty sheet."""
+        idx = len(self._sheets) + 1
+        existing = {s['name'] for s in self._sheets}
+        name = f"Sheet {idx}"
+        while name in existing:
+            idx += 1
+            name = f"Sheet {idx}"
+        sheet_idx = self._create_sheet(name)
+        self._sheet_tabs.setCurrentIndex(sheet_idx)
+        k2_logger.info(f"Added sheet: {name}", "DATA_TABS")
 
-    def set_working_data(self, scope: str, df: pd.DataFrame):
-        """Replace the working grid for *scope* with *df*."""
-        model = self._spreadsheet_model(scope)
+    def _clear_active_sheet(self):
+        """Clear the currently visible sheet's data."""
+        idx = self._sheet_tabs.currentIndex()
+        if 0 <= idx < len(self._sheets):
+            self._sheets[idx]['model'].clear_all()
+            k2_logger.info(f"Cleared sheet: {self._sheets[idx]['name']}", "DATA_TABS")
+
+    def _reset_sheets(self):
+        """Remove all sheets and create a fresh Sheet 1."""
+        for s in self._sheets:
+            s['model'].clear_all()
+        while self._sheet_tabs.count() > 0:
+            self._sheet_tabs.removeTab(0)
+        self._sheets.clear()
+        self._create_sheet("Sheet 1")
+
+    def _resolve_sheet(self, sheet=None) -> Optional[Dict[str, Any]]:
+        """Resolve a sheet by name (str), index (int), or None (Sheet 1)."""
+        if not self._sheets:
+            return None
+        if sheet is None:
+            return self._sheets[0]
+        if isinstance(sheet, int):
+            return self._sheets[sheet] if 0 <= sheet < len(self._sheets) else None
+        if isinstance(sheet, str):
+            for s in self._sheets:
+                if s['name'] == sheet:
+                    return s
+            return None
+        return None
+
+    def get_sheet_names(self) -> List[str]:
+        """Return the list of sheet names."""
+        return [s['name'] for s in self._sheets]
+
+    def _sheet_model(self, sheet=None) -> SpreadsheetModel:
+        """Return the SpreadsheetModel for the given sheet."""
+        s = self._resolve_sheet(sheet)
+        return s['model'] if s else self._sheets[0]['model']
+
+    # ── public data API (used by AI engine and persistence) ────────
+
+    def set_working_data(self, scope: str, df: pd.DataFrame, sheet=None):
+        """Replace the working grid for *sheet* with *df*."""
+        model = self._sheet_model(sheet)
         if df is None or df.empty:
             model.clear_all()
-            self._update_working_info()
             return
 
         model.beginResetModel()
@@ -922,27 +1010,25 @@ class DataTabsWidget(QWidget):
             if values or col_name:
                 model._columns[col_idx] = {'name': str(col_name), 'values': values}
         model.endResetModel()
-        self._update_working_info()
 
-    def get_working_data(self, scope: str) -> Optional[pd.DataFrame]:
+    def get_working_data(self, scope: str = 'model', sheet=None) -> Optional[pd.DataFrame]:
         """Read the working grid as a DataFrame (None if empty)."""
-        model = self._spreadsheet_model(scope)
+        model = self._sheet_model(sheet)
         return model.to_dataframe()
 
     def add_working_column(self, scope: str, name: str, values: list,
-                           column: Optional[str] = None):
-        """Add or replace a named column in the working grid.
+                           column: Optional[str] = None, sheet=None):
+        """Add or replace a named column in a working sheet.
 
         Parameters
         ----------
-        scope : 'model' or 'global'
+        scope : kept for backward compatibility (ignored)
         name : column name (displayed in row 1 of the grid)
         values : data values (placed starting at row 2)
-        column : optional Excel-style letter (e.g. 'A', 'H', 'AA') for explicit
-                 placement. If None, reuses the existing column with the same name
-                 or appends to the next free column.
+        column : optional Excel-style letter for explicit placement
+        sheet : sheet name (str), index (int), or None for Sheet 1
         """
-        model = self._spreadsheet_model(scope)
+        model = self._sheet_model(sheet)
 
         if column is not None:
             col_idx = _letter_to_index(column)
@@ -951,36 +1037,40 @@ class DataTabsWidget(QWidget):
             col_idx = existing if existing is not None else model.next_free_column()
 
         model.set_column(col_idx, name, values)
-        self._update_working_info()
         letter = _col_letter(col_idx)
+        resolved = self._resolve_sheet(sheet)
+        sname = resolved['name'] if resolved else '?'
         k2_logger.info(
-            f"Working column '{name}' -> {scope} col {letter} ({len(values)} vals)",
+            f"Working column '{name}' -> [{sname}] col {letter} ({len(values)} vals)",
             "DATA_TABS")
 
-    def delete_working_column(self, scope: str, column_name: str) -> bool:
-        """Remove a named column from the working grid. Returns True on success."""
-        model = self._spreadsheet_model(scope)
+    def delete_working_column(self, scope: str, column_name: str, sheet=None) -> bool:
+        """Remove a named column from a working sheet. Returns True on success."""
+        model = self._sheet_model(sheet)
         col_idx = model.find_column_by_name(column_name)
 
         if col_idx is None:
+            resolved = self._resolve_sheet(sheet)
+            sname = resolved['name'] if resolved else '?'
             k2_logger.warning(
-                f"Cannot delete '{column_name}' from working [{scope}]: not found",
+                f"Cannot delete '{column_name}' from [{sname}]: not found",
                 "DATA_TABS")
             return False
 
         model.remove_column_data(col_idx)
-        self._update_working_info()
+        resolved = self._resolve_sheet(sheet)
+        sname = resolved['name'] if resolved else '?'
         k2_logger.info(
-            f"Deleted working column '{column_name}' from [{scope}]", "DATA_TABS")
+            f"Deleted working column '{column_name}' from [{sname}]", "DATA_TABS")
         return True
 
-    def _on_spreadsheet_header_menu(self, pos, view: QTableView, scope: str):
+    def _on_spreadsheet_header_menu(self, pos, view: QTableView, sheet_name: str):
         """Right-click context menu on spreadsheet column header."""
         logical_idx = view.horizontalHeader().logicalIndexAt(pos)
         if logical_idx < 0:
             return
 
-        model = self._spreadsheet_model(scope)
+        model = self._sheet_model(sheet_name)
         col_data = model._columns.get(logical_idx)
         if col_data is None:
             return
@@ -1011,31 +1101,14 @@ class DataTabsWidget(QWidget):
         if action == delete_action:
             reply = QMessageBox.question(
                 self, "Delete Column",
-                f"Delete column {display} from {scope} workspace?",
+                f"Delete column {display} from '{sheet_name}'?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No)
             if reply == QMessageBox.StandardButton.Yes:
                 if col_name:
-                    self.delete_working_column(scope, col_name)
+                    self.delete_working_column('model', col_name, sheet=sheet_name)
                 else:
                     model.remove_column_data(logical_idx)
-                    self._update_working_info()
-
-    def _clear_working(self, scope: str):
-        model = self._spreadsheet_model(scope)
-        model.clear_all()
-        self._update_working_info()
-        k2_logger.info(f"Working data cleared ({scope})", "DATA_TABS")
-
-    def _update_working_info(self):
-        info = self.working_model_model.get_column_info()
-        if info:
-            col_count = len(info)
-            max_rows = max(
-                (ci['populated_rows'] for ci in info.values()), default=0)
-            self.working_info.setText(f"Model: {col_count} cols, {max_rows} max rows")
-        else:
-            self.working_info.setText("Working Data")
 
     # ==================================================================
     # Lifecycle
@@ -1045,20 +1118,21 @@ class DataTabsWidget(QWidget):
         self._model_table_name = table_name
 
     def clear_all(self):
-        """Reset Tabs 1 & 2 and the model workspace. Global workspace preserved."""
+        """Reset Tabs 1, 2, and all working sheets."""
         self.current_table.setRowCount(0)
         self.current_table.setColumnCount(0)
         self.current_table.setProperty("_data_cols", None)
 
         self._forecast_sets = 0
         self._forecast_timestamps = []
+        self._last_row_number = None
+        self._forecast_data_col_start = 2
         self.forecast_table.setRowCount(0)
         self.forecast_table.setColumnCount(0)
         self.forecast_table.setProperty("_data_cols", None)
         self.forecast_info.setText("No model loaded")
 
-        self.working_model_model.clear_all()
-        self._update_working_info()
+        self._reset_sheets()
         self._model_table_name = None
 
     def cleanup(self):
@@ -1086,7 +1160,7 @@ class DataTabsWidget(QWidget):
                 item = table.item(r, c)
                 row.append(item.text() if item else "")
             data.append(row)
-        return {
+        result = {
             'columns': columns,
             'data': data,
             'forecast_sets': self._forecast_sets,
@@ -1094,6 +1168,9 @@ class DataTabsWidget(QWidget):
             'frequency': self._frequency,
             'market_hours_only': self._market_hours_only,
         }
+        if self._last_row_number is not None:
+            result['last_row_number'] = self._last_row_number
+        return result
 
     def restore_forecast(self, state: Dict):
         """Rebuild forecast tab from a previously serialised dict."""
@@ -1105,6 +1182,20 @@ class DataTabsWidget(QWidget):
         self._timespan = state.get('timespan', '')
         self._frequency = state.get('frequency', '1')
         self._market_hours_only = state.get('market_hours_only', False)
+
+        has_hash = '#' in columns
+        self._forecast_data_col_start = 3 if has_hash else 2
+        self._last_row_number = state.get('last_row_number')
+        if self._last_row_number is None and has_hash and data:
+            try:
+                hash_idx = columns.index('#')
+                first_num = int(data[0][hash_idx])
+                self._last_row_number = first_num - 1
+            except (ValueError, IndexError):
+                self._last_row_number = None
+
+        date_idx = columns.index('Date') if 'Date' in columns else (1 if has_hash else 0)
+        time_idx = columns.index('Time') if 'Time' in columns else (2 if has_hash else 1)
 
         table = self.forecast_table
         table.blockSignals(True)
@@ -1118,16 +1209,16 @@ class DataTabsWidget(QWidget):
             for c, val in enumerate(row):
                 item = QTableWidgetItem(val)
                 cname = columns[c] if c < len(columns) else ''
-                if cname in ('Date', 'Time'):
+                if cname in ('#', 'Date', 'Time'):
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
                 else:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 table.setItem(r, c, item)
-            if len(row) >= 2:
+            if len(row) > max(date_idx, time_idx):
                 try:
-                    d = datetime.strptime(row[0], '%Y-%m-%d').date()
-                    parts = row[1].split(':')
+                    d = datetime.strptime(row[date_idx], '%Y-%m-%d').date()
+                    parts = row[time_idx].split(':')
                     t = dt_time(int(parts[0]), int(parts[1]),
                                 int(parts[2].split('.')[0]) if len(parts) > 2 else 0)
                     self._forecast_timestamps.append((d, t))
@@ -1149,26 +1240,54 @@ class DataTabsWidget(QWidget):
             f"Forecast restored: {len(data)} rows, {self._forecast_sets} sets",
             "DATA_TABS")
 
-    def serialise_working_grid(self, scope: str) -> Optional[Dict]:
-        """Serialise the spreadsheet model, preserving column letter positions."""
-        model = self._spreadsheet_model(scope)
-        return model.to_serialised()
+    # ── Multi-sheet serialization ─────────────────────────────────
 
-    def restore_working_grid(self, scope: str, state: Optional[Dict]):
-        """Restore the spreadsheet model from a previously serialised dict."""
-        model = self._spreadsheet_model(scope)
+    def serialise_sheets(self) -> Optional[Dict]:
+        """Serialise all working sheets for DB storage."""
+        sheets = []
+        for s in self._sheets:
+            data = s['model'].to_serialised()
+            sheets.append({'name': s['name'], 'data': data})
+        if not any(s['data'] for s in sheets):
+            return None
+        return {'sheets': sheets}
+
+    def restore_sheets(self, state: Optional[Dict]):
+        """Restore sheets from serialised state. Handles legacy single-grid format."""
+        self._reset_sheets()
+
         if not state:
-            model.clear_all()
+            return
+
+        if 'sheets' in state:
+            for i, sheet_state in enumerate(state['sheets']):
+                name = sheet_state.get('name', f'Sheet {i + 1}')
+                if i == 0 and self._sheets:
+                    self._sheets[0]['name'] = name
+                    self._sheet_tabs.setTabText(0, name)
+                    sheet = self._sheets[0]
+                else:
+                    self._create_sheet(name)
+                    sheet = self._sheets[-1]
+                data = sheet_state.get('data')
+                if data:
+                    sheet['model'].from_serialised(data)
         else:
-            model.from_serialised(state)
-        self._update_working_info()
+            model = self._sheets[0]['model']
+            first_key = next(iter(state.keys()), None)
+            if first_key and first_key.isdigit():
+                model.from_serialised(state)
+            elif 'columns' in state and 'data' in state:
+                df = DataTabsWidget.deserialise_working(state)
+                if df is not None:
+                    self.set_working_data('model', df, sheet='Sheet 1')
+
+        k2_logger.info(
+            f"Restored {len(self._sheets)} sheet(s)", "DATA_TABS")
 
     @staticmethod
     def serialise_working(df: Optional[pd.DataFrame]) -> Optional[Dict]:
-        """Convert a working-data DataFrame to a JSON-serialisable dict.
-
-        Preserves column letter positions if _col_letters metadata is present.
-        """
+        """Convert a working-data DataFrame to a JSON-serialisable dict."""
         if df is None or df.empty:
             return None
         col_letters = getattr(df, 'attrs', {}).get('_col_letters', {})
@@ -1193,11 +1312,7 @@ class DataTabsWidget(QWidget):
 
     @staticmethod
     def deserialise_working(state: Optional[Dict]) -> Optional[pd.DataFrame]:
-        """Reconstruct a working-data DataFrame from a serialised dict.
-
-        Handles both the new grid format (keyed by column index) and the
-        legacy flat format (columns + data lists).
-        """
+        """Reconstruct a working-data DataFrame from a serialised dict."""
         if not state:
             return None
 
@@ -1263,8 +1378,32 @@ class DataTabsWidget(QWidget):
                 color: #ccc;
             }
 
+            /* ── Sheet tabs (inside Working Data) ────── */
+            #sheetTabs::pane {
+                border: none;
+                background-color: #0a0a0a;
+            }
+            #sheetTabs > QTabBar::tab {
+                background-color: #111111;
+                color: #888;
+                padding: 4px 16px;
+                border: none;
+                border-bottom: 2px solid transparent;
+                font-size: 11px;
+                font-weight: 500;
+            }
+            #sheetTabs > QTabBar::tab:selected {
+                background-color: #0a0a0a;
+                color: #fff;
+                border-bottom: 2px solid #4a9eff;
+            }
+            #sheetTabs > QTabBar::tab:hover:!selected {
+                background-color: #1a1a1a;
+                color: #ccc;
+            }
+
             /* ── Toolbars ────────────────────────────── */
-            #forecastToolbar, #workingToolbar {
+            #forecastToolbar {
                 background-color: #0f0f0f;
                 border-bottom: 1px solid #1a1a1a;
             }

@@ -214,8 +214,13 @@ class MiddlePaneWidget(QFrame):
         
         # Convert to DataFrame if needed (limited data for table)
         if isinstance(data, list) and len(data) > 0:
-            columns = ['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'VWAP',
-                        'Open_%', 'High_%', 'Low_%', 'Close_%', 'Elasticity', 'Close-Open_%']
+            has_row_number = self.current_metadata.get('has_row_number', False)
+            if has_row_number:
+                columns = ['#', 'Date', 'Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'VWAP',
+                            'Open_%', 'High_%', 'Low_%', 'Close_%', 'Elasticity', 'Close-Open_%']
+            else:
+                columns = ['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'VWAP',
+                            'Open_%', 'High_%', 'Low_%', 'Close_%', 'Elasticity', 'Close-Open_%']
             df = pd.DataFrame(data, columns=columns[:len(data[0])])
             self.current_data = df
         elif isinstance(data, pd.DataFrame):
@@ -253,12 +258,16 @@ class MiddlePaneWidget(QFrame):
         if self.data_tabs and self.current_data is not None and len(self.current_data) > 0:
             last_row = self.current_data.iloc[-1]
             self.data_tabs.set_model_context(self.current_table_name)
+            last_row_number = None
+            if '#' in self.current_data.columns:
+                last_row_number = self.total_records or int(self.current_data['#'].iloc[-1])
             self.data_tabs.setup_forecast(
                 last_date=last_row.get('Date', last_row.iloc[0]),
                 last_time=last_row.get('Time', last_row.iloc[1]),
                 timespan=self.current_metadata.get('timespan', 'minute'),
                 frequency=self.current_metadata.get('frequency', '1'),
                 market_hours_only=self.current_metadata.get('market_hours_only', False),
+                last_row_number=last_row_number,
             )
         
         # Initial status
@@ -287,8 +296,13 @@ class MiddlePaneWidget(QFrame):
         if isinstance(data, pd.DataFrame):
             df = data.copy()
         elif isinstance(data, list):
-            columns = ['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'VWAP',
-                        'Open_%', 'High_%', 'Low_%', 'Close_%', 'Elasticity', 'Close-Open_%']
+            has_row_number = self.current_metadata.get('has_row_number', False) if self.current_metadata else False
+            if has_row_number:
+                columns = ['#', 'Date', 'Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'VWAP',
+                            'Open_%', 'High_%', 'Low_%', 'Close_%', 'Elasticity', 'Close-Open_%']
+            else:
+                columns = ['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'VWAP',
+                            'Open_%', 'High_%', 'Low_%', 'Close_%', 'Elasticity', 'Close-Open_%']
             df = pd.DataFrame(data, columns=columns[:len(data[0])] if data else columns)
         else:
             return
@@ -582,7 +596,7 @@ class MiddlePaneWidget(QFrame):
     # ── Tab data persistence (called by analysis page) ──────────────
 
     def persist_tab_data(self, table_name: str):
-        """Save Tab 2 (forecast) and Tab 3 (working data) to the DB."""
+        """Save Tab 2 (forecast) and Tab 3 (working sheets) to the DB."""
         if not self.data_tabs:
             return
         from k2_quant.utilities.data.db_manager import db_manager
@@ -593,8 +607,7 @@ class MiddlePaneWidget(QFrame):
             else:
                 db_manager.delete_tab_data(f"forecast:{table_name}")
 
-            wm = self.data_tabs.get_working_data('model')
-            ws = DataTabsWidget.serialise_working(wm)
+            ws = self.data_tabs.serialise_sheets()
             if ws:
                 db_manager.save_tab_data(f"workspace:{table_name}", ws)
             else:
@@ -614,13 +627,8 @@ class MiddlePaneWidget(QFrame):
             if fc:
                 self.data_tabs.restore_forecast(fc)
 
-            self.data_tabs.working_model_model.clear_all()
-
-            wm = db_manager.load_tab_data(f"workspace:{table_name}")
-            if wm:
-                df_m = DataTabsWidget.deserialise_working(wm)
-                if df_m is not None:
-                    self.data_tabs.set_working_data('model', df_m)
+            ws = db_manager.load_tab_data(f"workspace:{table_name}")
+            self.data_tabs.restore_sheets(ws)
 
             k2_logger.info(f"Tab data restored for {table_name}", "MIDDLE_PANE")
         except Exception as e:

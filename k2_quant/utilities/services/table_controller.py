@@ -30,6 +30,18 @@ from k2_quant.utilities.config import api_config
 
 MAX_AGENT_ITERATIONS = 15
 
+AI_MODELS = {
+    "OpenAI o3": {"provider": "openai", "model": "o3"},
+    "OpenAI o4-mini": {"provider": "openai", "model": "o4-mini"},
+    "GPT-4.1": {"provider": "openai", "model": "gpt-4.1"},
+    "GPT-4.1 Mini": {"provider": "openai", "model": "gpt-4.1-mini"},
+    "Claude Opus 4": {"provider": "anthropic", "model": "claude-opus-4-20250514"},
+    "Claude Sonnet 4": {"provider": "anthropic", "model": "claude-sonnet-4-20250514"},
+    "Claude Haiku 3.5": {"provider": "anthropic", "model": "claude-3-5-haiku-20241022"},
+}
+
+DEFAULT_MODEL = "OpenAI o3"
+
 
 class TableController(QObject):
     """Agent-loop driven table manipulation with persistent Python engine."""
@@ -50,6 +62,7 @@ class TableController(QObject):
         step_callback: Optional[Callable[[str], None]] = None,
         initial_workspace: Optional[Dict[str, pd.DataFrame]] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
+        model_key: str = DEFAULT_MODEL,
     ) -> Dict[str, Any]:
         """Run the agent loop with a persistent Python namespace.
 
@@ -70,12 +83,23 @@ class TableController(QObject):
             Returns True when the user has requested cancellation.
         """
         try:
-            api_key = api_config.openai_api_key
-            if not api_key:
-                raise RuntimeError("Missing OPENAI_API_KEY")
+            model_info = AI_MODELS.get(model_key, AI_MODELS[DEFAULT_MODEL])
+            provider = model_info["provider"]
+            model_name = model_info["model"]
 
-            from openai import OpenAI
-            client = OpenAI(api_key=api_key)
+            if provider == "openai":
+                api_key = api_config.openai_api_key
+                if not api_key:
+                    raise RuntimeError("Missing OPENAI_API_KEY")
+                from openai import OpenAI
+                client = OpenAI(api_key=api_key)
+            else:
+                api_key = api_config.anthropic_api_key
+                if not api_key:
+                    raise RuntimeError(
+                        "Missing ANTHROPIC_API_KEY — set it in your .env file")
+                from anthropic import Anthropic
+                client = Anthropic(api_key=api_key)
 
             system_prompt = self._build_system_prompt(table, initial_workspace)
             tools = self._build_tools(table)
@@ -97,15 +121,24 @@ class TableController(QObject):
             # ── Persistent engine: load data & workspace once ────────
             df = db_manager.fetch_dataframe(table)
 
-            workspace: Dict[str, Dict[str, list]] = {'model': {}, 'global': {}}
-            if initial_workspace:
-                for scope in ('model', 'global'):
-                    ws_df = initial_workspace.get(scope)
+            workspace: Dict[str, Dict[str, list]] = {}
+            if initial_workspace and 'sheets' in initial_workspace:
+                for sheet_name, ws_df in initial_workspace['sheets'].items():
                     if ws_df is not None and not ws_df.empty:
-                        workspace[scope] = {
+                        workspace[sheet_name] = {
                             str(col): ws_df[col].tolist()
                             for col in ws_df.columns
                         }
+            elif initial_workspace:
+                for scope in ('model',):
+                    ws_df = initial_workspace.get(scope)
+                    if ws_df is not None and not ws_df.empty:
+                        workspace['Sheet 1'] = {
+                            str(col): ws_df[col].tolist()
+                            for col in ws_df.columns
+                        }
+            if not workspace:
+                workspace['Sheet 1'] = {}
 
             # ── Helper closures ──────────────────────────────────────
 
@@ -124,14 +157,16 @@ class TableController(QObject):
 
             write_verifications: list = []
 
-            def _to_working(column_name, values, scope='model', column=None):
+            def _to_working(column_name, values, scope='model', column=None, sheet=None):
+                sheet_key = sheet or 'Sheet 1'
                 cleaned = _clean_values(values)
-                workspace.setdefault(scope, {})[str(column_name)] = cleaned
+                workspace.setdefault(sheet_key, {})[str(column_name)] = cleaned
                 write_entry = {
                     "type": "working",
                     "column_name": str(column_name),
                     "values": cleaned,
                     "scope": str(scope),
+                    "sheet": sheet_key,
                 }
                 if column is not None:
                     write_entry["column"] = str(column).upper().strip()
@@ -139,14 +174,15 @@ class TableController(QObject):
                 preview_n = min(10, len(cleaned))
                 write_verifications.append({
                     "column": str(column_name),
-                    "scope": str(scope),
+                    "sheet": sheet_key,
                     "total_values": len(cleaned),
                     "first_values": cleaned[:preview_n],
                     "grid_column": str(column).upper().strip() if column else "auto",
                 })
 
-            def _read_working(scope='model', columns=None, head=None, tail=None):
-                cols = workspace.get(scope, {})
+            def _read_working(scope='model', columns=None, head=None, tail=None, sheet=None):
+                sheet_key = sheet or 'Sheet 1'
+                cols = workspace.get(sheet_key, {})
                 if not cols:
                     return pd.DataFrame()
                 max_len = max(len(v) for v in cols.values())
@@ -163,16 +199,19 @@ class TableController(QObject):
                     ws_df = ws_df.tail(tail)
                 return ws_df
 
-            def _delete_working(column_name, scope='model'):
-                workspace.get(scope, {}).pop(str(column_name), None)
+            def _delete_working(column_name, scope='model', sheet=None):
+                sheet_key = sheet or 'Sheet 1'
+                workspace.get(sheet_key, {}).pop(str(column_name), None)
                 tab_writes.append({
                     "type": "delete_working",
                     "column_name": str(column_name),
                     "scope": str(scope),
+                    "sheet": sheet_key,
                 })
 
-            def _workspace_info(scope='model'):
-                cols = workspace.get(scope, {})
+            def _workspace_info(scope='model', sheet=None):
+                sheet_key = sheet or 'Sheet 1'
+                cols = workspace.get(sheet_key, {})
                 if not cols:
                     return {}
                 col_names = list(cols.keys())
@@ -189,6 +228,9 @@ class TableController(QObject):
                         'first_3': values[:3] if values else [],
                     }
                 return info
+
+            def _list_sheets():
+                return list(workspace.keys())
 
             def _to_forecast(set_index, open_values=None, high_values=None,
                              low_values=None, close_values=None):
@@ -227,6 +269,7 @@ class TableController(QObject):
                 "to_forecast": _to_forecast,
                 "delete_working": _delete_working,
                 "workspace_info": _workspace_info,
+                "list_sheets": _list_sheets,
                 "_write_verifications": write_verifications,
             }
 
@@ -245,20 +288,92 @@ class TableController(QObject):
 
                 iterations += 1
 
-                response = client.chat.completions.create(
-                    model="o3",
-                    messages=messages,
-                    tools=tools,
-                    temperature=1,
-                )
+                tool_calls_to_exec = []
+                final_text = None
 
-                choice = response.choices[0]
-                assistant_msg = choice.message
+                if provider == "openai":
+                    response = client.chat.completions.create(
+                        model=model_name,
+                        messages=messages,
+                        tools=tools,
+                        temperature=1,
+                    )
+                    am = response.choices[0].message
 
-                if assistant_msg.tool_calls:
-                    messages.append(assistant_msg)
+                    if am.tool_calls:
+                        messages.append({
+                            "role": "assistant",
+                            "content": am.content,
+                            "tool_calls": [
+                                {
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.function.name,
+                                        "arguments": tc.function.arguments,
+                                    },
+                                }
+                                for tc in am.tool_calls
+                            ],
+                        })
+                        tool_calls_to_exec = [
+                            (tc.id, tc.function.name,
+                             tc.function.arguments)
+                            for tc in am.tool_calls
+                        ]
+                    else:
+                        final_text = am.content or "Done."
 
-                    for tool_call in assistant_msg.tool_calls:
+                else:  # anthropic
+                    anth_sys, anth_msgs = self._to_anthropic_messages(
+                        messages)
+                    anth_tools = self._to_anthropic_tools(tools)
+                    response = client.messages.create(
+                        model=model_name,
+                        max_tokens=16384,
+                        system=anth_sys,
+                        messages=anth_msgs,
+                        tools=anth_tools,
+                    )
+
+                    tool_use_blocks = [
+                        b for b in response.content
+                        if b.type == "tool_use"
+                    ]
+                    text_parts = [
+                        b.text for b in response.content
+                        if b.type == "text"
+                    ]
+
+                    if tool_use_blocks:
+                        messages.append({
+                            "role": "assistant",
+                            "content": (
+                                " ".join(text_parts)
+                                if text_parts else None),
+                            "tool_calls": [
+                                {
+                                    "id": tub.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tub.name,
+                                        "arguments": json.dumps(
+                                            tub.input),
+                                    },
+                                }
+                                for tub in tool_use_blocks
+                            ],
+                        })
+                        tool_calls_to_exec = [
+                            (tub.id, tub.name, tub.input)
+                            for tub in tool_use_blocks
+                        ]
+                    else:
+                        final_text = (
+                            " ".join(text_parts) or "Done.")
+
+                if tool_calls_to_exec:
+                    for tc_id, fn_name, fn_args in tool_calls_to_exec:
                         if cancel_check and cancel_check():
                             return {
                                 "success": True,
@@ -268,21 +383,23 @@ class TableController(QObject):
                                 "_tab_writes": tab_writes,
                             }
 
-                        fn_name = tool_call.function.name
-                        try:
-                            fn_args = json.loads(tool_call.function.arguments)
-                        except json.JSONDecodeError:
-                            fn_args = {}
+                        if isinstance(fn_args, str):
+                            try:
+                                fn_args = json.loads(fn_args)
+                            except json.JSONDecodeError:
+                                fn_args = {}
 
                         purpose = fn_args.get("purpose", fn_name)
                         if step_callback:
                             step_callback(purpose)
 
                         if fn_name == "run_sql":
-                            tool_result = self._tool_run_sql(fn_args.get("sql", ""))
+                            tool_result = self._tool_run_sql(
+                                fn_args.get("sql", ""))
                         elif fn_name == "run_python":
                             tool_result = self._tool_run_python(
-                                table, fn_args.get("code", ""), exec_globals)
+                                table, fn_args.get("code", ""),
+                                exec_globals)
                             if tool_result.get("_data_modified"):
                                 data_modified = True
                         elif fn_name == "run_web_search":
@@ -290,7 +407,8 @@ class TableController(QObject):
                                 fn_args.get("query", ""),
                                 fn_args.get("max_results", 5))
                         else:
-                            tool_result = {"error": f"Unknown tool: {fn_name}"}
+                            tool_result = {
+                                "error": f"Unknown tool: {fn_name}"}
 
                         result_str = json.dumps(
                             {k: v for k, v in tool_result.items()
@@ -301,13 +419,11 @@ class TableController(QObject):
 
                         messages.append({
                             "role": "tool",
-                            "tool_call_id": tool_call.id,
+                            "tool_call_id": tc_id,
                             "content": result_str[:50000],
                         })
 
                     continue
-
-                final_text = assistant_msg.content or "Done."
 
                 result = {
                     "success": True,
@@ -420,14 +536,15 @@ INSTRUCTIONS:
 - NEVER use emojis or emoticons in your responses. Keep all output plain text.
 
 TAB SYSTEM — The UI has three data tabs the user can see:
-  Tab 1 (Current Data): Read-only stock data. Refreshes automatically.
+  Tab 1 (Model Data): Read-only stock data. Refreshes automatically.
   Tab 2 (Forecast Data): Pre-generated future timestamps for price projections.
-  Tab 3 (Working Data): Editable grid workspace for intermediate results.
-    IMPORTANT: Tab 3 works like a spreadsheet. Each column is INDEPENDENT and may
-    have a different number of populated rows. A column with 370 values and a column
-    with 5,000 values coexist in the same grid — they are NOT row-aligned.
-    Always consult the WORKSPACE GRID MAP (below) to see each column's position,
-    name, and populated row count before operating on workspace data.
+  Tab 3 (Working Data): Editable grid workspace with MULTIPLE SHEETS (like Excel).
+    The user can create sheets ("Sheet 1", "Sheet 2", etc.). Each sheet is an
+    independent spreadsheet grid. Each column within a sheet is INDEPENDENT and may
+    have a different number of populated rows.
+    Always consult the WORKSPACE GRID MAP (below) to see each sheet's columns,
+    positions, names, and populated row counts before operating on workspace data.
+    Use list_sheets() to see available sheets at runtime.
 
 ROUTING RULES (important):
 - Intermediate computation results (elasticity, pattern matches, filtered lists, etc.)
@@ -464,21 +581,22 @@ WEB SEARCH NOTES:
 - For historical date analysis, search for events around the specific date.
 
 TAB HELPER FUNCTIONS (available inside run_python):
-- to_working(column_name, values, scope='model', column=None)
-    Write a column to the Working Data tab (Tab 3).
+- to_working(column_name, values, scope='model', column=None, sheet=None)
+    Write a column to a Working Data sheet (Tab 3).
     column_name: string label for the column (written to row 1).
     values: list, Series, or ndarray of values (written starting at row 2).
-    scope: 'model' (per-model workspace) or 'global' (shared workspace).
+    scope: kept for compatibility (always 'model').
     column: optional Excel-style letter (e.g. 'A', 'H', 'AA') to place the data
     in a specific grid column. If None, auto-assigns to the next free column
     (or replaces an existing column with the same name).
+    sheet: sheet name (e.g. 'Sheet 1', 'Sheet 2'). Defaults to 'Sheet 1'.
     ALIGNMENT: Match the length of values to the source column you are deriving
     from. If computing from a 370-row column, write exactly 370 values — not the
     full grid row count. Check workspace_info() to verify dimensions before writing.
 
-- read_working(scope='model', columns=None, head=None, tail=None)
-    Read the current state of the Working Data tab (Tab 3) as a pandas DataFrame.
-    scope: 'model' or 'global'.
+- read_working(scope='model', columns=None, head=None, tail=None, sheet=None)
+    Read a Working Data sheet as a pandas DataFrame.
+    sheet: sheet name (defaults to 'Sheet 1').
     columns: optional list of column names to include (None = all columns).
     head: optional int, return only the first N rows.
     tail: optional int, return only the last N rows.
@@ -488,11 +606,15 @@ TAB HELPER FUNCTIONS (available inside run_python):
     IMPORTANT: Always use read_working() to answer questions about workspace data
     instead of re-querying the database.
 
-- workspace_info(scope='model')
-    Returns per-column metadata as a dict:
+- workspace_info(scope='model', sheet=None)
+    Returns per-column metadata for a sheet as a dict:
     {{column_name: {{'letter': 'A', 'populated_rows': int, 'first_3': list}}, ...}}
+    sheet: sheet name (defaults to 'Sheet 1').
     Use this BEFORE computing derived columns to check how many populated rows
     the source column actually has. This prevents row-count mismatches.
+
+- list_sheets()
+    Returns a list of sheet names in the Working Data tab (e.g. ['Sheet 1', 'Sheet 2']).
 
 - to_forecast(set_index, open_values=None, high_values=None, low_values=None, close_values=None)
     Write price projections to the Forecast Data tab (Tab 2).
@@ -500,10 +622,10 @@ TAB HELPER FUNCTIONS (available inside run_python):
     Each list should align with the pre-generated future timestamps (up to 500 values).
     You may provide any subset of OHLC columns.
 
-- delete_working(column_name, scope='model')
-    Remove a column from the Working Data tab (Tab 3).
+- delete_working(column_name, scope='model', sheet=None)
+    Remove a column from a Working Data sheet (Tab 3).
     column_name: exact name of the column to delete.
-    scope: 'model' or 'global'.
+    sheet: sheet name (defaults to 'Sheet 1').
 
 {self._format_workspace_snapshot(initial_workspace)}"""
 
@@ -547,7 +669,8 @@ TAB HELPER FUNCTIONS (available inside run_python):
                         f"Execute Python code on the '{table}' data. The environment "
                         f"is persistent — variables, 'df', and workspace state survive "
                         f"between calls. 'pd', 'np', 'datetime' are available. "
-                        f"Use read_working()/to_working() for workspace I/O. "
+                        f"Use read_working(sheet=…)/to_working(sheet=…) for workspace I/O. "
+                        f"Use list_sheets() to see available sheets. "
                         f"Assign to 'result' variable to return a computed value."
                     ),
                     "parameters": {
@@ -813,6 +936,97 @@ TAB HELPER FUNCTIONS (available inside run_python):
         except Exception as e:
             return {"error": f"Web search error: {e}", "type": "error"}
 
+    # ── Anthropic format converters ─────────────────────────────────
+
+    @staticmethod
+    def _to_anthropic_messages(messages):
+        """Convert OpenAI-format message list to Anthropic (system, messages)."""
+        system_parts = []
+        anth_msgs = []
+
+        for msg in messages:
+            role = msg.get("role")
+
+            if role == "system":
+                system_parts.append(msg.get("content", ""))
+
+            elif role == "user":
+                content = msg.get("content", "")
+                if anth_msgs and anth_msgs[-1]["role"] == "user":
+                    prev = anth_msgs[-1]["content"]
+                    if isinstance(prev, str):
+                        anth_msgs[-1]["content"] = (
+                            prev + "\n\n" + content)
+                    else:
+                        anth_msgs[-1]["content"].append(
+                            {"type": "text", "text": content})
+                else:
+                    anth_msgs.append(
+                        {"role": "user", "content": content})
+
+            elif role == "assistant":
+                tool_calls = msg.get("tool_calls")
+                if tool_calls:
+                    content_blocks = []
+                    if msg.get("content"):
+                        content_blocks.append(
+                            {"type": "text", "text": msg["content"]})
+                    for tc in tool_calls:
+                        fn = tc["function"]
+                        try:
+                            inp = (
+                                json.loads(fn["arguments"])
+                                if isinstance(fn["arguments"], str)
+                                else fn["arguments"])
+                        except (json.JSONDecodeError, TypeError):
+                            inp = {}
+                        content_blocks.append({
+                            "type": "tool_use",
+                            "id": tc["id"],
+                            "name": fn["name"],
+                            "input": inp,
+                        })
+                    anth_msgs.append(
+                        {"role": "assistant", "content": content_blocks})
+                else:
+                    content = msg.get("content", "")
+                    if (anth_msgs
+                            and anth_msgs[-1]["role"] == "assistant"
+                            and isinstance(
+                                anth_msgs[-1]["content"], str)):
+                        anth_msgs[-1]["content"] += "\n\n" + content
+                    else:
+                        anth_msgs.append(
+                            {"role": "assistant", "content": content})
+
+            elif role == "tool":
+                tool_result = {
+                    "type": "tool_result",
+                    "tool_use_id": msg.get("tool_call_id"),
+                    "content": msg.get("content", ""),
+                }
+                if (anth_msgs
+                        and anth_msgs[-1]["role"] == "user"
+                        and isinstance(anth_msgs[-1]["content"], list)):
+                    anth_msgs[-1]["content"].append(tool_result)
+                else:
+                    anth_msgs.append(
+                        {"role": "user", "content": [tool_result]})
+
+        return "\n\n".join(system_parts), anth_msgs
+
+    @staticmethod
+    def _to_anthropic_tools(tools):
+        """Convert OpenAI-format tool definitions to Anthropic format."""
+        return [
+            {
+                "name": t["function"]["name"],
+                "description": t["function"]["description"],
+                "input_schema": t["function"]["parameters"],
+            }
+            for t in tools
+        ]
+
     # ── helpers ─────────────────────────────────────────────────────
 
     @staticmethod
@@ -832,12 +1046,15 @@ TAB HELPER FUNCTIONS (available inside run_python):
         if not initial_workspace:
             return "WORKSPACE GRID MAP: Empty (no columns in Working Data tab)."
 
+        sheets = initial_workspace.get('sheets', {})
+        if not sheets:
+            return "WORKSPACE GRID MAP: Empty (no columns in Working Data tab)."
+
         parts = ["WORKSPACE GRID MAP (Tab 3 — Working Data):"]
         parts.append("  Row 1 = column name (header).  Data starts at row 2.")
         has_content = False
 
-        for scope in ('model', 'global'):
-            ws_df = initial_workspace.get(scope)
+        for sheet_name, ws_df in sheets.items():
             if ws_df is None or (hasattr(ws_df, 'empty') and ws_df.empty):
                 continue
             if not isinstance(ws_df, pd.DataFrame):
@@ -845,7 +1062,7 @@ TAB HELPER FUNCTIONS (available inside run_python):
 
             has_content = True
             col_letters = getattr(ws_df, 'attrs', {}).get('_col_letters', {})
-            parts.append(f"\n  [{scope.upper()}]")
+            parts.append(f"\n  [Sheet: {sheet_name}]")
 
             for col_name in ws_df.columns:
                 letter = col_letters.get(col_name,
@@ -865,6 +1082,8 @@ TAB HELPER FUNCTIONS (available inside run_python):
         if not has_content:
             return "WORKSPACE GRID MAP: Empty (no columns in Working Data tab)."
 
+        sheet_list = list(sheets.keys())
+        parts.append(f"\n  AVAILABLE SHEETS: {sheet_list}")
         parts.append(
             "\n  WORKSPACE RULES:"
             "\n  - The grid uses Excel-style addressing: column letters (A, B, …) are static,"
@@ -874,9 +1093,10 @@ TAB HELPER FUNCTIONS (available inside run_python):
             "\n    THAT column's populated rows — not the total grid row count."
             "\n  - When writing derived columns, match the row count to the source column."
             "\n  - Columns at adjacent positions with the same row count are likely related."
-            "\n  - Use workspace_info() at runtime to check per-column populated row counts."
-            "\n  - Use read_working() to access data. Do NOT recompute existing columns"
-            "\n    unless the user explicitly asks."
+            "\n  - Use workspace_info(sheet='Sheet 1') to check per-column populated row counts."
+            "\n  - Use read_working(sheet='Sheet 1') to access data. Do NOT recompute existing"
+            "\n    columns unless the user explicitly asks."
+            "\n  - Use list_sheets() to see all available sheets."
         )
         return "\n".join(parts)
 

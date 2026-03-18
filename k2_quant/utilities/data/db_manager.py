@@ -408,6 +408,29 @@ class DatabaseManager:
         )
         return total_affected
 
+    def add_row_number_column(self, table_name: str) -> int:
+        """Add a '#' column with sequential row numbers (1-based) ordered by timestamp."""
+        with self.get_connection() as conn:
+            with self.get_cursor(conn) as cur:
+                cur.execute(f'ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS "#" INTEGER')
+                cur.execute(f"""
+                    WITH numbered AS (
+                        SELECT timestamp, ROW_NUMBER() OVER (ORDER BY timestamp) AS rn
+                        FROM {table_name}
+                    )
+                    UPDATE {table_name} t
+                    SET "#" = n.rn
+                    FROM numbered n
+                    WHERE t.timestamp = n.timestamp
+                """)
+                affected = cur.rowcount or 0
+                conn.commit()
+                k2_logger.info(
+                    f"Row number column added to {table_name}: {affected} rows numbered",
+                    "DATABASE",
+                )
+                return affected
+
     def fetch_dataframe(self, table_name: str) -> pd.DataFrame:
         """Fetch dataframe including any persisted indicator columns."""
         with self.get_connection() as conn:
@@ -467,7 +490,9 @@ class DatabaseManager:
                 # Check if we have the new columns
                 has_new_columns = self._check_column_exists(table_name, 'market_date')
                 has_derived = self._check_column_exists(table_name, 'open_pct')
+                has_row_num = self._check_column_exists(table_name, '#')
                 
+                row_num_prefix = '"#", ' if has_row_num else ''
                 derived_clause = ""
                 if has_derived:
                     derived_clause = ", open_pct, high_pct, low_pct, close_pct, elasticity, close_open_pct"
@@ -475,13 +500,13 @@ class DatabaseManager:
                 # Build appropriate SELECT clause based on table schema
                 if has_new_columns:
                     select_clause = f"""
-                        market_date,
+                        {row_num_prefix}market_date,
                         market_time,
                         open, high, low, close, volume, vwap{derived_clause}
                     """
                 else:
                     select_clause = f"""
-                        DATE(date_time_market) AS market_date,
+                        {row_num_prefix}DATE(date_time_market) AS market_date,
                         CAST(date_time_market AS TIME) AS market_time,
                         open, high, low, close, volume, vwap{derived_clause}
                     """

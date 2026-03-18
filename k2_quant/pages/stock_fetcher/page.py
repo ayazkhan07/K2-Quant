@@ -452,6 +452,10 @@ class StockFetcherWidget(QMainWindow):
                 # Pre-compute and persist standard technical indicators
                 self._persist_standard_indicators(self.current_table)
 
+                # Add sequential row number column
+                from k2_quant.utilities.data.db_manager import db_manager
+                db_manager.add_row_number_column(self.current_table)
+
                 # Show success message
                 show_info(
                     self, 
