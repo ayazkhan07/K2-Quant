@@ -174,6 +174,7 @@ class AnalysisPageWidget(QWidget):
         # Left pane connections
         self.left_pane.model_selected.connect(self.load_model_by_table)
         self.left_pane.strategy_toggled.connect(self.on_strategy_toggled)
+        self.left_pane.strategy_deleted.connect(self.on_strategy_deleted)
         self.left_pane.indicator_toggled.connect(self.on_indicator_toggled)
         
         # Middle pane connections
@@ -641,10 +642,9 @@ class AnalysisPageWidget(QWidget):
             k2_logger.error(f"Strategy toggle failed: {str(e)}", "ANALYSIS")
     
     def apply_strategy(self, strategy_name: str):
-        """Apply strategy projections"""
+        """Apply strategy — routes to forecast tab or DB projections."""
         table_name = self.current_model
         
-        # Fetch strategy code
         code = strategy_service.get_strategy_code(strategy_name)
         if not code:
             k2_logger.warning(f"Strategy code not found: {strategy_name}", "ANALYSIS")
@@ -663,27 +663,40 @@ class AnalysisPageWidget(QWidget):
         if '#' in df.columns:
             df = df.drop(columns=['#'])
         
-        # Convert to strategy format
         df['date_time_market'] = pd.to_datetime(df['Date'].astype(str) + ' ' + df['Time'].astype(str))
         df = df.rename(columns={'Open':'open','High':'high','Low':'low','Close':'close','Volume':'volume','VWAP':'vwap'})
         
-        # Execute strategy
         result = dpe_service.execute_strategy(code, df)
         if not result.get('success'):
             k2_logger.error(f"Strategy execution failed: {result.get('error')}", "ANALYSIS")
             return
         
-        result_df = result.get('data') if isinstance(result.get('data'), pd.DataFrame) else df
+        # ── Route forecast tab writes if the strategy produced any ──
+        tab_writes = result.get('_tab_writes', [])
+        forecast_writes = [w for w in tab_writes if w.get("type") == "forecast"]
+
+        if forecast_writes:
+            self._on_tab_writes(forecast_writes)
+            saved_models_manager.set_model_state(
+                table_name,
+                indicators=None,
+                active_strategy=strategy_name,
+                chart_range=None,
+            )
+            k2_logger.info(
+                f"Strategy '{strategy_name}' wrote {len(forecast_writes)} forecast set(s)",
+                "ANALYSIS",
+            )
+            return
         
-        # Get projection rows
+        # ── Legacy path: DB projection rows ──
+        result_df = result.get('data') if isinstance(result.get('data'), pd.DataFrame) else df
         proj_df = result_df.iloc[len(df):].copy() if len(result_df) > len(df) else pd.DataFrame()
         
         if not proj_df.empty:
-            # Insert projections
             stock_service.delete_projections(table_name, strategy_name)
             stock_service.insert_projections(table_name, proj_df, strategy_name)
             
-            # Update state
             saved_models_manager.set_model_state(
                 table_name,
                 indicators=None,
@@ -691,16 +704,21 @@ class AnalysisPageWidget(QWidget):
                 chart_range=None
             )
             
-            # Reload view
             rows, total_count = stock_service.get_display_data(table_name, limit=500)
             self.middle_pane.load_data(rows, self.current_metadata)
             self.model_label.setText(f"Model: {table_name} ({total_count:,} records)")
     
     def remove_strategy(self, strategy_name: str):
-        """Remove strategy projections"""
+        """Remove strategy projections and clear forecast tab."""
         table_name = self.current_model
         
         stock_service.delete_projections(table_name, strategy_name)
+
+        # Clear forecast tab values so forecast-based strategies are fully undone
+        tabs = getattr(self.middle_pane, "data_tabs", None)
+        if tabs is not None:
+            tabs.clear_forecast_values()
+
         saved_models_manager.set_model_state(
             table_name,
             indicators=None,
@@ -708,7 +726,6 @@ class AnalysisPageWidget(QWidget):
             chart_range=None
         )
         
-        # Reload view
         rows, total_count = stock_service.get_display_data(table_name, limit=500)
         self.middle_pane.load_data(rows, self.current_metadata)
         self.model_label.setText(f"Model: {table_name} ({total_count:,} records)")
@@ -757,9 +774,17 @@ class AnalysisPageWidget(QWidget):
         # In full implementation, would process with AI service
     
     def on_strategy_generated(self, name: str, code: str):
-        """Handle strategy generation from AI"""
+        """Handle strategy generation from AI — refresh left pane."""
         k2_logger.info(f"Strategy generated: {name}", "ANALYSIS")
-        # Could save strategy and apply it
+        self.refresh_left_pane_data()
+
+    def on_strategy_deleted(self, name: str):
+        """Delete strategy from DB, clean up any active projections, refresh UI."""
+        k2_logger.info(f"Strategy deleted: {name}", "ANALYSIS")
+        strategy_service.delete_strategy(name)
+        if self.current_model:
+            self.remove_strategy(name)
+        self.refresh_left_pane_data()
     
     def on_projection_requested_from_ai(self, params: dict):
         """Handle projection request from AI"""

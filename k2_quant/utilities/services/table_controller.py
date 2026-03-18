@@ -34,6 +34,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 from k2_quant.utilities.logger import k2_logger
 from k2_quant.utilities.data.db_manager import db_manager
 from k2_quant.utilities.config import api_config
+from k2_quant.utilities.services.strategy_service import strategy_service
 
 MAX_AGENT_ITERATIONS = 15
 
@@ -124,6 +125,7 @@ class TableController(QObject):
 
             data_modified = False
             tab_writes: list = []
+            strategies_saved: list = []
 
             # ── Persistent engine: load data & workspace once ────────
             df = db_manager.fetch_dataframe(table)
@@ -314,6 +316,7 @@ class TableController(QObject):
                         "cancelled": True,
                         "_tab_writes": tab_writes,
                         "_charts": charts,
+                        "_strategies_saved": strategies_saved,
                     }
 
                 iterations += 1
@@ -412,6 +415,7 @@ class TableController(QObject):
                                 "cancelled": True,
                                 "_tab_writes": tab_writes,
                                 "_charts": charts,
+                                "_strategies_saved": strategies_saved,
                             }
 
                         if isinstance(fn_args, str):
@@ -437,6 +441,12 @@ class TableController(QObject):
                             tool_result = self._tool_run_web_search(
                                 fn_args.get("query", ""),
                                 fn_args.get("max_results", 5))
+                        elif fn_name == "save_strategy":
+                            tool_result = self._tool_save_strategy(
+                                fn_args.get("name", ""),
+                                fn_args.get("code", ""),
+                                fn_args.get("description", ""),
+                                strategies_saved)
                         else:
                             tool_result = {
                                 "error": f"Unknown tool: {fn_name}"}
@@ -463,6 +473,7 @@ class TableController(QObject):
                     "iterations": iterations,
                     "_tab_writes": tab_writes,
                     "_charts": charts,
+                    "_strategies_saved": strategies_saved,
                 }
                 self.operation_complete.emit(result)
                 return result
@@ -475,6 +486,7 @@ class TableController(QObject):
                 "iterations": iterations,
                 "_tab_writes": tab_writes,
                 "_charts": charts,
+                "_strategies_saved": strategies_saved,
             }
             self.operation_complete.emit(result)
             return result
@@ -559,7 +571,7 @@ SUMMARY STATISTICS:
 {stats_text}
 
 INSTRUCTIONS:
-- You have three tools: run_sql (execute SQL against PostgreSQL), run_python (execute Python/pandas code), and run_web_search (search the web for news, events, and qualitative data).
+- You have four tools: run_sql (execute SQL against PostgreSQL), run_python (execute Python/pandas code), run_web_search (search the web for news, events, and qualitative data), and save_strategy (persist a Python script as a toggleable strategy).
 - Break complex tasks into steps. After each step, inspect the result before continuing.
 - Validate your results. If a count seems implausible given the summary stats, double-check.
 - When finished, provide a clear natural-language answer summarizing what you found or did.
@@ -680,6 +692,16 @@ TAB HELPER FUNCTIONS (available inside run_python):
     column_name: exact name of the column to delete.
     sheet: sheet name (defaults to 'Sheet 1').
 
+STRATEGY SAVING:
+- When the user asks you to create a strategy (a reusable script they can toggle on/off),
+  first develop and test the code with run_python, then call the save_strategy tool with
+  the final code.  The strategy will appear as a checkbox in the Strategies panel.
+- The DPE execution context for saved strategies provides: df (DataFrame with columns
+  open, high, low, close, volume, vwap, date_time_market), pd, np, datetime, timedelta,
+  and to_forecast(set_index, open_values, high_values, low_values, close_values).
+- IMPORTANT: When presenting the saved strategy to the user, ALWAYS include the full
+  code in a ```python code block so they can review it.
+
 {self._format_workspace_snapshot(initial_workspace)}"""
 
         except Exception as e:
@@ -777,6 +799,40 @@ TAB HELPER FUNCTIONS (available inside run_python):
                             },
                         },
                         "required": ["query", "purpose"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "save_strategy",
+                    "description": (
+                        "Save a Python strategy script so the user can toggle it "
+                        "on/off from the Strategies panel.  The code will be executed "
+                        "by the DPE when the user toggles the strategy on.  "
+                        "The execution context provides: df (DataFrame with columns "
+                        "open, high, low, close, volume, vwap, date_time_market), "
+                        "pd, np, datetime, timedelta, and to_forecast().  "
+                        "Use this tool AFTER you have developed and tested the "
+                        "strategy code via run_python."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Display name for the strategy (e.g. 'Random 5%')",
+                            },
+                            "code": {
+                                "type": "string",
+                                "description": "The full Python strategy code to save",
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "Short description of what the strategy does",
+                            },
+                        },
+                        "required": ["name", "code"],
                     },
                 },
             },
@@ -994,6 +1050,27 @@ TAB HELPER FUNCTIONS (available inside run_python):
             return {"error": f"Web search failed: {e}", "type": "error"}
         except Exception as e:
             return {"error": f"Web search error: {e}", "type": "error"}
+
+    # ── strategy executor ─────────────────────────────────────────
+
+    def _tool_save_strategy(self, name: str, code: str,
+                            description: str,
+                            strategies_saved: list) -> Dict[str, Any]:
+        """Persist a strategy via strategy_service and track it for the UI."""
+        try:
+            ok = strategy_service.save_strategy(
+                name, code, description=description or "")
+            if not ok:
+                return {"error": "strategy_service.save_strategy returned False",
+                        "type": "error"}
+            strategies_saved.append({"name": name, "code": code,
+                                     "description": description or ""})
+            k2_logger.info(f"Strategy saved via tool: {name}", "TABLE_CTRL")
+            return {"type": "strategy_saved", "name": name,
+                    "message": f"Strategy '{name}' saved. It now appears in "
+                               f"the Strategies panel for the user to toggle."}
+        except Exception as e:
+            return {"error": f"Failed to save strategy: {e}", "type": "error"}
 
     # ── Anthropic format converters ─────────────────────────────────
 

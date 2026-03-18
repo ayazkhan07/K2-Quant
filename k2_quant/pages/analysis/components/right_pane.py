@@ -141,7 +141,7 @@ class RightPaneWidget(QFrame):
         # Header row
         header_row = QHBoxLayout()
         header_row.setContentsMargins(0, 0, 0, 0)
-        ai_label = QLabel("CONVERSATIONAL AI")
+        ai_label = QLabel("THINKSPACE")
         ai_label.setObjectName("sectionTitle")
         header_row.addWidget(ai_label)
         header_row.addStretch()
@@ -204,11 +204,11 @@ class RightPaneWidget(QFrame):
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.ai_input.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
-        self.ai_input.document().setDocumentMargin(4)
+        self.ai_input.document().setDocumentMargin(8)
         self._input_line_height = QFontMetrics(
             self.ai_input.font()).lineSpacing()
         self._input_max_lines = 5
-        self._input_padding = 28
+        self._input_padding = 46
         self.ai_input.setFixedHeight(
             self._input_line_height + self._input_padding)
         self.ai_input.textChanged.connect(self._adjust_input_height)
@@ -757,6 +757,19 @@ class RightPaneWidget(QFrame):
                 self.data_modified.emit()
             if result.get('_tab_writes'):
                 self.tab_writes_ready.emit(result['_tab_writes'])
+            for strat in result.get('_strategies_saved', []):
+                s_name = strat.get('name', '')
+                s_code = strat.get('code', '')
+                if s_name and s_code:
+                    header = QLabel(
+                        f'<span style="color:#4a9eff; font-size:12px;">'
+                        f'Strategy saved: {s_name}</span>')
+                    header.setTextFormat(Qt.TextFormat.RichText)
+                    header.setStyleSheet("background:transparent; padding:4px 0 0 0;")
+                    self._add_widget(header)
+                    self._add_widget(
+                        self._make_code_block_widget(s_code, 'python'))
+                    self.strategy_generated.emit(s_name, s_code)
         else:
             self._pending_charts = []
             error = result.get('error', 'Operation failed')
@@ -986,7 +999,7 @@ class RightPaneWidget(QFrame):
                 background-color: #1a1a1a;
                 color: #fff;
                 border: 1px solid #2a2a2a;
-                padding: 10px 14px;
+                padding: 14px 14px;
                 border-radius: 12px;
                 font-family: 'Inter', 'Segoe UI', Arial, sans-serif;
                 font-size: 13px;

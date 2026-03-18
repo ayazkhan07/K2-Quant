@@ -8,8 +8,10 @@ Save as: k2_quant/pages/analysis/components/left_pane.py
 import re
 from typing import Dict, List, Optional
 from PyQt6.QtWidgets import (QFrame, QVBoxLayout, QLabel, QScrollArea,
-                             QWidget, QCheckBox, QListWidget, QListWidgetItem)
+                             QWidget, QCheckBox, QListWidget, QListWidgetItem,
+                             QMenu)
 from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QAction
 
 from k2_quant.utilities.logger import k2_logger
 
@@ -20,6 +22,7 @@ class LeftPaneWidget(QFrame):
     # Signals
     model_selected = pyqtSignal(str)  # table_name
     strategy_toggled = pyqtSignal(str, bool)  # strategy_name, enabled
+    strategy_deleted = pyqtSignal(str)  # strategy_name
     indicator_toggled = pyqtSignal(str, bool)  # indicator_name, enabled
     
     def __init__(self):
@@ -139,6 +142,19 @@ class LeftPaneWidget(QFrame):
         
         k2_logger.info(f"Strategy '{name}' toggled: {checked}", "LEFT_PANE")
         self.strategy_toggled.emit(name, checked)
+
+    def _show_strategy_context_menu(self, checkbox: QCheckBox, pos, name: str):
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu { background-color: #1a1a1a; color: #e0e0e0; "
+            "border: 1px solid #2a2a2a; padding: 4px; }"
+            "QMenu::item { padding: 6px 20px; }"
+            "QMenu::item:selected { background-color: #5a2020; }")
+        delete_action = menu.addAction("Delete Strategy")
+        chosen = menu.exec(checkbox.mapToGlobal(pos))
+        if chosen == delete_action:
+            self.active_strategies.discard(name)
+            self.strategy_deleted.emit(name)
     
     def on_indicator_toggled(self, name: str, checked: bool):
         """Handle indicator toggle - immediate action"""
@@ -188,13 +204,17 @@ class LeftPaneWidget(QFrame):
             no_strategies.setStyleSheet("color: #666; padding: 10px;")
             self.strategy_layout.addWidget(no_strategies)
         else:
-            # Add strategy checkboxes
             for strategy in strategies:
                 name = strategy.get('name', 'Unknown')
                 checkbox = QCheckBox(name)
                 checkbox.setObjectName("strategyCheckbox")
                 checkbox.stateChanged.connect(
                     lambda state, n=name: self.on_strategy_toggled(n, state == Qt.CheckState.Checked.value)
+                )
+                checkbox.setContextMenuPolicy(
+                    Qt.ContextMenuPolicy.CustomContextMenu)
+                checkbox.customContextMenuRequested.connect(
+                    lambda pos, cb=checkbox, n=name: self._show_strategy_context_menu(cb, pos, n)
                 )
                 self.strategy_layout.addWidget(checkbox)
         

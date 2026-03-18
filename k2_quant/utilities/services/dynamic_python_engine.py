@@ -158,15 +158,22 @@ class StrategyExecutor:
     
     def execute_code(self, code: str, data: pd.DataFrame, 
                     monitor_callback: Optional[Callable] = None) -> Dict[str, Any]:
-        """Execute strategy code with monitoring"""
+        """Execute strategy code with monitoring.
+
+        Strategy code may call ``to_forecast(set_index, ...)`` to write
+        price projections to the Forecast tab.  Any such writes are
+        collected in ``result['_tab_writes']`` for the caller to route.
+        """
         start_time = time.time()
+        tab_writes: List[Dict[str, Any]] = []
         result = {
             'success': False,
             'data': None,
             'output': '',
             'error': None,
             'execution_time': 0,
-            'metrics': {}
+            'metrics': {},
+            '_tab_writes': tab_writes,
         }
         
         # Capture output
@@ -174,10 +181,37 @@ class StrategyExecutor:
         stderr_capture = io.StringIO()
         
         try:
+            # ── Build to_forecast closure (mirrors table_controller) ──
+            def _to_forecast(set_index, open_values=None, high_values=None,
+                             low_values=None, close_values=None):
+                def _clean(vals):
+                    if vals is None:
+                        return None
+                    if isinstance(vals, (pd.Series, np.ndarray)):
+                        vals = vals.tolist()
+                    out = []
+                    for v in vals:
+                        if v is None:
+                            out.append(None)
+                        elif isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
+                            out.append(None)
+                        else:
+                            out.append(float(v))
+                    return out[:500]
+                tab_writes.append({
+                    "type": "forecast",
+                    "set_index": int(set_index),
+                    "open_values": _clean(open_values),
+                    "high_values": _clean(high_values),
+                    "low_values": _clean(low_values),
+                    "close_values": _clean(close_values),
+                })
+
             # Prepare execution context with data
             exec_context = self.execution_context.copy()
             exec_context['data'] = data.copy()  # Work on copy to preserve original
             exec_context['df'] = exec_context['data']  # Alias for convenience
+            exec_context['to_forecast'] = _to_forecast
             
             # Notify monitor
             if monitor_callback:
