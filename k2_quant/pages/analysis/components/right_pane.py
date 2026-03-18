@@ -1,9 +1,8 @@
 """
 Right Pane Component - Conversational AI with Agent Loop
 
-Contains AI chat interface backed by an agent loop that can execute
-multiple tool calls (SQL, Python) per user message, showing intermediate
-steps as the agent works.
+Scroll-based chat layout that supports inline interactive charts
+(matplotlib FigureCanvasQTAgg) alongside text messages.
 
 Save as: k2_quant/pages/analysis/components/right_pane.py
 """
@@ -12,14 +11,14 @@ from typing import Dict, Any, Optional, List
 from datetime import datetime
 import base64
 import html as html_mod
+import json
 import re
 
 from PyQt6.QtWidgets import (QFrame, QVBoxLayout, QHBoxLayout, QTextEdit,
-                             QLineEdit, QPushButton, QLabel, QWidget, QProgressBar,
-                             QSizePolicy, QComboBox)
-from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer, QEvent, QUrl
-from PyQt6.QtGui import (QTextCursor, QTextBlockFormat, QTextCharFormat, QColor,
-                         QFontMetrics, QTextOption, QImage, QTextImageFormat)
+                             QPushButton, QLabel, QWidget, QProgressBar,
+                             QSizePolicy, QComboBox, QScrollArea)
+from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer, QEvent
+from PyQt6.QtGui import QColor, QFontMetrics, QPixmap
 
 from k2_quant.utilities.logger import k2_logger
 from k2_quant.utilities.services import table_controller
@@ -94,47 +93,49 @@ class CommandWorker(QThread):
 
 
 class RightPaneWidget(QFrame):
-    """Right pane with AI chat interface"""
-    
+    """Right pane with AI chat interface (scroll-based with interactive charts)."""
+
     # Signals
-    message_sent = pyqtSignal(str)  # message
-    strategy_generated = pyqtSignal(str, str)  # name, code
-    projection_requested = pyqtSignal(dict)  # parameters
-    data_modified = pyqtSignal()  # emitted when the agent modifies table data
-    tab_writes_ready = pyqtSignal(list)  # emitted when agent routes data to Tab 2/3
-    
+    message_sent = pyqtSignal(str)
+    strategy_generated = pyqtSignal(str, str)
+    projection_requested = pyqtSignal(dict)
+    data_modified = pyqtSignal()
+    tab_writes_ready = pyqtSignal(list)
+
     def __init__(self):
         super().__init__()
         self.setFixedWidth(998)
         self.setObjectName("rightPane")
-        
+
         self.current_context: Optional[Dict[str, Any]] = None
         self.conversation_history: List[Dict[str, str]] = []
         self.worker: Optional[CommandWorker] = None
         self.streaming_timer = None
         self.streaming_text = ""
         self.streaming_index = 0
+        self._streaming_prefix = "AI: "
+        self._streaming_label: Optional[QLabel] = None
         self.math_formatter = MathFormatter(use_block_markers=True)
         self.workspace_provider: Optional[callable] = None
         self.save_chat_callback: Optional[callable] = None
         self.load_chat_callback: Optional[callable] = None
         self._pending_charts: list = []
-        self._chart_counter: int = 0
+        self._message_records: list = []
 
-        # Per-model chat persistence: {table_name: {'html': str, 'history': list}}
         self._chat_store: Dict[str, Dict[str, Any]] = {}
         self._active_table: Optional[str] = None
-        
+
         self.init_ui()
         self.setup_styling()
-    
+
+    # ── UI setup ─────────────────────────────────────────────────
+
     def init_ui(self):
-        """Initialize the UI"""
         layout = QVBoxLayout()
         layout.setContentsMargins(15, 15, 15, 15)
         layout.setSpacing(10)
         self.setLayout(layout)
-        
+
         # Header row
         header_row = QHBoxLayout()
         header_row.setContentsMargins(0, 0, 0, 0)
@@ -157,117 +158,216 @@ class RightPaneWidget(QFrame):
         self.clear_btn.clicked.connect(self.clear_chat)
         header_row.addWidget(self.clear_btn)
         layout.addLayout(header_row)
-        
-        # Chat display
-        self.chat_display = QTextEdit()
-        self.chat_display.setReadOnly(True)
-        self.chat_display.setObjectName("chatDisplay")
-        self.chat_display.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
-        self.chat_display.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
-        self.chat_display.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.chat_display.document().setDefaultStyleSheet(
-            "body { word-wrap: break-word; }"
-            "table { table-layout: fixed; width: 100%; }"
-            "td, th { word-wrap: break-word; overflow-wrap: break-word; }"
-        )
-        layout.addWidget(self.chat_display)
-        
-        # Loading indicator (initially hidden)
+
+        # Chat display — QScrollArea with vertical widget list
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setObjectName("chatScrollArea")
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+
+        self.scroll_content = QWidget()
+        self.scroll_content.setObjectName("chatScrollContent")
+        self.chat_layout = QVBoxLayout(self.scroll_content)
+        self.chat_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.chat_layout.setContentsMargins(10, 10, 10, 10)
+        self.chat_layout.setSpacing(2)
+
+        self.scroll_area.setWidget(self.scroll_content)
+        layout.addWidget(self.scroll_area)
+
+        # Loading indicator
         self.loading_bar = QProgressBar()
         self.loading_bar.setObjectName("loadingBar")
-        self.loading_bar.setMaximum(0)  # Indeterminate progress
+        self.loading_bar.setMaximum(0)
         self.loading_bar.setMinimum(0)
         self.loading_bar.setTextVisible(False)
         self.loading_bar.setFixedHeight(2)
         self.loading_bar.hide()
         layout.addWidget(self.loading_bar)
-        
+
         # Input area
         input_widget = QWidget()
         input_layout = QHBoxLayout()
         input_layout.setContentsMargins(0, 0, 0, 0)
         input_widget.setLayout(input_layout)
-        
+
         self.ai_input = QTextEdit()
         self.ai_input.setPlaceholderText("Type your message...")
         self.ai_input.setObjectName("chatInput")
         self.ai_input.setAcceptRichText(False)
         self.ai_input.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
-        self.ai_input.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.ai_input.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.ai_input.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.ai_input.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.ai_input.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.ai_input.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
         self.ai_input.document().setDocumentMargin(4)
-        self._input_line_height = QFontMetrics(self.ai_input.font()).lineSpacing()
+        self._input_line_height = QFontMetrics(
+            self.ai_input.font()).lineSpacing()
         self._input_max_lines = 5
         self._input_padding = 28
-        self.ai_input.setFixedHeight(self._input_line_height + self._input_padding)
+        self.ai_input.setFixedHeight(
+            self._input_line_height + self._input_padding)
         self.ai_input.textChanged.connect(self._adjust_input_height)
         self.ai_input.installEventFilter(self)
         input_layout.addWidget(self.ai_input)
-        
+
         self.send_btn = QPushButton("Send")
         self.send_btn.clicked.connect(self.send_ai_message)
         self.send_btn.setObjectName("sendBtn")
         input_layout.addWidget(self.send_btn)
-        
+
         layout.addWidget(input_widget)
-    
+
+    # ── chat widget helpers ──────────────────────────────────────
+
+    def _scroll_to_bottom(self):
+        QTimer.singleShot(10, lambda: self.scroll_area.verticalScrollBar(
+            ).setValue(self.scroll_area.verticalScrollBar().maximum()))
+
+    def _add_widget(self, widget):
+        self.chat_layout.addWidget(widget)
+        self._scroll_to_bottom()
+
+    def _make_user_bubble(self, text: str) -> QLabel:
+        label = QLabel()
+        label.setWordWrap(True)
+        label.setTextFormat(Qt.TextFormat.RichText)
+        label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+        label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        label.setStyleSheet("background: transparent; padding: 0; margin: 0;")
+        label.setContentsMargins(0, 14, 0, 0)
+        safe = html_mod.escape(text).replace('\n', '<br>')
+        label.setText(
+            f'<span style="color:#666666;">YOU: </span>'
+            f'<span style="color:#ffffff;">{safe}</span>')
+        return label
+
+    def _make_ai_bubble(self, html_content: str = "") -> QLabel:
+        label = QLabel()
+        label.setWordWrap(True)
+        label.setTextFormat(Qt.TextFormat.RichText)
+        label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        label.setStyleSheet("background: transparent; padding: 0; margin: 0;")
+        label.setContentsMargins(0, 4, 0, 14)
+        if html_content:
+            label.setText(html_content)
+        return label
+
+    def _make_step_label(self, text: str) -> QLabel:
+        label = QLabel(f"  {text}")
+        label.setWordWrap(True)
+        label.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        label.setStyleSheet(
+            "color: #666666; background: transparent;"
+            "font-size: 12px; padding: 0; margin: 0;")
+        label.setContentsMargins(0, 1, 0, 1)
+        return label
+
+    def _build_ai_html(self, text: str, prefix: str = "AI: ") -> str:
+        """Build complete HTML for an AI message bubble."""
+        prefix_html = (
+            f'<span style="color:#666666;">'
+            f'{html_mod.escape(prefix)}</span>')
+
+        if self._has_markdown_table(text):
+            lines = text.split('\n')
+            parts = [prefix_html]
+            i = 0
+            while i < len(lines):
+                stripped = lines[i].strip()
+
+                if '|' in stripped and not self._is_separator_line(stripped):
+                    table_lines = [stripped]
+                    j = i + 1
+                    found_sep = False
+                    while j < len(lines):
+                        s = lines[j].strip()
+                        if not s:
+                            j += 1
+                            continue
+                        if self._is_separator_line(s):
+                            found_sep = True
+                            j += 1
+                            continue
+                        if '|' in s:
+                            table_lines.append(s)
+                            j += 1
+                            continue
+                        break
+                    if found_sep and len(table_lines) >= 2:
+                        rows = []
+                        for tl in table_lines:
+                            cells = [c.strip() for c in tl.split('|')]
+                            if cells and cells[0] == '':
+                                cells = cells[1:]
+                            if cells and cells[-1] == '':
+                                cells = cells[:-1]
+                            if cells:
+                                rows.append(cells)
+                        if rows:
+                            parts.append(self._build_table_html(rows))
+                        i = j
+                        continue
+
+                if stripped:
+                    safe = html_mod.escape(stripped)
+                    parts.append(
+                        f'<span style="color:#ffffff;">{safe}</span><br>')
+                i += 1
+            return ''.join(parts)
+
+        formatted = self.math_formatter.format_full(text)
+        safe = html_mod.escape(formatted).replace('\n', '<br>')
+        return (f'{prefix_html}'
+                f'<span style="color:#ffffff;">{safe}</span>')
+
+    # ── send message ─────────────────────────────────────────────
+
     def send_ai_message(self):
-        """Send message to AI and execute via agent loop"""
         message = self.ai_input.toPlainText().strip()
         if not message:
             return
-        
-        # Add user message to chat (right-aligned)
-        cursor = self.chat_display.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
 
-        block_fmt = QTextBlockFormat()
-        block_fmt.setAlignment(Qt.AlignmentFlag.AlignRight)
-        block_fmt.setTopMargin(18)
-        block_fmt.setBottomMargin(0)
-        cursor.insertBlock(block_fmt)
+        self._add_widget(self._make_user_bubble(message))
+        self._message_records.append({'type': 'user', 'content': message})
 
-        label_fmt = QTextCharFormat()
-        label_fmt.setForeground(QColor("#666666"))
-        cursor.insertText("YOU: ", label_fmt)
-
-        text_fmt = QTextCharFormat()
-        text_fmt.setForeground(QColor("#ffffff"))
-        cursor.insertText(message, text_fmt)
-
-        self.chat_display.setTextCursor(cursor)
-        
-        # Clear input and reset height
         self.ai_input.clear()
-        self.ai_input.setFixedHeight(self._input_line_height + self._input_padding)
-        self.ai_input.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.ai_input.setFixedHeight(
+            self._input_line_height + self._input_padding)
+        self.ai_input.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
-        # Add to history
         self.conversation_history.append({
             'role': 'user',
             'content': message,
             'timestamp': datetime.now().isoformat()
         })
-        
-        # Determine current table from context
+
         table_name = None
         if self.current_context:
             table_name = self.current_context.get('table_name')
 
         if not table_name:
-            self.stream_response("Please load a model first so I know which table to operate on.")
+            self.stream_response(
+                "Please load a model first so I know which table to operate on.")
             return
 
-        # Prevent concurrent requests
         if self.worker and self.worker.isRunning():
-            self.stream_response("Previous command is still executing. Please wait.")
+            self.stream_response(
+                "Previous command is still executing. Please wait.")
             return
 
-        # Show loading indicator
         self.loading_bar.show()
-        
-        # Build clean history for the agent (exclude the message we just added)
+
         history_for_agent = [
             {"role": h["role"], "content": h["content"]}
             for h in self.conversation_history
@@ -294,13 +394,11 @@ class RightPaneWidget(QFrame):
         self.message_sent.emit(message)
 
     def _cancel_request(self):
-        """Cancel the running AI request."""
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
             k2_logger.info("AI request cancelled by user", "AI_CHAT")
 
     def _set_cancel_mode(self, active: bool):
-        """Toggle the send button between Send and Cancel states."""
         try:
             self.send_btn.clicked.disconnect()
         except TypeError:
@@ -316,157 +414,32 @@ class RightPaneWidget(QFrame):
         self.send_btn.style().unpolish(self.send_btn)
         self.send_btn.style().polish(self.send_btn)
 
-    # ── intermediate step display ──────────────────────────────────
+    # ── intermediate step display ────────────────────────────────
 
     def _on_step_update(self, text: str):
-        """Display an intermediate agent step in subdued style."""
-        cursor = self.chat_display.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self._add_widget(self._make_step_label(text))
+        self._message_records.append({'type': 'step', 'content': text})
 
-        block_fmt = QTextBlockFormat()
-        block_fmt.setAlignment(Qt.AlignmentFlag.AlignLeft)
-        block_fmt.setTopMargin(2)
-        block_fmt.setBottomMargin(2)
-        cursor.insertBlock(block_fmt)
-
-        step_fmt = QTextCharFormat()
-        step_fmt.setForeground(QColor("#666666"))
-        cursor.insertText(f"  {text}", step_fmt)
-
-        self.chat_display.setTextCursor(cursor)
-        self.chat_display.ensureCursorVisible()
-
-    # ── response rendering ─────────────────────────────────────────
-
-    # ── markdown table helpers ─────────────────────────────────────
+    # ── markdown table helpers ───────────────────────────────────
 
     @staticmethod
     def _is_separator_line(line: str) -> bool:
-        """True for markdown table separators like |---|---| or :---: | :---:"""
         stripped = line.strip()
         if not stripped or '|' not in stripped:
             return False
         return bool(re.match(r'^[\|\s\-:]+$', stripped) and '--' in stripped)
 
     def _has_markdown_table(self, text: str) -> bool:
-        """Check whether *text* contains at least one markdown-style table."""
         lines = [l.strip() for l in text.split('\n') if l.strip()]
         has_sep = any(self._is_separator_line(l) for l in lines)
         pipe_data = sum(
-            1 for l in lines if '|' in l and not self._is_separator_line(l)
-        )
+            1 for l in lines
+            if '|' in l and not self._is_separator_line(l))
         return has_sep and pipe_data >= 2
 
-    # ── response rendering ─────────────────────────────────────────
-
-    def stream_response(self, text: str, prefix: str = "AI: "):
-        """Stream text with markdown table support."""
-        if self._has_markdown_table(text):
-            self._render_formatted_response(text)
-            return
-
-        self.streaming_text = self.math_formatter.format_full(text)
-        self.streaming_index = 0
-
-        cursor = self.chat_display.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-
-        block_fmt = QTextBlockFormat()
-        block_fmt.setAlignment(Qt.AlignmentFlag.AlignLeft)
-        block_fmt.setTopMargin(6)
-        block_fmt.setBottomMargin(18)
-        cursor.insertBlock(block_fmt)
-
-        label_fmt = QTextCharFormat()
-        label_fmt.setForeground(QColor("#666666"))
-        cursor.insertText(prefix, label_fmt)
-
-        text_fmt = QTextCharFormat()
-        text_fmt.setForeground(QColor("#ffffff"))
-        cursor.setCharFormat(text_fmt)
-        self.chat_display.setTextCursor(cursor)
-        
-        if self.streaming_timer:
-            self.streaming_timer.stop()
-        
-        self.streaming_timer = QTimer()
-        self.streaming_timer.timeout.connect(self._stream_next_chunk)
-        self.streaming_timer.start(20)
-
-    def _render_formatted_response(self, text: str):
-        """Render response converting markdown tables to proper HTML tables."""
-        cursor = self.chat_display.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-
-        block_fmt = QTextBlockFormat()
-        block_fmt.setAlignment(Qt.AlignmentFlag.AlignLeft)
-        block_fmt.setTopMargin(6)
-        block_fmt.setBottomMargin(18)
-        cursor.insertBlock(block_fmt)
-
-        label_fmt = QTextCharFormat()
-        label_fmt.setForeground(QColor("#666666"))
-        cursor.insertText("AI: ", label_fmt)
-
-        text_fmt = QTextCharFormat()
-        text_fmt.setForeground(QColor("#ffffff"))
-        cursor.setCharFormat(text_fmt)
-
-        lines = text.split('\n')
-        i = 0
-
-        while i < len(lines):
-            stripped = lines[i].strip()
-
-            if '|' in stripped and not self._is_separator_line(stripped):
-                table_lines = [stripped]
-                j = i + 1
-                found_separator = False
-
-                while j < len(lines):
-                    s = lines[j].strip()
-                    if not s:
-                        j += 1
-                        continue
-                    if self._is_separator_line(s):
-                        found_separator = True
-                        j += 1
-                        continue
-                    if '|' in s:
-                        table_lines.append(s)
-                        j += 1
-                        continue
-                    break
-
-                if found_separator and len(table_lines) >= 2:
-                    rows = []
-                    for tl in table_lines:
-                        cells = [c.strip() for c in tl.split('|')]
-                        if cells and cells[0] == '':
-                            cells = cells[1:]
-                        if cells and cells[-1] == '':
-                            cells = cells[:-1]
-                        if cells:
-                            rows.append(cells)
-                    if rows:
-                        self._insert_table(cursor, rows)
-                    i = j
-                    continue
-
-            if stripped:
-                cursor.insertText(stripped + '\n')
-            i += 1
-
-        if self._pending_charts:
-            self._insert_charts(self._pending_charts)
-            self._pending_charts = []
-
-        self.chat_display.ensureCursorVisible()
-
-    def _insert_table(self, cursor, rows):
-        """Insert a well-formatted HTML table into the chat display."""
+    def _build_table_html(self, rows: list) -> str:
         if not rows:
-            return
+            return ""
 
         num_cols = max(len(r) for r in rows)
         for r in rows:
@@ -504,70 +477,148 @@ class RightPaneWidget(QFrame):
             table_html += "</tr>"
 
         table_html += "</tbody></table>"
-        cursor.insertHtml(table_html)
+        return table_html
 
-    def _insert_charts(self, charts: list):
-        """Insert base64-encoded PNG charts as inline images in the chat."""
-        cursor = self.chat_display.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        doc = self.chat_display.document()
+    # ── response rendering ───────────────────────────────────────
 
-        for img_b64 in charts:
-            img_data = base64.b64decode(img_b64)
-            image = QImage()
-            image.loadFromData(img_data)
-            if image.isNull():
-                continue
+    def stream_response(self, text: str, prefix: str = "AI: "):
+        self._message_records.append(
+            {'type': 'ai', 'content': text, 'prefix': prefix})
 
-            self._chart_counter += 1
-            resource_name = f"chart_{self._chart_counter}"
-            doc.addResource(2, QUrl(resource_name), image)
+        if self._has_markdown_table(text):
+            self._render_formatted_response(text, prefix)
+            return
 
-            max_w = self.chat_display.viewport().width() - 30
-            scale = min(1.0, max_w / image.width()) if image.width() > 0 else 1.0
+        self.streaming_text = self.math_formatter.format_full(text)
+        self.streaming_index = 0
+        self._streaming_prefix = prefix
 
-            block_fmt = QTextBlockFormat()
-            block_fmt.setAlignment(Qt.AlignmentFlag.AlignLeft)
-            block_fmt.setTopMargin(10)
-            block_fmt.setBottomMargin(10)
-            cursor.insertBlock(block_fmt)
+        label = self._make_ai_bubble()
+        prefix_html = (
+            f'<span style="color:#666666;">'
+            f'{html_mod.escape(prefix)}</span>')
+        label.setText(prefix_html)
+        self._streaming_label = label
+        self._add_widget(label)
 
-            img_fmt = QTextImageFormat()
-            img_fmt.setName(resource_name)
-            img_fmt.setWidth(image.width() * scale)
-            img_fmt.setHeight(image.height() * scale)
-            cursor.insertImage(img_fmt)
+        if self.streaming_timer:
+            self.streaming_timer.stop()
 
-        self.chat_display.setTextCursor(cursor)
-        self.chat_display.ensureCursorVisible()
+        self.streaming_timer = QTimer()
+        self.streaming_timer.timeout.connect(self._stream_next_chunk)
+        self.streaming_timer.start(20)
+
+    def _render_formatted_response(self, text: str, prefix: str = "AI: "):
+        label = self._make_ai_bubble(self._build_ai_html(text, prefix))
+        self._add_widget(label)
+
+        if self._pending_charts:
+            self._insert_charts(self._pending_charts)
+            self._pending_charts = []
 
     def _stream_next_chunk(self):
-        """Stream next chunk of text"""
         if self.streaming_index < len(self.streaming_text):
-            chunk_size = min(2, len(self.streaming_text) - self.streaming_index)
-            chunk = self.streaming_text[self.streaming_index:self.streaming_index + chunk_size]
-            
-            cursor = self.chat_display.textCursor()
-            cursor.movePosition(QTextCursor.MoveOperation.End)
-            fmt = QTextCharFormat()
-            fmt.setForeground(QColor("#ffffff"))
-            cursor.insertText(chunk, fmt)
-            self.chat_display.setTextCursor(cursor)
-            
-            self.chat_display.ensureCursorVisible()
-            
+            chunk_size = min(
+                2, len(self.streaming_text) - self.streaming_index)
             self.streaming_index += chunk_size
+
+            text_so_far = self.streaming_text[:self.streaming_index]
+            safe = html_mod.escape(text_so_far).replace('\n', '<br>')
+            prefix_html = (
+                f'<span style="color:#666666;">'
+                f'{html_mod.escape(self._streaming_prefix)}</span>')
+            self._streaming_label.setText(
+                f'{prefix_html}'
+                f'<span style="color:#ffffff;">{safe}</span>')
+            self._scroll_to_bottom()
         else:
             self.streaming_timer.stop()
             self.streaming_timer = None
+            self._streaming_label = None
             if self._pending_charts:
                 self._insert_charts(self._pending_charts)
                 self._pending_charts = []
 
-    # ── worker result handling ─────────────────────────────────────
-    
+    # ── chart insertion ──────────────────────────────────────────
+
+    def _insert_charts(self, charts: list):
+        for chart_data in charts:
+            if isinstance(chart_data, dict):
+                fig = chart_data.get('figure')
+                png = chart_data.get('png', '')
+            else:
+                fig = None
+                png = chart_data
+
+            inserted = False
+            if fig is not None:
+                try:
+                    widget = self._create_interactive_chart(fig)
+                    self._add_widget(widget)
+                    inserted = True
+                except Exception as e:
+                    k2_logger.error(
+                        f"Interactive chart failed, falling back to PNG: {e}",
+                        "AI_CHAT")
+
+            if not inserted and png:
+                self._add_static_chart(png)
+
+            self._message_records.append(
+                {'type': 'chart', 'png': png if isinstance(png, str) else ''})
+
+    def _create_interactive_chart(self, figure):
+        from matplotlib.backends.backend_qtagg import (
+            FigureCanvasQTAgg, NavigationToolbar2QT)
+
+        container = QFrame()
+        container.setObjectName("chartContainer")
+        container.setStyleSheet("""
+            #chartContainer {
+                background-color: #1a1a1a;
+                border: 1px solid #2a2a2a;
+                border-radius: 4px;
+            }
+        """)
+        clayout = QVBoxLayout(container)
+        clayout.setContentsMargins(4, 4, 4, 4)
+        clayout.setSpacing(2)
+
+        canvas = FigureCanvasQTAgg(figure)
+        canvas.setMinimumHeight(350)
+        canvas.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        toolbar = NavigationToolbar2QT(canvas, container)
+        toolbar.setStyleSheet(
+            "background: #1a1a1a; border: none; color: #ccc;")
+
+        clayout.addWidget(toolbar)
+        clayout.addWidget(canvas)
+        container.setMinimumHeight(400)
+        return container
+
+    def _add_static_chart(self, png_b64: str):
+        label = QLabel()
+        label.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        label.setStyleSheet("background: transparent;")
+        label.setContentsMargins(0, 6, 0, 6)
+
+        img_data = base64.b64decode(png_b64)
+        pixmap = QPixmap()
+        pixmap.loadFromData(img_data)
+
+        max_w = self.scroll_area.viewport().width() - 30
+        if pixmap.width() > max_w > 0:
+            pixmap = pixmap.scaledToWidth(
+                max_w, Qt.TransformationMode.SmoothTransformation)
+
+        label.setPixmap(pixmap)
+        self._add_widget(label)
+
+    # ── worker result handling ───────────────────────────────────
+
     def _on_worker_result(self, result: Dict[str, Any]):
-        """Handle worker completion."""
         self.loading_bar.hide()
         self._set_cancel_mode(False)
         self._pending_charts = result.get('_charts', [])
@@ -581,7 +632,8 @@ class RightPaneWidget(QFrame):
                 'timestamp': datetime.now().isoformat()
             })
         elif result.get('success'):
-            response = result.get('display_message', 'Operation completed successfully.')
+            response = result.get(
+                'display_message', 'Operation completed successfully.')
             self.stream_response(response)
 
             self.conversation_history.append({
@@ -595,8 +647,10 @@ class RightPaneWidget(QFrame):
             if result.get('_tab_writes'):
                 self.tab_writes_ready.emit(result['_tab_writes'])
         else:
+            self._pending_charts = []
             error = result.get('error', 'Operation failed')
-            self.stream_response(f"Unable to complete that request. {error}")
+            self.stream_response(
+                f"Unable to complete that request. {error}")
 
             self.conversation_history.append({
                 'role': 'assistant',
@@ -607,21 +661,22 @@ class RightPaneWidget(QFrame):
         self.worker = None
 
     def _on_worker_error(self, error_msg: str):
-        """Handle worker error"""
         self.loading_bar.hide()
         self._set_cancel_mode(False)
-        self.stream_response(f"Unable to process that request. {error_msg}")
+        self._pending_charts = []
+        self.stream_response(
+            f"Unable to process that request. {error_msg}")
         self.worker = None
-    
-    # ── context and state management ───────────────────────────────
+
+    # ── context and state management ─────────────────────────────
 
     def set_data_context(self, context: Dict[str, Any]):
-        """Set the data context for AI, saving and restoring chat per model."""
+        """Save current chat, load or create chat for the new model."""
         new_table = context.get('table_name') if context else None
 
         if self._active_table:
             chat_state = {
-                'html': self.chat_display.toHtml(),
+                'records': list(self._message_records),
                 'history': list(self.conversation_history),
             }
             self._chat_store[self._active_table] = chat_state
@@ -629,38 +684,108 @@ class RightPaneWidget(QFrame):
                 try:
                     self.save_chat_callback(
                         self._active_table,
-                        chat_state['html'],
+                        json.dumps(self._message_records),
                         chat_state['history'])
                 except Exception:
                     pass
 
         if new_table and new_table in self._chat_store:
             saved = self._chat_store[new_table]
-            self.chat_display.setHtml(saved['html'])
-            self.conversation_history = list(saved['history'])
+            self._rebuild_chat(saved.get('records', []))
+            self.conversation_history = list(saved.get('history', []))
         elif new_table and self.load_chat_callback:
             try:
                 saved = self.load_chat_callback(new_table)
-                if saved and saved.get('html'):
-                    self.chat_display.setHtml(saved['html'])
-                    self.conversation_history = list(saved.get('history', []))
-                    self._chat_store[new_table] = saved
+                if saved:
+                    records = None
+                    raw = saved.get('html', '')
+                    if raw:
+                        try:
+                            records = json.loads(raw)
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+
+                    if isinstance(records, list):
+                        self._rebuild_chat(records)
+                    else:
+                        self._rebuild_from_history(
+                            saved.get('history', []))
+
+                    self.conversation_history = list(
+                        saved.get('history', []))
+                    self._chat_store[new_table] = {
+                        'records': list(self._message_records),
+                        'history': self.conversation_history,
+                    }
                 else:
-                    self.chat_display.clear()
+                    self._clear_chat_widgets()
                     self.conversation_history.clear()
             except Exception:
-                self.chat_display.clear()
+                self._clear_chat_widgets()
                 self.conversation_history.clear()
         else:
-            self.chat_display.clear()
+            self._clear_chat_widgets()
             self.conversation_history.clear()
 
         self._active_table = new_table
         self.current_context = context
-    
+
+    def _rebuild_chat(self, records: list):
+        """Reconstruct chat widgets from saved message records."""
+        self._clear_chat_widgets()
+        self._message_records = []
+        for rec in records:
+            rtype = rec.get('type', '')
+            content = rec.get('content', '')
+            prefix = rec.get('prefix', 'AI: ')
+
+            if rtype == 'user':
+                self.chat_layout.addWidget(self._make_user_bubble(content))
+                self._message_records.append(rec)
+            elif rtype == 'ai':
+                html = self._build_ai_html(content, prefix)
+                self.chat_layout.addWidget(self._make_ai_bubble(html))
+                self._message_records.append(rec)
+            elif rtype == 'step':
+                self.chat_layout.addWidget(self._make_step_label(content))
+                self._message_records.append(rec)
+            elif rtype == 'chart':
+                png = rec.get('png', '')
+                if png:
+                    self._add_static_chart(png)
+                self._message_records.append(rec)
+        self._scroll_to_bottom()
+
+    def _rebuild_from_history(self, history: list):
+        """Fallback: rebuild chat from conversation history (old format)."""
+        self._clear_chat_widgets()
+        self._message_records = []
+        for msg in history:
+            role = msg.get('role', '')
+            content = msg.get('content', '')
+            if not content:
+                continue
+            if role == 'user':
+                self.chat_layout.addWidget(self._make_user_bubble(content))
+                self._message_records.append(
+                    {'type': 'user', 'content': content})
+            elif role == 'assistant':
+                html = self._build_ai_html(content, 'AI: ')
+                self.chat_layout.addWidget(self._make_ai_bubble(html))
+                self._message_records.append(
+                    {'type': 'ai', 'content': content, 'prefix': 'AI: '})
+        self._scroll_to_bottom()
+
+    def _clear_chat_widgets(self):
+        while self.chat_layout.count():
+            item = self.chat_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        self._message_records = []
+
     def clear_chat(self):
-        """Clear chat history for the active model and persist the empty state."""
-        self.chat_display.clear()
+        self._clear_chat_widgets()
         self.conversation_history.clear()
         if self._active_table and self._active_table in self._chat_store:
             del self._chat_store[self._active_table]
@@ -670,11 +795,10 @@ class RightPaneWidget(QFrame):
             except Exception:
                 pass
         k2_logger.info("Chat cleared", "AI_CHAT")
-    
-    # ── auto-growing input ───────────────────────────────────────────
+
+    # ── auto-growing input ───────────────────────────────────────
 
     def eventFilter(self, obj, event):
-        """Enter sends the message; Shift+Enter inserts a newline."""
         if obj is self.ai_input and event.type() == QEvent.Type.KeyPress:
             if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
                 if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
@@ -694,18 +818,21 @@ class RightPaneWidget(QFrame):
         self.ai_input.setFixedHeight(new_h)
 
         if content_h + pad > max_h:
-            self.ai_input.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            self.ai_input.setVerticalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         else:
-            self.ai_input.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            self.ai_input.setVerticalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+    # ── styling ──────────────────────────────────────────────────
 
     def setup_styling(self):
-        """Apply styling to the pane"""
         self.setStyleSheet("""
             #rightPane {
                 background-color: #0f0f0f;
                 border-left: 1px solid #1a1a1a;
             }
-            
+
             #sectionTitle {
                 font-size: 11px;
                 text-transform: uppercase;
@@ -717,28 +844,32 @@ class RightPaneWidget(QFrame):
                 padding: 5px 10px;
                 border-radius: 3px;
             }
-            
-            #chatDisplay {
+
+            #chatScrollArea {
                 background-color: #0a0a0a;
-                color: #ccc;
                 border: 1px solid #1a1a1a;
                 border-radius: 4px;
-                padding: 10px;
+            }
+
+            #chatScrollContent {
+                background-color: #0a0a0a;
+            }
+
+            #chatScrollContent QLabel {
                 font-family: 'Inter', 'Segoe UI', Arial, sans-serif;
                 font-size: 13px;
-                line-height: 1.6;
             }
-            
+
             #loadingBar {
                 background-color: #0a0a0a;
                 border: none;
             }
-            
+
             #loadingBar::chunk {
                 background-color: #ffffff;
                 border-radius: 1px;
             }
-            
+
             #chatInput {
                 background-color: #1a1a1a;
                 color: #fff;
@@ -748,7 +879,7 @@ class RightPaneWidget(QFrame):
                 font-family: 'Inter', 'Segoe UI', Arial, sans-serif;
                 font-size: 13px;
             }
-            
+
             #sendBtn {
                 background-color: #1a1a1a;
                 color: #fff;
@@ -757,11 +888,11 @@ class RightPaneWidget(QFrame):
                 border-radius: 3px;
                 font-weight: bold;
             }
-            
+
             #sendBtn:hover {
                 background-color: #2a2a2a;
             }
-            
+
             #cancelBtn {
                 background-color: #3a1a1a;
                 color: #ff6b6b;
@@ -770,12 +901,12 @@ class RightPaneWidget(QFrame):
                 border-radius: 3px;
                 font-weight: bold;
             }
-            
+
             #cancelBtn:hover {
                 background-color: #4a2222;
                 border-color: #ff6b6b;
             }
-            
+
             #modelCombo {
                 background-color: #1a1a1a;
                 color: #ccc;
@@ -786,23 +917,23 @@ class RightPaneWidget(QFrame):
                 font-family: 'Inter', 'Segoe UI', Arial, sans-serif;
                 min-width: 140px;
             }
-            
+
             #modelCombo:hover {
                 border-color: #444;
             }
-            
+
             #modelCombo QAbstractItemView {
                 background-color: #1a1a1a;
                 color: #ccc;
                 selection-background-color: #2a2a2a;
                 border: 1px solid #333;
             }
-            
+
             #modelCombo::drop-down {
                 border: none;
                 width: 20px;
             }
-            
+
             #clearChatBtn {
                 background-color: transparent;
                 color: #666;
@@ -811,26 +942,27 @@ class RightPaneWidget(QFrame):
                 border-radius: 3px;
                 font-size: 11px;
             }
-            
+
             #clearChatBtn:hover {
                 background-color: #2a2a2a;
                 color: #fff;
             }
         """)
-    
+
+    # ── cleanup ──────────────────────────────────────────────────
+
     def cleanup(self):
-        """Cleanup resources, persisting active chat before clearing."""
         if self.streaming_timer:
             self.streaming_timer.stop()
         if self._active_table and self.save_chat_callback:
             try:
                 self.save_chat_callback(
                     self._active_table,
-                    self.chat_display.toHtml(),
+                    json.dumps(self._message_records),
                     list(self.conversation_history))
             except Exception:
                 pass
-        self.chat_display.clear()
+        self._clear_chat_widgets()
         self.conversation_history.clear()
         self._chat_store.clear()
         self._active_table = None

@@ -32,6 +32,7 @@ This module orchestrates technical indicator application with the following obje
    - MUST handle parameter mismatches gracefully
 """
 
+import json
 import re
 from typing import Dict, Optional, Any, List, Union
 from datetime import datetime
@@ -876,7 +877,7 @@ class AnalysisPageWidget(QWidget):
                 self.middle_pane.persist_tab_data(self.current_model)
                 self._save_chat(
                     self.current_model,
-                    self.right_pane.chat_display.toHtml(),
+                    json.dumps(self.right_pane._message_records),
                     list(self.right_pane.conversation_history))
 
             # Clear left pane states

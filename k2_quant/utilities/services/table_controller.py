@@ -277,9 +277,10 @@ class TableController(QObject):
                     facecolor=target.get_facecolor(), edgecolor='none',
                 )
                 buf.seek(0)
-                charts.append(base64.b64encode(buf.read()).decode('utf-8'))
+                png_b64 = base64.b64encode(buf.read()).decode('utf-8')
                 buf.close()
                 plt.close(target)
+                charts.append({'png': png_b64, 'figure': target})
                 return f"Chart captured ({len(charts)} total)"
 
             # Persistent namespace shared across all run_python calls
