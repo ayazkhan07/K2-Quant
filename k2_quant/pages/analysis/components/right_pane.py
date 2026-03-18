@@ -10,14 +10,16 @@ Save as: k2_quant/pages/analysis/components/right_pane.py
 
 from typing import Dict, Any, Optional, List
 from datetime import datetime
+import base64
 import html as html_mod
 import re
 
 from PyQt6.QtWidgets import (QFrame, QVBoxLayout, QHBoxLayout, QTextEdit,
                              QLineEdit, QPushButton, QLabel, QWidget, QProgressBar,
                              QSizePolicy, QComboBox)
-from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer, QEvent
-from PyQt6.QtGui import QTextCursor, QTextBlockFormat, QTextCharFormat, QColor, QFontMetrics, QTextOption
+from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer, QEvent, QUrl
+from PyQt6.QtGui import (QTextCursor, QTextBlockFormat, QTextCharFormat, QColor,
+                         QFontMetrics, QTextOption, QImage, QTextImageFormat)
 
 from k2_quant.utilities.logger import k2_logger
 from k2_quant.utilities.services import table_controller
@@ -116,6 +118,8 @@ class RightPaneWidget(QFrame):
         self.workspace_provider: Optional[callable] = None
         self.save_chat_callback: Optional[callable] = None
         self.load_chat_callback: Optional[callable] = None
+        self._pending_charts: list = []
+        self._chart_counter: int = 0
 
         # Per-model chat persistence: {table_name: {'html': str, 'history': list}}
         self._chat_store: Dict[str, Dict[str, Any]] = {}
@@ -453,6 +457,10 @@ class RightPaneWidget(QFrame):
                 cursor.insertText(stripped + '\n')
             i += 1
 
+        if self._pending_charts:
+            self._insert_charts(self._pending_charts)
+            self._pending_charts = []
+
         self.chat_display.ensureCursorVisible()
 
     def _insert_table(self, cursor, rows):
@@ -497,7 +505,42 @@ class RightPaneWidget(QFrame):
 
         table_html += "</tbody></table>"
         cursor.insertHtml(table_html)
-    
+
+    def _insert_charts(self, charts: list):
+        """Insert base64-encoded PNG charts as inline images in the chat."""
+        cursor = self.chat_display.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        doc = self.chat_display.document()
+
+        for img_b64 in charts:
+            img_data = base64.b64decode(img_b64)
+            image = QImage()
+            image.loadFromData(img_data)
+            if image.isNull():
+                continue
+
+            self._chart_counter += 1
+            resource_name = f"chart_{self._chart_counter}"
+            doc.addResource(2, QUrl(resource_name), image)
+
+            max_w = self.chat_display.viewport().width() - 30
+            scale = min(1.0, max_w / image.width()) if image.width() > 0 else 1.0
+
+            block_fmt = QTextBlockFormat()
+            block_fmt.setAlignment(Qt.AlignmentFlag.AlignLeft)
+            block_fmt.setTopMargin(10)
+            block_fmt.setBottomMargin(10)
+            cursor.insertBlock(block_fmt)
+
+            img_fmt = QTextImageFormat()
+            img_fmt.setName(resource_name)
+            img_fmt.setWidth(image.width() * scale)
+            img_fmt.setHeight(image.height() * scale)
+            cursor.insertImage(img_fmt)
+
+        self.chat_display.setTextCursor(cursor)
+        self.chat_display.ensureCursorVisible()
+
     def _stream_next_chunk(self):
         """Stream next chunk of text"""
         if self.streaming_index < len(self.streaming_text):
@@ -517,6 +560,9 @@ class RightPaneWidget(QFrame):
         else:
             self.streaming_timer.stop()
             self.streaming_timer = None
+            if self._pending_charts:
+                self._insert_charts(self._pending_charts)
+                self._pending_charts = []
 
     # ── worker result handling ─────────────────────────────────────
     
@@ -524,8 +570,10 @@ class RightPaneWidget(QFrame):
         """Handle worker completion."""
         self.loading_bar.hide()
         self._set_cancel_mode(False)
+        self._pending_charts = result.get('_charts', [])
 
         if result.get('cancelled'):
+            self._pending_charts = []
             self.stream_response("Request cancelled.", prefix="")
             self.conversation_history.append({
                 'role': 'assistant',

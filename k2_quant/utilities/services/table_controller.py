@@ -16,9 +16,16 @@ successive run_python tool invocations within the same agent turn.
 import json
 import re
 import requests
+import base64
 from decimal import Decimal
+from io import BytesIO
 from typing import Dict, Any, Optional, List, Callable
 from datetime import datetime
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+plt.style.use('dark_background')
 
 import pandas as pd
 import numpy as np
@@ -257,13 +264,33 @@ class TableController(QObject):
                     "close_values": _clean_forecast(close_values),
                 })
 
+            # ── Chart helper ─────────────────────────────────────────
+            charts: list = []
+
+            def _show_chart(title=None, fig=None):
+                target = fig or plt.gcf()
+                if title:
+                    target.suptitle(title)
+                buf = BytesIO()
+                target.savefig(
+                    buf, format='png', dpi=150, bbox_inches='tight',
+                    facecolor=target.get_facecolor(), edgecolor='none',
+                )
+                buf.seek(0)
+                charts.append(base64.b64encode(buf.read()).decode('utf-8'))
+                buf.close()
+                plt.close(target)
+                return f"Chart captured ({len(charts)} total)"
+
             # Persistent namespace shared across all run_python calls
             exec_globals = {
                 "df": df,
                 "pd": pd,
                 "np": np,
+                "plt": plt,
                 "datetime": datetime,
                 "result": None,
+                "show_chart": _show_chart,
                 "to_working": _to_working,
                 "read_working": _read_working,
                 "to_forecast": _to_forecast,
@@ -271,6 +298,7 @@ class TableController(QObject):
                 "workspace_info": _workspace_info,
                 "list_sheets": _list_sheets,
                 "_write_verifications": write_verifications,
+                "_charts": charts,
             }
 
             # ── Agent loop ───────────────────────────────────────────
@@ -284,6 +312,7 @@ class TableController(QObject):
                         "data_modified": data_modified,
                         "cancelled": True,
                         "_tab_writes": tab_writes,
+                        "_charts": charts,
                     }
 
                 iterations += 1
@@ -381,6 +410,7 @@ class TableController(QObject):
                                 "data_modified": data_modified,
                                 "cancelled": True,
                                 "_tab_writes": tab_writes,
+                                "_charts": charts,
                             }
 
                         if isinstance(fn_args, str):
@@ -431,6 +461,7 @@ class TableController(QObject):
                     "data_modified": data_modified,
                     "iterations": iterations,
                     "_tab_writes": tab_writes,
+                    "_charts": charts,
                 }
                 self.operation_complete.emit(result)
                 return result
@@ -442,6 +473,7 @@ class TableController(QObject):
                 "data_modified": data_modified,
                 "iterations": iterations,
                 "_tab_writes": tab_writes,
+                "_charts": charts,
             }
             self.operation_complete.emit(result)
             return result
@@ -567,6 +599,26 @@ PYTHON NOTES:
 - The DataFrame must always retain a 'timestamp' column.
 - To return a computed value without modifying the table, assign to 'result' variable.
 
+CHARTING (available inside run_python):
+- 'plt' (matplotlib.pyplot) is available with a dark theme pre-configured.
+- After building a chart, call show_chart() to display it inline in the chat.
+  show_chart(title=None, fig=None) — captures the current figure as an image.
+  Do NOT call plt.show() — it will freeze the application. Always use show_chart().
+- Always call plt.figure() before creating a new chart.
+- You can create any matplotlib visualization: line plots, scatter plots, bar charts,
+  histograms, mathematical function graphs, heatmaps, etc.
+- Always add axis labels, a title, and grid for readability.
+- Example for equation plotting:
+    x = np.linspace(-10, 10, 200)
+    y = 2*x + 5
+    plt.figure()
+    plt.plot(x, y)
+    plt.title('y = 2x + 5')
+    plt.xlabel('x')
+    plt.ylabel('y')
+    plt.grid(True, alpha=0.3)
+    show_chart()
+
 VERIFICATION:
 - After every to_working() call, the system automatically returns a verification summary
   showing the column name and the first values written. ALWAYS inspect this verification
@@ -668,9 +720,10 @@ TAB HELPER FUNCTIONS (available inside run_python):
                     "description": (
                         f"Execute Python code on the '{table}' data. The environment "
                         f"is persistent — variables, 'df', and workspace state survive "
-                        f"between calls. 'pd', 'np', 'datetime' are available. "
+                        f"between calls. 'pd', 'np', 'datetime', 'plt' are available. "
                         f"Use read_working(sheet=…)/to_working(sheet=…) for workspace I/O. "
                         f"Use list_sheets() to see available sheets. "
+                        f"Use show_chart() after plt calls to display charts inline (never plt.show()). "
                         f"Assign to 'result' variable to return a computed value."
                     ),
                     "parameters": {
@@ -776,6 +829,7 @@ TAB HELPER FUNCTIONS (available inside run_python):
             df_before = exec_globals["df"].copy(deep=True)
             original_cols = set(df_before.columns)
             original_len = len(df_before)
+            charts_before = len(exec_globals.get("_charts", []))
 
             exec_globals["result"] = None
 
@@ -882,6 +936,10 @@ TAB HELPER FUNCTIONS (available inside run_python):
                 pending = list(verifications)
                 verifications.clear()
                 resp["workspace_writes_verification"] = pending
+
+            new_charts = len(exec_globals.get("_charts", [])) - charts_before
+            if new_charts > 0:
+                resp["charts_generated"] = new_charts
 
             return resp
 
