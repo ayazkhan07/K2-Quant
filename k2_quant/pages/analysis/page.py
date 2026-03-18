@@ -723,14 +723,18 @@ class AnalysisPageWidget(QWidget):
         k2_logger.info(f"View mode changed to {mode}", "ANALYSIS")
     
     def on_forecast_apply(self, forecast_data: dict):
-        """Render forecast data as dashed OHLC lines on the chart."""
-        k2_logger.info(
-            f"Forecast apply received: {len(forecast_data)} set(s)", "ANALYSIS")
+        """Render forecast data as dashed OHLC lines on the chart, or clear them."""
         cw = getattr(self.middle_pane, "chart_widget", None)
         if cw is None:
             k2_logger.warning("No chart widget — cannot render forecast lines", "ANALYSIS")
             return
-        cw.add_forecast_data(forecast_data)
+        if not forecast_data:
+            cw.clear_forecast_data()
+            k2_logger.info("Forecast lines cleared from chart", "ANALYSIS")
+        else:
+            cw.add_forecast_data(forecast_data)
+            k2_logger.info(
+                f"Forecast apply received: {len(forecast_data)} set(s)", "ANALYSIS")
 
     def on_projection_requested(self):
         """Handle projection request from middle pane"""

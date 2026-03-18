@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QTableWidget,
     QTableWidgetItem, QPushButton, QLabel, QHeaderView, QMessageBox,
     QMenu, QTableView, QAbstractItemView, QStyledItemDelegate,
+    QToolButton,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QAbstractTableModel, QModelIndex
 from PyQt6.QtGui import QFont, QColor
@@ -524,13 +525,18 @@ class DataTabsWidget(QWidget):
         self.btn_add_set.clicked.connect(self.add_forecast_set)
         tl.addWidget(self.btn_add_set)
 
-        btn_apply = QPushButton("Apply to Chart")
-        btn_apply.setToolTip("Push populated forecasts to chart as dashed lines")
-        btn_apply.clicked.connect(self._emit_forecast)
-        tl.addWidget(btn_apply)
+        self.btn_chart_lines = QToolButton()
+        self.btn_chart_lines.setText("Chart Lines ▾")
+        self.btn_chart_lines.setToolTip("Toggle forecast lines on the chart")
+        self.btn_chart_lines.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._chart_lines_menu = QMenu(self.btn_chart_lines)
+        self._chart_lines_menu.setStyleSheet(self._dropdown_menu_style())
+        self.btn_chart_lines.setMenu(self._chart_lines_menu)
+        self._forecast_actions: Dict[str, 'QAction'] = {}
+        tl.addWidget(self.btn_chart_lines)
 
         btn_clear = QPushButton("Clear Forecasts")
-        btn_clear.setToolTip("Erase forecast values; timestamps preserved")
+        btn_clear.setToolTip("Erase forecast values and remove chart lines")
         btn_clear.clicked.connect(self.clear_forecast_values)
         tl.addWidget(btn_clear)
 
@@ -756,6 +762,7 @@ class DataTabsWidget(QWidget):
             market_hours_only, count=self.FORECAST_ROW_COUNT,
         )
         self._rebuild_forecast_table()
+        self._rebuild_chart_lines_menu()
         self.forecast_info.setText(
             f"{len(self._forecast_timestamps)} future timestamps generated"
         )
@@ -774,6 +781,7 @@ class DataTabsWidget(QWidget):
             return
         self._forecast_sets += 1
         self._rebuild_forecast_table()
+        self._rebuild_chart_lines_menu()
         k2_logger.info(f"Forecast set P{self._forecast_sets} added", "DATA_TABS")
 
     def _rebuild_forecast_table(self):
@@ -831,8 +839,116 @@ class DataTabsWidget(QWidget):
         self._pad_empty_columns(table)
         table.blockSignals(False)
 
+    def _rebuild_chart_lines_menu(self):
+        """Rebuild the Chart Lines dropdown with grouped entries per forecast set."""
+        self._chart_lines_menu.clear()
+        self._forecast_actions.clear()
+
+        if self._forecast_sets == 0:
+            action = self._chart_lines_menu.addAction("No forecast sets")
+            action.setEnabled(False)
+            return
+
+        for s in range(1, self._forecast_sets + 1):
+            set_menu = self._chart_lines_menu.addMenu(f"Set P{s}")
+            set_menu.setStyleSheet(self._dropdown_menu_style())
+
+            toggle_all = set_menu.addAction("Toggle All")
+            toggle_all.setCheckable(True)
+            toggle_all.setChecked(False)
+            self._forecast_actions[f"P{s}_all"] = toggle_all
+            set_menu.addSeparator()
+
+            ohlc_actions = []
+            for ohlc in FORECAST_OHLC:
+                key = f"P{s}_{ohlc}"
+                act = set_menu.addAction(ohlc)
+                act.setCheckable(True)
+                act.setChecked(False)
+                self._forecast_actions[key] = act
+                ohlc_actions.append(act)
+                act.toggled.connect(self._on_forecast_toggle)
+
+            toggle_all.toggled.connect(
+                lambda checked, actions=ohlc_actions: self._on_toggle_all(checked, actions))
+
+    def _on_toggle_all(self, checked: bool, actions: list):
+        """Check/uncheck all OHLC actions in a set."""
+        for act in actions:
+            act.blockSignals(True)
+            act.setChecked(checked)
+            act.blockSignals(False)
+        self._on_forecast_toggle()
+
+    def _on_forecast_toggle(self, _=None):
+        """Collect checked forecast columns and emit data for the chart."""
+        checked_sets = set()
+        for key, act in self._forecast_actions.items():
+            if key.endswith('_all'):
+                continue
+            if act.isChecked():
+                set_num = int(key.split('_')[0][1:])
+                checked_sets.add(set_num)
+
+        if not checked_sets:
+            self.forecast_apply.emit({})
+            return
+
+        full_data = self.get_forecast_data()
+        filtered = {}
+        for s in checked_sets:
+            if s in full_data:
+                df = full_data[s]
+                set_prefix = f"P{s}"
+                kept_cols = ['Date', 'Time']
+                for key, act in self._forecast_actions.items():
+                    if key.startswith(set_prefix + '_') and not key.endswith('_all') and act.isChecked():
+                        ohlc = key.split('_', 1)[1]
+                        col = f"{ohlc}_P{s}"
+                        if col in df.columns:
+                            kept_cols.append(col)
+                if len(kept_cols) > 2:
+                    filtered[s] = df[kept_cols]
+
+        self.forecast_apply.emit(filtered if filtered else {})
+
+    @staticmethod
+    def _dropdown_menu_style() -> str:
+        return """
+            QMenu {
+                background-color: #1a1a1a;
+                color: #e0e0e0;
+                border: 1px solid #2a2a2a;
+                padding: 4px;
+            }
+            QMenu::item {
+                padding: 6px 20px;
+            }
+            QMenu::item:selected {
+                background-color: #2a3f5f;
+            }
+            QMenu::item:disabled {
+                color: #555;
+            }
+            QMenu::indicator {
+                width: 14px;
+                height: 14px;
+                margin-left: 6px;
+            }
+            QMenu::indicator:checked {
+                background-color: #4a9eff;
+                border: 1px solid #4a9eff;
+                border-radius: 2px;
+            }
+            QMenu::indicator:unchecked {
+                background-color: transparent;
+                border: 1px solid #555;
+                border-radius: 2px;
+            }
+        """
+
     def clear_forecast_values(self):
-        """Erase editable cells; keep timestamps and row numbers intact."""
+        """Erase editable cells, uncheck all chart-line toggles, and signal chart to clear."""
         table = self.forecast_table
         start = getattr(self, '_forecast_data_col_start', 2)
         for r in range(table.rowCount()):
@@ -840,7 +956,14 @@ class DataTabsWidget(QWidget):
                 item = table.item(r, c)
                 if item:
                     item.setText("")
-        k2_logger.info("Forecast values cleared", "DATA_TABS")
+
+        for key, act in self._forecast_actions.items():
+            act.blockSignals(True)
+            act.setChecked(False)
+            act.blockSignals(False)
+
+        self.forecast_apply.emit({})
+        k2_logger.info("Forecast values cleared and chart lines removed", "DATA_TABS")
 
     def set_forecast_values(self, column_name: str, values: list):
         """Programmatically write values into a forecast column."""
@@ -912,15 +1035,8 @@ class DataTabsWidget(QWidget):
         return result
 
     def _emit_forecast(self):
-        data = self.get_forecast_data()
-        if not data:
-            QMessageBox.information(
-                self, "No Data",
-                "No forecast values to apply.\n"
-                "Add a forecast set and populate values first.")
-            return
-        self.forecast_apply.emit(data)
-        k2_logger.info(f"Forecast applied: {len(data)} set(s)", "DATA_TABS")
+        """Legacy entry point — triggers reactive toggle-based emission."""
+        self._on_forecast_toggle()
 
     # ==================================================================
     # Tab 3 – Working Data (multi-sheet spreadsheet)
@@ -1131,6 +1247,7 @@ class DataTabsWidget(QWidget):
         self.forecast_table.setColumnCount(0)
         self.forecast_table.setProperty("_data_cols", None)
         self.forecast_info.setText("No model loaded")
+        self._rebuild_chart_lines_menu()
 
         self._reset_sheets()
         self._model_table_name = None
@@ -1233,6 +1350,7 @@ class DataTabsWidget(QWidget):
         self._pad_empty_columns(table)
         table.blockSignals(False)
 
+        self._rebuild_chart_lines_menu()
         self.forecast_info.setText(
             f"{len(self._forecast_timestamps)} timestamps, "
             f"{self._forecast_sets} forecast set(s)")
@@ -1407,7 +1525,7 @@ class DataTabsWidget(QWidget):
                 background-color: #0f0f0f;
                 border-bottom: 1px solid #1a1a1a;
             }
-            QPushButton {
+            QPushButton, QToolButton {
                 background-color: #1a1a1a;
                 color: #999;
                 border: 1px solid #2a2a2a;
@@ -1415,9 +1533,12 @@ class DataTabsWidget(QWidget):
                 border-radius: 3px;
                 font-size: 11px;
             }
-            QPushButton:hover {
+            QPushButton:hover, QToolButton:hover {
                 background-color: #2a2a2a;
                 color: #fff;
+            }
+            QToolButton::menu-indicator {
+                image: none;
             }
 
             /* ── Tables ──────────────────────────────── */
