@@ -59,6 +59,7 @@ class MiddlePaneWidget(QFrame):
     indicator_applied = pyqtSignal(str, dict)  # indicator_type, params
     data_exported = pyqtSignal(str, pd.DataFrame)  # format, data
     forecast_apply = pyqtSignal(dict)  # forwarded from DataTabsWidget
+    forecast_column_toggled = pyqtSignal(str, bool)  # column_name, visible
     
     def __init__(self):
         super().__init__()
@@ -178,6 +179,7 @@ class MiddlePaneWidget(QFrame):
             # Create tabbed data widget (Current / Forecast / Working)
             self.data_tabs = DataTabsWidget()
             self.data_tabs.forecast_apply.connect(self.forecast_apply)
+            self.data_tabs.forecast_column_toggled.connect(self.forecast_column_toggled)
             self.splitter.addWidget(self.data_tabs)
             
             # Set initial sizes (60/40 split)

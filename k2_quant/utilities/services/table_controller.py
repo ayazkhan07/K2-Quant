@@ -241,8 +241,9 @@ class TableController(QObject):
             def _list_sheets():
                 return list(workspace.keys())
 
-            def _to_forecast(set_index, open_values=None, high_values=None,
-                             low_values=None, close_values=None):
+            def _to_forecast(column_name_or_set_index, values_or_open=None,
+                             high_values=None, low_values=None,
+                             close_values=None):
                 def _clean_forecast(vals):
                     if vals is None:
                         return None
@@ -257,14 +258,22 @@ class TableController(QObject):
                         else:
                             out.append(float(v))
                     return out[:500]
-                tab_writes.append({
-                    "type": "forecast",
-                    "set_index": int(set_index),
-                    "open_values": _clean_forecast(open_values),
-                    "high_values": _clean_forecast(high_values),
-                    "low_values": _clean_forecast(low_values),
-                    "close_values": _clean_forecast(close_values),
-                })
+
+                if isinstance(column_name_or_set_index, str):
+                    tab_writes.append({
+                        "type": "forecast",
+                        "column_name": column_name_or_set_index,
+                        "values": _clean_forecast(values_or_open),
+                    })
+                else:
+                    tab_writes.append({
+                        "type": "forecast",
+                        "set_index": int(column_name_or_set_index),
+                        "open_values": _clean_forecast(values_or_open),
+                        "high_values": _clean_forecast(high_values),
+                        "low_values": _clean_forecast(low_values),
+                        "close_values": _clean_forecast(close_values),
+                    })
 
             # ── Chart helper ─────────────────────────────────────────
             charts: list = []
@@ -681,11 +690,14 @@ TAB HELPER FUNCTIONS (available inside run_python):
 - list_sheets()
     Returns a list of sheet names in the Working Data tab (e.g. ['Sheet 1', 'Sheet 2']).
 
-- to_forecast(set_index, open_values=None, high_values=None, low_values=None, close_values=None)
-    Write price projections to the Forecast Data tab (Tab 2).
-    set_index: integer (1, 2, 3…) identifying the forecast scenario.
-    Each list should align with the pre-generated future timestamps (up to 500 values).
-    You may provide any subset of OHLC columns.
+- to_forecast(column_name, values)
+    Write a named forecast column to the Forecast Data tab (Tab 2).
+    column_name: string label for the column (e.g. 'RPP_Open_Avg_P').
+    values: list of float values (up to 500) aligned with future timestamps.
+    Each call writes one column. The column appears in the forecast tab and
+    can be individually toggled on/off on the chart by the user.
+    Legacy form: to_forecast(set_index, open_values=..., high_values=..., ...)
+    is still supported for backward compatibility.
 
 - delete_working(column_name, scope='model', sheet=None)
     Remove a column from a Working Data sheet (Tab 3).
@@ -698,7 +710,7 @@ STRATEGY SAVING:
   the final code.  The strategy will appear as a checkbox in the Strategies panel.
 - The DPE execution context for saved strategies provides: df (DataFrame with columns
   open, high, low, close, volume, vwap, date_time_market), pd, np, datetime, timedelta,
-  and to_forecast(set_index, open_values, high_values, low_values, close_values).
+  and to_forecast(column_name, values) to write named forecast columns.
 - IMPORTANT: When presenting the saved strategy to the user, ALWAYS include the full
   code in a ```python code block so they can review it.
 

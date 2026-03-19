@@ -184,6 +184,7 @@ class AnalysisPageWidget(QWidget):
         self.middle_pane.indicator_applied.connect(self.on_indicator_applied_from_middle)
         self.middle_pane.data_exported.connect(self.on_data_exported)
         self.middle_pane.forecast_apply.connect(self.on_forecast_apply)
+        self.middle_pane.forecast_column_toggled.connect(self.on_forecast_column_toggled)
         
         # Right pane connections
         self.right_pane.message_sent.connect(self.on_ai_message_sent)
@@ -676,6 +677,8 @@ class AnalysisPageWidget(QWidget):
         forecast_writes = [w for w in tab_writes if w.get("type") == "forecast"]
 
         if forecast_writes:
+            for w in forecast_writes:
+                w['_strategy'] = strategy_name
             self._on_tab_writes(forecast_writes)
             saved_models_manager.set_model_state(
                 table_name,
@@ -684,7 +687,7 @@ class AnalysisPageWidget(QWidget):
                 chart_range=None,
             )
             k2_logger.info(
-                f"Strategy '{strategy_name}' wrote {len(forecast_writes)} forecast set(s)",
+                f"Strategy '{strategy_name}' wrote {len(forecast_writes)} forecast column(s)",
                 "ANALYSIS",
             )
             return
@@ -709,15 +712,20 @@ class AnalysisPageWidget(QWidget):
             self.model_label.setText(f"Model: {table_name} ({total_count:,} records)")
     
     def remove_strategy(self, strategy_name: str):
-        """Remove strategy projections and clear forecast tab."""
+        """Remove strategy projections and clear that strategy's forecast columns."""
         table_name = self.current_model
         
         stock_service.delete_projections(table_name, strategy_name)
 
-        # Clear forecast tab values so forecast-based strategies are fully undone
         tabs = getattr(self.middle_pane, "data_tabs", None)
+        cw = getattr(self.middle_pane, "chart_widget", None)
+
         if tabs is not None:
-            tabs.clear_forecast_values()
+            col_names = list(tabs._strategy_columns.get(strategy_name, []))
+            tabs.clear_strategy_columns(strategy_name)
+            if cw is not None:
+                for col_name in col_names:
+                    cw.remove_forecast_line(col_name)
 
         saved_models_manager.set_model_state(
             table_name,
@@ -740,7 +748,7 @@ class AnalysisPageWidget(QWidget):
         k2_logger.info(f"View mode changed to {mode}", "ANALYSIS")
     
     def on_forecast_apply(self, forecast_data: dict):
-        """Render forecast data as dashed OHLC lines on the chart, or clear them."""
+        """Clear all forecast lines when an empty dict arrives."""
         cw = getattr(self.middle_pane, "chart_widget", None)
         if cw is None:
             k2_logger.warning("No chart widget — cannot render forecast lines", "ANALYSIS")
@@ -748,10 +756,20 @@ class AnalysisPageWidget(QWidget):
         if not forecast_data:
             cw.clear_forecast_data()
             k2_logger.info("Forecast lines cleared from chart", "ANALYSIS")
+
+    def on_forecast_column_toggled(self, column_name: str, visible: bool):
+        """Show or hide a single named forecast line on the chart."""
+        cw = getattr(self.middle_pane, "chart_widget", None)
+        if cw is None:
+            return
+        tabs = getattr(self.middle_pane, "data_tabs", None)
+        if visible:
+            if tabs is not None:
+                values = tabs.get_forecast_column_data(column_name)
+                if values:
+                    cw.add_forecast_line(column_name, values)
         else:
-            cw.add_forecast_data(forecast_data)
-            k2_logger.info(
-                f"Forecast apply received: {len(forecast_data)} set(s)", "ANALYSIS")
+            cw.remove_forecast_line(column_name)
 
     def on_projection_requested(self):
         """Handle projection request from middle pane"""
@@ -861,18 +879,29 @@ class AnalysisPageWidget(QWidget):
                             f"AI deleted '{col}'{sheet_info}",
                             "ANALYSIS")
                 elif wtype == "forecast":
-                    set_idx = w.get("set_index", 1)
-                    while tabs._forecast_sets < set_idx:
-                        tabs.add_forecast_set()
-                    for ohlc, key in [("Open", "open_values"), ("High", "high_values"),
-                                      ("Low", "low_values"), ("Close", "close_values")]:
-                        vals = w.get(key)
+                    if "column_name" in w:
+                        col_name = w["column_name"]
+                        vals = w.get("values", [])
+                        strategy = w.get("_strategy", "AI")
                         if vals:
-                            col_name = f"{ohlc}_P{set_idx}"
-                            tabs.set_forecast_values(col_name, vals)
-                    k2_logger.info(
-                        f"AI wrote forecast set P{set_idx} to forecast tab",
-                        "ANALYSIS")
+                            tabs.set_forecast_column(strategy, col_name, vals)
+                        k2_logger.info(
+                            f"Forecast column '{col_name}' written "
+                            f"(strategy: {strategy})", "ANALYSIS")
+                    else:
+                        strategy = w.get("_strategy", "AI")
+                        set_idx = w.get("set_index", 1)
+                        for ohlc, key in [("Open", "open_values"),
+                                          ("High", "high_values"),
+                                          ("Low", "low_values"),
+                                          ("Close", "close_values")]:
+                            vals = w.get(key)
+                            if vals:
+                                col_name = f"{ohlc}_P{set_idx}"
+                                tabs.set_forecast_column(strategy, col_name, vals)
+                        k2_logger.info(
+                            f"Legacy forecast set P{set_idx} written "
+                            f"(strategy: {strategy})", "ANALYSIS")
             except Exception as e:
                 k2_logger.error(f"Failed to process tab write: {e}", "ANALYSIS")
     

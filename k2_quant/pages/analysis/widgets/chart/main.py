@@ -2357,14 +2357,73 @@ class ChartWidget(QWidget):
 
     # ── Forecast (dashed) lines ──────────────────────────────────────
 
-    def add_forecast_data(self, forecast_data: dict):
-        """Render dashed OHLC lines for each forecast set.
+    _FORECAST_PALETTE = [
+        '#00ff00', '#0080ff', '#ff0000', '#ffff00',
+        '#ff8000', '#00ffff', '#ff00ff', '#80ff00',
+        '#ff4080', '#40c0ff', '#c0ff40', '#ff40c0',
+    ]
 
-        Args:
-            forecast_data: {set_index: DataFrame} where DataFrame columns
-                           are Open_Px, High_Px, Low_Px, Close_Px and rows
-                           are the projected bars.
-        """
+    def _forecast_color(self, column_name: str) -> str:
+        """Pick a color for a forecast column based on OHLC suffix or palette cycling."""
+        cn_upper = column_name.upper()
+        for ohlc, color in OHLC_COLORS.items():
+            if ohlc.upper() in cn_upper:
+                return color
+        idx = hash(column_name) % len(self._FORECAST_PALETTE)
+        return self._FORECAST_PALETTE[idx]
+
+    def add_forecast_line(self, column_name: str, values: list):
+        """Render a single named forecast column as a dashed line on the chart."""
+        if self.data is None or len(self.data) == 0:
+            return
+
+        self.remove_forecast_line(column_name)
+
+        clean = [v for v in values if v is not None]
+        if not clean:
+            return
+
+        y = np.array(clean, dtype=np.float64)
+        base_x = len(self.data)
+        color = self._forecast_color(column_name)
+
+        last_val = None
+        for ohlc_col in ['Close', 'Open', 'High', 'Low']:
+            if ohlc_col in self.data.columns:
+                col_vals = self.data[ohlc_col].dropna()
+                if len(col_vals) > 0:
+                    last_val = float(col_vals.iloc[-1])
+                    break
+
+        if last_val is not None:
+            x_arr = np.empty(len(y) + 1, dtype=np.float64)
+            y_arr = np.empty(len(y) + 1, dtype=np.float64)
+            x_arr[0] = base_x - 1
+            y_arr[0] = last_val
+            x_arr[1:] = np.arange(base_x, base_x + len(y), dtype=np.float64)
+            y_arr[1:] = y
+        else:
+            x_arr = np.arange(base_x, base_x + len(y), dtype=np.float64)
+            y_arr = y
+
+        plot_item = pg.PlotDataItem(
+            x=x_arr, y=y_arr,
+            pen=pg.mkPen(color=color, width=2,
+                         style=Qt.PenStyle.DashLine),
+            connect='finite',
+        )
+        self.main_plot.addItem(plot_item)
+        self._forecast_lines[column_name] = plot_item
+        k2_logger.info(f"Added forecast line '{column_name}' to chart", "CHART")
+
+    def remove_forecast_line(self, column_name: str):
+        """Remove a single named forecast line from the chart."""
+        item = self._forecast_lines.pop(column_name, None)
+        if item and item.scene():
+            self.main_plot.removeItem(item)
+
+    def add_forecast_data(self, forecast_data: dict):
+        """Legacy: render dashed OHLC lines for set-indexed forecast data."""
         self.clear_forecast_data()
         if not forecast_data or self.data is None or len(self.data) == 0:
             return
@@ -2422,8 +2481,24 @@ class ChartWidget(QWidget):
                 self.main_plot.removeItem(item)
         self._forecast_lines.clear()
 
+    def clear_forecast_lines(self, strategy_name: Optional[str] = None):
+        """Remove forecast lines, optionally filtered by strategy prefix.
+
+        When *strategy_name* is None, removes all lines (same as
+        ``clear_forecast_data``).  Otherwise removes only lines whose key
+        belongs to that strategy (tracked via data_tabs._strategy_columns).
+        """
+        if strategy_name is None:
+            self.clear_forecast_data()
+            return
+        to_remove = [k for k in self._forecast_lines if k.startswith(strategy_name)]
+        for key in to_remove:
+            item = self._forecast_lines.pop(key, None)
+            if item and item.scene():
+                self.main_plot.removeItem(item)
+
     def toggle_forecast_line(self, key: str, visible: bool):
-        """Show/hide a single forecast line by key (e.g. 'P1_Open')."""
+        """Show/hide a single forecast line by key."""
         item = self._forecast_lines.get(key)
         if item:
             item.setVisible(visible)

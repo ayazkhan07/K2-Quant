@@ -446,13 +446,13 @@ class DataTabsWidget(QWidget):
     """Tabbed data interface: Current Data | Forecast Data | Working Data."""
 
     forecast_apply = pyqtSignal(dict)
+    forecast_column_toggled = pyqtSignal(str, bool)
 
     FORECAST_ROW_COUNT = 500
 
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        self._forecast_sets: int = 0
         self._forecast_timestamps: List[Tuple[dt_date, dt_time]] = []
         self._model_table_name: Optional[str] = None
         self._timespan = ''
@@ -460,6 +460,10 @@ class DataTabsWidget(QWidget):
         self._market_hours_only = False
         self._last_row_number: Optional[int] = None
         self._forecast_data_col_start: int = 2
+
+        self._strategy_columns: Dict[str, List[str]] = {}
+        self._forecast_col_order: List[str] = []
+        self._forecast_col_visible: Dict[str, bool] = {}
 
         self._init_ui()
         self._apply_styling()
@@ -507,7 +511,6 @@ class DataTabsWidget(QWidget):
         vl.setSpacing(0)
         container.setLayout(vl)
 
-        # toolbar
         toolbar = QWidget()
         toolbar.setFixedHeight(35)
         toolbar.setObjectName("forecastToolbar")
@@ -520,23 +523,8 @@ class DataTabsWidget(QWidget):
         tl.addWidget(self.forecast_info)
         tl.addStretch()
 
-        self.btn_add_set = QPushButton("+ Forecast Set")
-        self.btn_add_set.setToolTip("Add Open/High/Low/Close projection columns")
-        self.btn_add_set.clicked.connect(self.add_forecast_set)
-        tl.addWidget(self.btn_add_set)
-
-        self.btn_chart_lines = QToolButton()
-        self.btn_chart_lines.setText("Chart Lines ▾")
-        self.btn_chart_lines.setToolTip("Toggle forecast lines on the chart")
-        self.btn_chart_lines.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        self._chart_lines_menu = QMenu(self.btn_chart_lines)
-        self._chart_lines_menu.setStyleSheet(self._dropdown_menu_style())
-        self.btn_chart_lines.setMenu(self._chart_lines_menu)
-        self._forecast_actions: Dict[str, 'QAction'] = {}
-        tl.addWidget(self.btn_chart_lines)
-
         btn_clear = QPushButton("Clear Forecasts")
-        btn_clear.setToolTip("Erase forecast values and remove chart lines")
+        btn_clear.setToolTip("Erase all forecast values and remove chart lines")
         btn_clear.clicked.connect(self.clear_forecast_values)
         tl.addWidget(btn_clear)
 
@@ -550,6 +538,8 @@ class DataTabsWidget(QWidget):
         self.forecast_table.setVerticalScrollMode(QTableWidget.ScrollMode.ScrollPerPixel)
         self.forecast_table.setHorizontalScrollMode(QTableWidget.ScrollMode.ScrollPerPixel)
         self._apply_header_font(self.forecast_table)
+        self.forecast_table.horizontalHeader().sectionClicked.connect(
+            self._on_forecast_header_clicked)
         vl.addWidget(self.forecast_table)
 
         self.tab_widget.addTab(container, "Forecast Data")
@@ -755,14 +745,15 @@ class DataTabsWidget(QWidget):
         self._timespan = timespan
         self._frequency = frequency
         self._market_hours_only = market_hours_only
-        self._forecast_sets = 0
         self._last_row_number = last_row_number
         self._forecast_timestamps = generate_future_timestamps(
             last_date, last_time, timespan, frequency,
             market_hours_only, count=self.FORECAST_ROW_COUNT,
         )
+        self._strategy_columns.clear()
+        self._forecast_col_order.clear()
+        self._forecast_col_visible.clear()
         self._rebuild_forecast_table()
-        self._rebuild_chart_lines_menu()
         self.forecast_info.setText(
             f"{len(self._forecast_timestamps)} future timestamps generated"
         )
@@ -772,32 +763,83 @@ class DataTabsWidget(QWidget):
             "DATA_TABS",
         )
 
-    def add_forecast_set(self):
-        """Append Open_Px / High_Px / Low_Px / Close_Px columns."""
-        if not self._forecast_timestamps:
-            QMessageBox.information(
-                self, "No Model",
-                "Load a model first so timestamps can be generated.")
-            return
-        self._forecast_sets += 1
+    # ── New named-column forecast API ─────────────────────────────
+
+    def set_forecast_column(self, strategy_name: str, column_name: str, values: list):
+        """Add or update a named forecast column under a strategy group."""
+        if column_name not in self._forecast_col_order:
+            self._forecast_col_order.append(column_name)
+        self._forecast_col_visible.setdefault(column_name, False)
+
+        cols = self._strategy_columns.setdefault(strategy_name, [])
+        if column_name not in cols:
+            cols.append(column_name)
+
         self._rebuild_forecast_table()
-        self._rebuild_chart_lines_menu()
-        k2_logger.info(f"Forecast set P{self._forecast_sets} added", "DATA_TABS")
+
+        table = self.forecast_table
+        col_idx = self._forecast_column_index(column_name)
+        if col_idx is None:
+            return
+        for r, val in enumerate(values):
+            if r >= table.rowCount():
+                break
+            text = ""
+            if val is not None and not (isinstance(val, float) and np.isnan(val)):
+                try:
+                    text = f"{float(val):.2f}"
+                except (ValueError, TypeError):
+                    text = str(val)
+            item = table.item(r, col_idx)
+            if item:
+                item.setText(text)
+
+        k2_logger.info(
+            f"Forecast column '{column_name}' ({len(values)} vals) "
+            f"under strategy '{strategy_name}'", "DATA_TABS")
+
+    def clear_strategy_columns(self, strategy_name: str):
+        """Remove all forecast columns belonging to a strategy."""
+        cols = self._strategy_columns.pop(strategy_name, [])
+        for col_name in cols:
+            if col_name in self._forecast_col_order:
+                self._forecast_col_order.remove(col_name)
+            self._forecast_col_visible.pop(col_name, None)
+        if cols:
+            self._rebuild_forecast_table()
+            self.forecast_apply.emit({})
+            k2_logger.info(
+                f"Cleared {len(cols)} forecast columns for strategy '{strategy_name}'",
+                "DATA_TABS")
+
+    def _forecast_column_index(self, column_name: str) -> Optional[int]:
+        """Return the QTableWidget column index for a named forecast column."""
+        table = self.forecast_table
+        for c in range(table.columnCount()):
+            h = table.horizontalHeaderItem(c)
+            if h is None:
+                continue
+            text = h.text()
+            if text.startswith("● ") or text.startswith("○ "):
+                text = text[2:]
+            if text == column_name:
+                return c
+        return None
 
     def _rebuild_forecast_table(self):
         table = self.forecast_table
         ts = self._forecast_timestamps
         has_hash = getattr(self, '_last_row_number', None) is not None
-        cols = []
+        cols: List[str] = []
         if has_hash:
             cols.append('#')
         cols.extend(['Date', 'Time'])
-        for s in range(1, self._forecast_sets + 1):
-            for base in FORECAST_OHLC:
-                cols.append(f"{base}_P{s}")
 
-        prefix_len = 3 if has_hash else 2
+        prefix_len = len(cols)
         self._forecast_data_col_start = prefix_len
+
+        for col_name in self._forecast_col_order:
+            cols.append(col_name)
 
         table.blockSignals(True)
         table.setSortingEnabled(False)
@@ -805,31 +847,46 @@ class DataTabsWidget(QWidget):
         table.setColumnCount(len(cols))
         table.setHorizontalHeaderLabels(cols)
 
+        for c in range(prefix_len, len(cols)):
+            col_name = cols[c]
+            visible = self._forecast_col_visible.get(col_name, False)
+            header_item = table.horizontalHeaderItem(c)
+            if header_item:
+                icon = "● " if visible else "○ "
+                header_item.setText(icon + col_name)
+
         for r, (d, t) in enumerate(ts):
             ci = 0
             if has_hash:
-                num_item = QTableWidgetItem(str(self._last_row_number + r + 1))
-                num_item.setFlags(num_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                num_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
-                table.setItem(r, ci, num_item)
+                existing = table.item(r, ci)
+                if existing is None:
+                    num_item = QTableWidgetItem(str(self._last_row_number + r + 1))
+                    num_item.setFlags(num_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                    num_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+                    table.setItem(r, ci, num_item)
                 ci += 1
 
-            d_item = QTableWidgetItem(str(d))
-            d_item.setFlags(d_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            d_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
-            table.setItem(r, ci, d_item)
+            existing_d = table.item(r, ci)
+            if existing_d is None:
+                d_item = QTableWidgetItem(str(d))
+                d_item.setFlags(d_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                d_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+                table.setItem(r, ci, d_item)
             ci += 1
 
-            t_item = QTableWidgetItem(str(t)[:8])
-            t_item.setFlags(t_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            t_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
-            table.setItem(r, ci, t_item)
+            existing_t = table.item(r, ci)
+            if existing_t is None:
+                t_item = QTableWidgetItem(str(t)[:8])
+                t_item.setFlags(t_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                t_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+                table.setItem(r, ci, t_item)
             ci += 1
 
             for c in range(ci, len(cols)):
-                item = QTableWidgetItem("")
-                item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-                table.setItem(r, c, item)
+                if table.item(r, c) is None:
+                    item = QTableWidgetItem("")
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                    table.setItem(r, c, item)
 
         table.resizeColumnsToContents()
         for i in range(len(cols)):
@@ -839,141 +896,46 @@ class DataTabsWidget(QWidget):
         self._pad_empty_columns(table)
         table.blockSignals(False)
 
-    def _rebuild_chart_lines_menu(self):
-        """Rebuild the Chart Lines dropdown with grouped entries per forecast set."""
-        self._chart_lines_menu.clear()
-        self._forecast_actions.clear()
+    def _on_forecast_header_clicked(self, logical_index: int):
+        """Toggle chart visibility when a forecast column header is clicked."""
+        start = getattr(self, '_forecast_data_col_start', 2)
+        if logical_index < start:
+            return
+        header_item = self.forecast_table.horizontalHeaderItem(logical_index)
+        if header_item is None:
+            return
+        text = header_item.text()
+        if text.startswith("● "):
+            col_name = text[2:]
+        elif text.startswith("○ "):
+            col_name = text[2:]
+        else:
+            col_name = text
 
-        if self._forecast_sets == 0:
-            action = self._chart_lines_menu.addAction("No forecast sets")
-            action.setEnabled(False)
+        if col_name not in self._forecast_col_visible:
             return
 
-        for s in range(1, self._forecast_sets + 1):
-            set_menu = self._chart_lines_menu.addMenu(f"Set P{s}")
-            set_menu.setStyleSheet(self._dropdown_menu_style())
+        new_visible = not self._forecast_col_visible[col_name]
+        self._forecast_col_visible[col_name] = new_visible
 
-            toggle_all = set_menu.addAction("Toggle All")
-            toggle_all.setCheckable(True)
-            toggle_all.setChecked(False)
-            self._forecast_actions[f"P{s}_all"] = toggle_all
-            set_menu.addSeparator()
+        icon = "● " if new_visible else "○ "
+        header_item.setText(icon + col_name)
 
-            ohlc_actions = []
-            for ohlc in FORECAST_OHLC:
-                key = f"P{s}_{ohlc}"
-                act = set_menu.addAction(ohlc)
-                act.setCheckable(True)
-                act.setChecked(False)
-                self._forecast_actions[key] = act
-                ohlc_actions.append(act)
-                act.toggled.connect(self._on_forecast_toggle)
-
-            toggle_all.toggled.connect(
-                lambda checked, actions=ohlc_actions: self._on_toggle_all(checked, actions))
-
-    def _on_toggle_all(self, checked: bool, actions: list):
-        """Check/uncheck all OHLC actions in a set."""
-        for act in actions:
-            act.blockSignals(True)
-            act.setChecked(checked)
-            act.blockSignals(False)
-        self._on_forecast_toggle()
-
-    def _on_forecast_toggle(self, _=None):
-        """Collect checked forecast columns and emit data for the chart."""
-        checked_sets = set()
-        for key, act in self._forecast_actions.items():
-            if key.endswith('_all'):
-                continue
-            if act.isChecked():
-                set_num = int(key.split('_')[0][1:])
-                checked_sets.add(set_num)
-
-        if not checked_sets:
-            self.forecast_apply.emit({})
-            return
-
-        full_data = self.get_forecast_data()
-        filtered = {}
-        for s in checked_sets:
-            if s in full_data:
-                df = full_data[s]
-                set_prefix = f"P{s}"
-                kept_cols = ['Date', 'Time']
-                for key, act in self._forecast_actions.items():
-                    if key.startswith(set_prefix + '_') and not key.endswith('_all') and act.isChecked():
-                        ohlc = key.split('_', 1)[1]
-                        col = f"{ohlc}_P{s}"
-                        if col in df.columns:
-                            kept_cols.append(col)
-                if len(kept_cols) > 2:
-                    filtered[s] = df[kept_cols]
-
-        self.forecast_apply.emit(filtered if filtered else {})
-
-    @staticmethod
-    def _dropdown_menu_style() -> str:
-        return """
-            QMenu {
-                background-color: #1a1a1a;
-                color: #e0e0e0;
-                border: 1px solid #2a2a2a;
-                padding: 4px;
-            }
-            QMenu::item {
-                padding: 6px 20px;
-            }
-            QMenu::item:selected {
-                background-color: #2a3f5f;
-            }
-            QMenu::item:disabled {
-                color: #555;
-            }
-            QMenu::indicator {
-                width: 14px;
-                height: 14px;
-                margin-left: 6px;
-            }
-            QMenu::indicator:checked {
-                background-color: #4a9eff;
-                border: 1px solid #4a9eff;
-                border-radius: 2px;
-            }
-            QMenu::indicator:unchecked {
-                background-color: transparent;
-                border: 1px solid #555;
-                border-radius: 2px;
-            }
-        """
+        self.forecast_column_toggled.emit(col_name, new_visible)
 
     def clear_forecast_values(self):
-        """Erase editable cells, uncheck all chart-line toggles, and signal chart to clear."""
-        table = self.forecast_table
-        start = getattr(self, '_forecast_data_col_start', 2)
-        for r in range(table.rowCount()):
-            for c in range(start, self._data_col_count(table)):
-                item = table.item(r, c)
-                if item:
-                    item.setText("")
-
-        for key, act in self._forecast_actions.items():
-            act.blockSignals(True)
-            act.setChecked(False)
-            act.blockSignals(False)
-
+        """Erase all forecast data, reset visibility, and signal chart to clear."""
+        self._strategy_columns.clear()
+        self._forecast_col_order.clear()
+        self._forecast_col_visible.clear()
+        self._rebuild_forecast_table()
         self.forecast_apply.emit({})
         k2_logger.info("Forecast values cleared and chart lines removed", "DATA_TABS")
 
     def set_forecast_values(self, column_name: str, values: list):
-        """Programmatically write values into a forecast column."""
+        """Legacy: write values into a forecast column by exact header name."""
         table = self.forecast_table
-        col_idx = None
-        for c in range(self._data_col_count(table)):
-            h = table.horizontalHeaderItem(c)
-            if h and h.text() == column_name:
-                col_idx = c
-                break
+        col_idx = self._forecast_column_index(column_name)
         if col_idx is None:
             k2_logger.warning(f"Forecast column '{column_name}' not found", "DATA_TABS")
             return
@@ -990,19 +952,37 @@ class DataTabsWidget(QWidget):
             if item:
                 item.setText(text)
 
-    def get_forecast_data(self) -> Dict[int, pd.DataFrame]:
-        """Return ``{set_index: DataFrame}`` for populated forecast rows only."""
-        result: Dict[int, pd.DataFrame] = {}
+    def get_forecast_column_data(self, column_name: str) -> Optional[List[Optional[float]]]:
+        """Read values from a single named forecast column."""
+        col_idx = self._forecast_column_index(column_name)
+        if col_idx is None:
+            return None
+        table = self.forecast_table
+        values: List[Optional[float]] = []
+        for r in range(table.rowCount()):
+            item = table.item(r, col_idx)
+            txt = item.text().strip() if item else ""
+            if txt:
+                try:
+                    values.append(float(txt))
+                except ValueError:
+                    values.append(None)
+            else:
+                values.append(None)
+        return values
+
+    def get_forecast_data(self) -> Dict[str, pd.DataFrame]:
+        """Return ``{strategy_name: DataFrame}`` for all populated forecast columns."""
+        result: Dict[str, pd.DataFrame] = {}
         table = self.forecast_table
 
-        for s in range(1, self._forecast_sets + 1):
-            target_cols = [f"{base}_P{s}" for base in FORECAST_OHLC]
+        for strategy, col_names in self._strategy_columns.items():
             col_map: Dict[str, int] = {}
-            for c in range(self._data_col_count(table)):
-                h = table.horizontalHeaderItem(c)
-                if h and h.text() in target_cols:
-                    col_map[h.text()] = c
-            if len(col_map) != 4:
+            for cn in col_names:
+                idx = self._forecast_column_index(cn)
+                if idx is not None:
+                    col_map[cn] = idx
+            if not col_map:
                 continue
 
             rows = []
@@ -1021,22 +1001,11 @@ class DataTabsWidget(QWidget):
                     else:
                         values[cname] = None
                 if has_any:
-                    d_item = table.item(r, 0)
-                    t_item = table.item(r, 1)
-                    row = {
-                        'Date': d_item.text() if d_item else '',
-                        'Time': t_item.text() if t_item else '',
-                    }
-                    row.update(values)
-                    rows.append(row)
+                    rows.append(values)
             if rows:
-                result[s] = pd.DataFrame(rows)
+                result[strategy] = pd.DataFrame(rows)
 
         return result
-
-    def _emit_forecast(self):
-        """Legacy entry point — triggers reactive toggle-based emission."""
-        self._on_forecast_toggle()
 
     # ==================================================================
     # Tab 3 – Working Data (multi-sheet spreadsheet)
@@ -1239,15 +1208,16 @@ class DataTabsWidget(QWidget):
         self.current_table.setColumnCount(0)
         self.current_table.setProperty("_data_cols", None)
 
-        self._forecast_sets = 0
         self._forecast_timestamps = []
         self._last_row_number = None
         self._forecast_data_col_start = 2
+        self._strategy_columns.clear()
+        self._forecast_col_order.clear()
+        self._forecast_col_visible.clear()
         self.forecast_table.setRowCount(0)
         self.forecast_table.setColumnCount(0)
         self.forecast_table.setProperty("_data_cols", None)
         self.forecast_info.setText("No model loaded")
-        self._rebuild_chart_lines_menu()
 
         self._reset_sheets()
         self._model_table_name = None
@@ -1261,15 +1231,16 @@ class DataTabsWidget(QWidget):
 
     def serialise_forecast(self) -> Optional[Dict]:
         """Return forecast tab state as a JSON-serialisable dict (or None)."""
-        if not self._forecast_timestamps or self._forecast_sets == 0:
+        if not self._forecast_timestamps or not self._forecast_col_order:
             return None
         table = self.forecast_table
         data_cols = self._data_col_count(table)
-        columns = [
-            (table.horizontalHeaderItem(c).text()
-             if table.horizontalHeaderItem(c) else f"Col_{c}")
-            for c in range(data_cols)
-        ]
+
+        raw_columns = []
+        for c in range(data_cols):
+            h = table.horizontalHeaderItem(c)
+            raw_columns.append(h.text() if h else f"Col_{c}")
+
         data = []
         for r in range(table.rowCount()):
             row = []
@@ -1277,10 +1248,14 @@ class DataTabsWidget(QWidget):
                 item = table.item(r, c)
                 row.append(item.text() if item else "")
             data.append(row)
+
         result = {
-            'columns': columns,
+            'version': 2,
+            'columns': raw_columns,
             'data': data,
-            'forecast_sets': self._forecast_sets,
+            'strategy_columns': {k: list(v) for k, v in self._strategy_columns.items()},
+            'forecast_col_order': list(self._forecast_col_order),
+            'forecast_col_visible': dict(self._forecast_col_visible),
             'timespan': self._timespan,
             'frequency': self._frequency,
             'market_hours_only': self._market_hours_only,
@@ -1293,16 +1268,39 @@ class DataTabsWidget(QWidget):
         """Rebuild forecast tab from a previously serialised dict."""
         if not state:
             return
-        columns = state.get('columns', [])
-        data = state.get('data', [])
-        self._forecast_sets = state.get('forecast_sets', 0)
+
+        version = state.get('version', 1)
         self._timespan = state.get('timespan', '')
         self._frequency = state.get('frequency', '1')
         self._market_hours_only = state.get('market_hours_only', False)
+        self._last_row_number = state.get('last_row_number')
+
+        columns = state.get('columns', [])
+        data = state.get('data', [])
+
+        if version >= 2:
+            self._strategy_columns = {
+                k: list(v)
+                for k, v in state.get('strategy_columns', {}).items()
+            }
+            self._forecast_col_order = list(state.get('forecast_col_order', []))
+            self._forecast_col_visible = dict(state.get('forecast_col_visible', {}))
+        else:
+            self._strategy_columns.clear()
+            self._forecast_col_order.clear()
+            self._forecast_col_visible.clear()
+            forecast_sets = state.get('forecast_sets', 0)
+            for s in range(1, forecast_sets + 1):
+                for base in FORECAST_OHLC:
+                    col_name = f"{base}_P{s}"
+                    self._forecast_col_order.append(col_name)
+                    self._forecast_col_visible[col_name] = False
+                    cols = self._strategy_columns.setdefault("Legacy", [])
+                    cols.append(col_name)
 
         has_hash = '#' in columns
         self._forecast_data_col_start = 3 if has_hash else 2
-        self._last_row_number = state.get('last_row_number')
+
         if self._last_row_number is None and has_hash and data:
             try:
                 hash_idx = columns.index('#')
@@ -1325,8 +1323,9 @@ class DataTabsWidget(QWidget):
         for r, row in enumerate(data):
             for c, val in enumerate(row):
                 item = QTableWidgetItem(val)
-                cname = columns[c] if c < len(columns) else ''
-                if cname in ('#', 'Date', 'Time'):
+                raw_col = columns[c] if c < len(columns) else ''
+                col_clean = raw_col.lstrip("● ").lstrip("○ ") if raw_col else ''
+                if col_clean in ('#', 'Date', 'Time'):
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
                 else:
@@ -1350,12 +1349,13 @@ class DataTabsWidget(QWidget):
         self._pad_empty_columns(table)
         table.blockSignals(False)
 
-        self._rebuild_chart_lines_menu()
+        total_cols = len(self._forecast_col_order)
+        strategies = len(self._strategy_columns)
         self.forecast_info.setText(
             f"{len(self._forecast_timestamps)} timestamps, "
-            f"{self._forecast_sets} forecast set(s)")
+            f"{total_cols} forecast column(s) from {strategies} strategy(ies)")
         k2_logger.info(
-            f"Forecast restored: {len(data)} rows, {self._forecast_sets} sets",
+            f"Forecast restored: {len(data)} rows, {total_cols} named columns",
             "DATA_TABS")
 
     # ── Multi-sheet serialization ─────────────────────────────────

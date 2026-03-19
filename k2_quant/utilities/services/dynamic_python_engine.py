@@ -182,8 +182,9 @@ class StrategyExecutor:
         
         try:
             # ── Build to_forecast closure (mirrors table_controller) ──
-            def _to_forecast(set_index, open_values=None, high_values=None,
-                             low_values=None, close_values=None):
+            def _to_forecast(column_name_or_set_index, values_or_open=None,
+                             high_values=None, low_values=None,
+                             close_values=None):
                 def _clean(vals):
                     if vals is None:
                         return None
@@ -198,14 +199,22 @@ class StrategyExecutor:
                         else:
                             out.append(float(v))
                     return out[:500]
-                tab_writes.append({
-                    "type": "forecast",
-                    "set_index": int(set_index),
-                    "open_values": _clean(open_values),
-                    "high_values": _clean(high_values),
-                    "low_values": _clean(low_values),
-                    "close_values": _clean(close_values),
-                })
+
+                if isinstance(column_name_or_set_index, str):
+                    tab_writes.append({
+                        "type": "forecast",
+                        "column_name": column_name_or_set_index,
+                        "values": _clean(values_or_open),
+                    })
+                else:
+                    tab_writes.append({
+                        "type": "forecast",
+                        "set_index": int(column_name_or_set_index),
+                        "open_values": _clean(values_or_open),
+                        "high_values": _clean(high_values),
+                        "low_values": _clean(low_values),
+                        "close_values": _clean(close_values),
+                    })
 
             # Prepare execution context with data
             exec_context = self.execution_context.copy()
