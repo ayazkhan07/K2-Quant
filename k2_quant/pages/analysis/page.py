@@ -180,7 +180,6 @@ class AnalysisPageWidget(QWidget):
         # Middle pane connections
         self.middle_pane.column_toggled.connect(self.on_column_toggled)
         self.middle_pane.view_mode_changed.connect(self.on_view_mode_changed)
-        self.middle_pane.projection_requested.connect(self.on_projection_requested)
         self.middle_pane.indicator_applied.connect(self.on_indicator_applied_from_middle)
         self.middle_pane.data_exported.connect(self.on_data_exported)
         self.middle_pane.forecast_apply.connect(self.on_forecast_apply)
@@ -189,7 +188,6 @@ class AnalysisPageWidget(QWidget):
         # Right pane connections
         self.right_pane.message_sent.connect(self.on_ai_message_sent)
         self.right_pane.strategy_generated.connect(self.on_strategy_generated)
-        self.right_pane.projection_requested.connect(self.on_projection_requested_from_ai)
         self.right_pane.data_modified.connect(self._on_ai_data_modified)
         self.right_pane.tab_writes_ready.connect(self._on_tab_writes)
         self.right_pane.workspace_provider = self._get_workspace_state
@@ -587,45 +585,6 @@ class AnalysisPageWidget(QWidget):
         except Exception as e:
             k2_logger.error(f"Failed to remove indicator {indicator_name}: {e}", "ANALYSIS")
     
-    def persist_indicator_to_db(self, name: str, params: Dict, data: pd.Series):
-        """Persist indicator to database (optional)"""
-        if not self.current_model:
-            return
-        
-        try:
-            # Create column name
-            col_name = self._indicator_column_name(name, params)
-            
-            # Get dataframe with timestamp
-            df = stock_service.get_full_dataframe(self.current_model)
-            if df is None:
-                return
-            
-            # Ensure column exists
-            stock_service.ensure_indicator_column(self.current_model, col_name, sql_type="NUMERIC")
-            
-            # Update column
-            stock_service.update_indicator_column(self.current_model, col_name, df['timestamp'], data)
-            
-            # Update model state
-            state = saved_models_manager.get_model_state(self.current_model)
-            indicators = state.get('indicators', {})
-            indicators[col_name] = {'name': name, 'params': params}
-            saved_models_manager.set_model_state(
-                self.current_model,
-                indicators=indicators,
-                active_strategy=state.get('active_strategy'),
-                chart_range=state.get('chart_range')
-            )
-            
-        except Exception as e:
-            k2_logger.debug(f"Could not persist indicator to DB: {e}", "ANALYSIS")
-    
-    def _indicator_column_name(self, name: str, params: Dict) -> str:
-        """Generate column name for indicator"""
-        items = [f"{k}_{params[k]}" for k in sorted(params.keys())] if params else []
-        return "_".join([name.lower()] + items) if items else name.lower()
-    
     def on_strategy_toggled(self, strategy_name: str, enabled: bool):
         """Handle strategy toggle from left pane"""
         if not self.current_model:
@@ -661,8 +620,6 @@ class AnalysisPageWidget(QWidget):
             all_columns = ['Date','Time','Open','High','Low','Close','Volume','VWAP',
                             'Open_%','High_%','Low_%','Close_%','Elasticity','Close-Open_%']
         df = pd.DataFrame(rows, columns=all_columns[:len(rows[0])] if rows else all_columns[:8])
-        if '#' in df.columns:
-            df = df.drop(columns=['#'])
         
         df['date_time_market'] = pd.to_datetime(df['Date'].astype(str) + ' ' + df['Time'].astype(str))
         df = df.rename(columns={'Open':'open','High':'high','Low':'low','Close':'close','Volume':'volume','VWAP':'vwap'})
@@ -715,7 +672,10 @@ class AnalysisPageWidget(QWidget):
         """Remove strategy projections and clear that strategy's forecast columns."""
         table_name = self.current_model
         
-        stock_service.delete_projections(table_name, strategy_name)
+        try:
+            stock_service.delete_projections(table_name, strategy_name)
+        except Exception:
+            pass
 
         tabs = getattr(self.middle_pane, "data_tabs", None)
         cw = getattr(self.middle_pane, "chart_widget", None)
@@ -771,11 +731,6 @@ class AnalysisPageWidget(QWidget):
         else:
             cw.remove_forecast_line(column_name)
 
-    def on_projection_requested(self):
-        """Handle projection request from middle pane"""
-        k2_logger.info("Projection requested from middle pane", "ANALYSIS")
-        # Could trigger AI to generate projections
-    
     def on_indicator_applied_from_middle(self, indicator_type: str, params: dict):
         """Handle indicator application from middle pane"""
         k2_logger.info(f"Indicator {indicator_type} applied with params {params}", "ANALYSIS")
@@ -804,10 +759,6 @@ class AnalysisPageWidget(QWidget):
             self.remove_strategy(name)
         self.refresh_left_pane_data()
     
-    def on_projection_requested_from_ai(self, params: dict):
-        """Handle projection request from AI"""
-        k2_logger.info(f"Projection requested from AI: {params}", "ANALYSIS")
-
     def _on_ai_data_modified(self):
         """Refresh middle pane when the AI agent modifies table data."""
         if not self.current_model:

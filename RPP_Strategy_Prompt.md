@@ -1,3 +1,4 @@
+
 STRATEGY: 8-8 Recursive Price Projection (RPP)
 
 You are implementing a quantitative pattern-matching price projection strategy in Python. The strategy is called the 8-8 Recursive Price Projection (RPP). You have access to run_sql and run_python tools, a persistent Python environment where df is the full model data table as a pandas DataFrame, and to_forecast() to write final projections to Tab 2. All intermediate results must go to a newly created sheet via to_working() at each step as described below.

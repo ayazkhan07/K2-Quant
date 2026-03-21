@@ -2387,8 +2387,18 @@ class ChartWidget(QWidget):
         base_x = len(self.data)
         color = self._forecast_color(column_name)
 
+        cn_lower = column_name.lower()
+        if 'open' in cn_lower:
+            anchor_order = ['Open', 'Close', 'High', 'Low']
+        elif 'high' in cn_lower:
+            anchor_order = ['High', 'Close', 'Open', 'Low']
+        elif 'low' in cn_lower:
+            anchor_order = ['Low', 'Close', 'Open', 'High']
+        else:
+            anchor_order = ['Close', 'Open', 'High', 'Low']
+
         last_val = None
-        for ohlc_col in ['Close', 'Open', 'High', 'Low']:
+        for ohlc_col in anchor_order:
             if ohlc_col in self.data.columns:
                 col_vals = self.data[ohlc_col].dropna()
                 if len(col_vals) > 0:
