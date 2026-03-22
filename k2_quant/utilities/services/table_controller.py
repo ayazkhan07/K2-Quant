@@ -456,6 +456,25 @@ class TableController(QObject):
                                 fn_args.get("code", ""),
                                 fn_args.get("description", ""),
                                 strategies_saved)
+                        elif fn_name == "get_strategy":
+                            tool_result = self._tool_get_strategy(
+                                fn_args.get("name", ""))
+                        elif fn_name == "list_strategies":
+                            tool_result = self._tool_list_strategies()
+                        elif fn_name == "rename_strategy":
+                            tool_result = self._tool_rename_strategy(
+                                fn_args.get("old_name", ""),
+                                fn_args.get("new_name", ""),
+                                strategies_saved)
+                        elif fn_name == "delete_strategy":
+                            tool_result = self._tool_delete_strategy(
+                                fn_args.get("name", ""),
+                                strategies_saved)
+                        elif fn_name == "duplicate_strategy":
+                            tool_result = self._tool_duplicate_strategy(
+                                fn_args.get("source_name", ""),
+                                fn_args.get("new_name", ""),
+                                strategies_saved)
                         else:
                             tool_result = {
                                 "error": f"Unknown tool: {fn_name}"}
@@ -580,7 +599,7 @@ SUMMARY STATISTICS:
 {stats_text}
 
 INSTRUCTIONS:
-- You have four tools: run_sql (execute SQL against PostgreSQL), run_python (execute Python/pandas code), run_web_search (search the web for news, events, and qualitative data), and save_strategy (persist a Python script as a toggleable strategy).
+- You have these tools: run_sql (execute SQL against PostgreSQL), run_python (execute Python/pandas code), run_web_search (search the web for news, events, and qualitative data), and strategy management tools: save_strategy, get_strategy, list_strategies, rename_strategy, delete_strategy, duplicate_strategy.
 - Break complex tasks into steps. After each step, inspect the result before continuing.
 - Validate your results. If a count seems implausible given the summary stats, double-check.
 - When finished, provide a clear natural-language answer summarizing what you found or did.
@@ -704,15 +723,27 @@ TAB HELPER FUNCTIONS (available inside run_python):
     column_name: exact name of the column to delete.
     sheet: sheet name (defaults to 'Sheet 1').
 
-STRATEGY SAVING:
-- When the user asks you to create a strategy (a reusable script they can toggle on/off),
-  first develop and test the code with run_python, then call the save_strategy tool with
-  the final code.  The strategy will appear as a checkbox in the Strategies panel.
+STRATEGY MANAGEMENT:
+- save_strategy(name, code, description): Save or update a strategy. It appears as a
+  toggleable checkbox in the Strategies panel. First develop and test code with run_python,
+  then save the final version.
+- get_strategy(name): Retrieve a saved strategy's full code and metadata. Use this when
+  the user asks to review, modify, or discuss an existing strategy.
+- list_strategies(): List all saved strategies with names and descriptions (no code).
+- rename_strategy(old_name, new_name): Rename an existing strategy.
+- delete_strategy(name): Permanently delete a strategy. Confirm with the user first.
+- duplicate_strategy(source_name, new_name): Copy a strategy under a new name for
+  creating variants without modifying the original.
 - The DPE execution context for saved strategies provides: df (DataFrame with columns
   open, high, low, close, volume, vwap, date_time_market), pd, np, datetime, timedelta,
   and to_forecast(column_name, values) to write named forecast columns.
-- IMPORTANT: When presenting the saved strategy to the user, ALWAYS include the full
-  code in a ```python code block so they can review it.
+- IMPORTANT: When presenting strategy code to the user, ALWAYS include the full code
+  in a ```python code block so they can review it.
+- When asked to modify a strategy, use get_strategy to retrieve the current code, make
+  the changes, then save_strategy with the updated code.
+- IMPORTANT: Strategy names must be EXACT. Before any get_strategy, rename_strategy,
+  delete_strategy, or duplicate_strategy call, ALWAYS call list_strategies() first to
+  verify the exact name. Never guess or assume a strategy name.
 
 {self._format_workspace_snapshot(initial_workspace)}"""
 
@@ -845,6 +876,105 @@ STRATEGY SAVING:
                             },
                         },
                         "required": ["name", "code"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_strategy",
+                    "description": (
+                        "Retrieve a saved strategy's full code and metadata by name. "
+                        "Use this to inspect, review, or modify an existing strategy."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Exact name of the strategy to retrieve",
+                            },
+                        },
+                        "required": ["name"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_strategies",
+                    "description": (
+                        "List all saved strategies with their names, descriptions, "
+                        "and metadata. Does not return code — use get_strategy for that."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "rename_strategy",
+                    "description": "Rename an existing saved strategy.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "old_name": {
+                                "type": "string",
+                                "description": "Current name of the strategy",
+                            },
+                            "new_name": {
+                                "type": "string",
+                                "description": "New name for the strategy",
+                            },
+                        },
+                        "required": ["old_name", "new_name"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "delete_strategy",
+                    "description": (
+                        "Permanently delete a saved strategy. "
+                        "Ask the user to confirm before calling this."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Exact name of the strategy to delete",
+                            },
+                        },
+                        "required": ["name"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "duplicate_strategy",
+                    "description": (
+                        "Copy an existing strategy under a new name. "
+                        "Useful for creating variants without modifying the original."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "source_name": {
+                                "type": "string",
+                                "description": "Name of the strategy to copy from",
+                            },
+                            "new_name": {
+                                "type": "string",
+                                "description": "Name for the new copy",
+                            },
+                        },
+                        "required": ["source_name", "new_name"],
                     },
                 },
             },
@@ -1083,6 +1213,91 @@ STRATEGY SAVING:
                                f"the Strategies panel for the user to toggle."}
         except Exception as e:
             return {"error": f"Failed to save strategy: {e}", "type": "error"}
+
+    def _tool_get_strategy(self, name: str) -> Dict[str, Any]:
+        """Retrieve a saved strategy's code and metadata."""
+        try:
+            strategy = strategy_service.get_strategy(name)
+            if not strategy:
+                return {"error": f"Strategy '{name}' not found", "type": "error"}
+            return {
+                "type": "strategy",
+                "name": strategy["name"],
+                "description": strategy.get("description", ""),
+                "code": strategy["code"],
+                "category": strategy.get("category", ""),
+                "created_at": str(strategy.get("created_at", "")),
+                "updated_at": str(strategy.get("updated_at", "")),
+            }
+        except Exception as e:
+            return {"error": f"Failed to get strategy: {e}", "type": "error"}
+
+    def _tool_list_strategies(self) -> Dict[str, Any]:
+        """List all saved strategies."""
+        try:
+            strategies = strategy_service.get_all_strategies()
+            items = [
+                {"name": s["name"],
+                 "description": s.get("description", ""),
+                 "category": s.get("category", ""),
+                 "updated_at": str(s.get("updated_at", ""))}
+                for s in strategies
+            ]
+            return {"type": "strategy_list", "count": len(items),
+                    "strategies": items}
+        except Exception as e:
+            return {"error": f"Failed to list strategies: {e}", "type": "error"}
+
+    def _tool_rename_strategy(self, old_name: str, new_name: str,
+                              strategies_saved: list) -> Dict[str, Any]:
+        """Rename an existing strategy."""
+        try:
+            ok = strategy_service.rename_strategy(old_name, new_name)
+            if not ok:
+                return {"error": f"Strategy '{old_name}' not found or rename failed",
+                        "type": "error"}
+            strategies_saved.append({"name": new_name, "renamed_from": old_name})
+            k2_logger.info(f"Strategy renamed via tool: {old_name} -> {new_name}",
+                           "TABLE_CTRL")
+            return {"type": "strategy_renamed",
+                    "old_name": old_name, "new_name": new_name,
+                    "message": f"Strategy renamed from '{old_name}' to '{new_name}'."}
+        except Exception as e:
+            return {"error": f"Failed to rename strategy: {e}", "type": "error"}
+
+    def _tool_delete_strategy(self, name: str,
+                              strategies_saved: list) -> Dict[str, Any]:
+        """Delete a strategy permanently."""
+        try:
+            ok = strategy_service.delete_strategy(name)
+            if not ok:
+                return {"error": f"Strategy '{name}' not found or delete failed",
+                        "type": "error"}
+            strategies_saved.append({"name": name, "deleted": True})
+            k2_logger.info(f"Strategy deleted via tool: {name}", "TABLE_CTRL")
+            return {"type": "strategy_deleted", "name": name,
+                    "message": f"Strategy '{name}' permanently deleted."}
+        except Exception as e:
+            return {"error": f"Failed to delete strategy: {e}", "type": "error"}
+
+    def _tool_duplicate_strategy(self, source_name: str, new_name: str,
+                                 strategies_saved: list) -> Dict[str, Any]:
+        """Copy an existing strategy under a new name."""
+        try:
+            ok = strategy_service.duplicate_strategy(source_name, new_name)
+            if not ok:
+                return {"error": f"Strategy '{source_name}' not found or duplicate failed",
+                        "type": "error"}
+            strategies_saved.append({"name": new_name,
+                                     "duplicated_from": source_name})
+            k2_logger.info(
+                f"Strategy duplicated via tool: {source_name} -> {new_name}",
+                "TABLE_CTRL")
+            return {"type": "strategy_duplicated",
+                    "source": source_name, "new_name": new_name,
+                    "message": f"Strategy '{source_name}' copied as '{new_name}'."}
+        except Exception as e:
+            return {"error": f"Failed to duplicate strategy: {e}", "type": "error"}
 
     # ── Anthropic format converters ─────────────────────────────────
 

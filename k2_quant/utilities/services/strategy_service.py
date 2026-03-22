@@ -141,6 +141,43 @@ class StrategyService:
             k2_logger.error(f"Failed to get strategies: {str(e)}", "STRATEGY")
             return []
     
+    def rename_strategy(self, old_name: str, new_name: str) -> bool:
+        """Rename a strategy, removing any conflicting row first"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "DELETE FROM strategies WHERE name = ? AND name != ?",
+                    (new_name, old_name),
+                )
+                cursor.execute(
+                    "UPDATE strategies SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE name = ?",
+                    (new_name, old_name),
+                )
+                if cursor.rowcount == 0:
+                    return False
+                conn.commit()
+                k2_logger.info(f"Strategy renamed: {old_name} -> {new_name}", "STRATEGY")
+                return True
+        except Exception as e:
+            k2_logger.error(f"Failed to rename strategy: {str(e)}", "STRATEGY")
+            return False
+
+    def duplicate_strategy(self, source_name: str, new_name: str) -> bool:
+        """Copy an existing strategy under a new name"""
+        try:
+            source = self.get_strategy(source_name)
+            if not source:
+                return False
+            return self.save_strategy(
+                new_name, source['code'],
+                description=source.get('description', ''),
+                category=source.get('category', 'custom'),
+            )
+        except Exception as e:
+            k2_logger.error(f"Failed to duplicate strategy: {str(e)}", "STRATEGY")
+            return False
+
     def delete_strategy(self, name: str) -> bool:
         """Hard delete a strategy from the database"""
         try:

@@ -757,9 +757,11 @@ class RightPaneWidget(QFrame):
                 self.data_modified.emit()
             if result.get('_tab_writes'):
                 self.tab_writes_ready.emit(result['_tab_writes'])
+            strategies_changed = False
             for strat in result.get('_strategies_saved', []):
                 s_name = strat.get('name', '')
                 s_code = strat.get('code', '')
+                strategies_changed = True
                 if s_name and s_code:
                     header = QLabel(
                         f'<span style="color:#4a9eff; font-size:12px;">'
@@ -769,7 +771,9 @@ class RightPaneWidget(QFrame):
                     self._add_widget(header)
                     self._add_widget(
                         self._make_code_block_widget(s_code, 'python'))
-                    self.strategy_generated.emit(s_name, s_code)
+            if strategies_changed:
+                self.strategy_generated.emit(
+                    result['_strategies_saved'][-1].get('name', ''), '')
         else:
             self._pending_charts = []
             error = result.get('error', 'Operation failed')
