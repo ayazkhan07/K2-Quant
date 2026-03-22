@@ -43,9 +43,9 @@ AI_MODELS = {
     "OpenAI o4-mini": {"provider": "openai", "model": "o4-mini"},
     "GPT-4.1": {"provider": "openai", "model": "gpt-4.1"},
     "GPT-4.1 Mini": {"provider": "openai", "model": "gpt-4.1-mini"},
-    "Claude Opus 4": {"provider": "anthropic", "model": "claude-opus-4-20250514"},
-    "Claude Sonnet 4": {"provider": "anthropic", "model": "claude-sonnet-4-20250514"},
-    "Claude Haiku 3.5": {"provider": "anthropic", "model": "claude-3-5-haiku-20241022"},
+    "Claude Opus 4.6": {"provider": "anthropic", "model": "claude-opus-4-6"},
+    "Claude Sonnet 4.6": {"provider": "anthropic", "model": "claude-sonnet-4-6"},
+    "Claude Haiku 4.5": {"provider": "anthropic", "model": "claude-haiku-4-5-20251001"},
 }
 
 DEFAULT_MODEL = "OpenAI o3"
