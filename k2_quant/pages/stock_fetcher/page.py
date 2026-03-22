@@ -430,17 +430,15 @@ class StockFetcherWidget(QMainWindow):
             # Import the saved models manager
             from k2_quant.utilities.data.saved_models_manager import saved_models_manager
             
-            # Parse timespan from table name if not in current_data
-            table_parts = self.current_table.split('_')
-            timespan = table_parts[2] if len(table_parts) > 2 else 'day'
-            
-            # Prepare model data (current table already reflects filtered/unfiltered dataset)
+            timespan, _, _, multiplier = stock_service.convert_ui_parameters(
+                self.active_range, self.active_frequency)
+
             model_data = {
                 'table_name': self.current_table,
                 'symbol': self.current_data['symbol'],
                 'timespan': timespan,
                 'range_val': self.active_range,
-                'frequency': self.active_frequency,
+                'frequency': str(multiplier),
                 'market_hours_only': self.market_hours_only,
                 'record_count': self.current_data.get('total_records', 0)
             }

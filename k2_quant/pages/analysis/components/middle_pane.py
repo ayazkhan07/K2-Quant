@@ -262,13 +262,20 @@ class MiddlePaneWidget(QFrame):
             self.data_tabs.set_model_context(self.current_table_name)
             last_row_number = None
             if '#' in self.current_data.columns:
-                last_row_number = self.total_records or int(self.current_data['#'].iloc[-1])
+                last_row_number = int(self.current_data['#'].iloc[-1])
+
+            timespan_val = self.current_metadata.get('timespan', 'minute').lower()
+            is_intraday = timespan_val.startswith('min') or timespan_val.startswith('hour')
+            market_hours = self.current_metadata.get('market_hours_only', False)
+            if is_intraday:
+                market_hours = True
+
             self.data_tabs.setup_forecast(
                 last_date=last_row.get('Date', last_row.iloc[0]),
                 last_time=last_row.get('Time', last_row.iloc[1]),
                 timespan=self.current_metadata.get('timespan', 'minute'),
                 frequency=self.current_metadata.get('frequency', '1'),
-                market_hours_only=self.current_metadata.get('market_hours_only', False),
+                market_hours_only=market_hours,
                 last_row_number=last_row_number,
             )
         

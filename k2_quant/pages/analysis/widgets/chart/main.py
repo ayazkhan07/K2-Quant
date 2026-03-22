@@ -282,10 +282,14 @@ class TimeAxisManager:
         self.max_labels = 20
         self.min_label_spacing = 50
 
-    def calculate_time_labels(self, dt_cache, x_range, axis_width):
+    def calculate_time_labels(self, dt_cache, x_range, axis_width,
+                              is_intraday: bool = False):
         """Place a label at every Nth visible data point.
-        Intraday: HH:MM | day number at date change | MMM-YY at month change.
-        Daily:    day number | MMM-YY at month change."""
+
+        When *is_intraday* is True the major format is always ``%H:%M``
+        so the axis never loses the model's native time denomination.
+        Day-change and month-change labels are inserted at boundaries.
+        """
         if dt_cache is None or len(dt_cache) == 0:
             return []
 
@@ -303,11 +307,17 @@ class TimeAxisManager:
         if pd.isna(start_date) or pd.isna(end_date):
             return []
 
-        time_span, _ = get_time_span(start_date, end_date)
-        fmt = TIME_FORMATS[time_span]
-        major_fmt = fmt['major']
-        date_fmt = fmt.get('date_change')
-        month_fmt = fmt.get('month_change')
+        if is_intraday:
+            major_fmt = '%H:%M'
+            date_fmt = '%-d'
+            month_fmt = '%b-%y'
+        else:
+            time_span, _ = get_time_span(start_date, end_date)
+            fmt = TIME_FORMATS[time_span]
+            major_fmt = fmt['major']
+            date_fmt = fmt.get('date_change')
+            month_fmt = fmt.get('month_change')
+
         x_span = x_range[1] - x_range[0]
         if x_span <= 0:
             return []
@@ -867,6 +877,7 @@ class ChartWidget(QWidget):
         self.total_records = 0
         self._global_start_index = 0
         self.is_fetching = False
+        self._model_metadata: Optional[Dict] = None
         
         # Debounce timers dict
         self._debounce_timers = {}
@@ -1268,8 +1279,11 @@ class ChartWidget(QWidget):
             return
 
         axis_width = self.x_axis._width
+        meta = self._model_metadata or {}
+        ts_val = (meta.get('timespan') or '').lower()
+        intraday = ts_val.startswith('min') or ts_val.startswith('hour')
         labels = self.time_axis_manager.calculate_time_labels(
-            self._dt_cache, x_range, axis_width)
+            self._dt_cache, x_range, axis_width, is_intraday=intraday)
         grid_positions = self.time_axis_manager.calculate_grid_positions(
             self._dt_cache, x_range)
 
@@ -1333,6 +1347,7 @@ class ChartWidget(QWidget):
             vb._manual_y_mode = False
         self.current_table_name = table_name
         self.total_records = total_records or 0
+        self._model_metadata = metadata
 
         if self.total_records <= 0:
             k2_logger.warning("No records to load for chart", "CHART")
@@ -1539,21 +1554,113 @@ class ChartWidget(QWidget):
             self._dt_cache = None
         
     def _extend_dt_cache(self, extra_points: int = 1500):
-        """Extrapolate future dates so the x-axis shows labels beyond the last bar."""
+        """Extrapolate future dates so the x-axis shows labels beyond the last bar.
+
+        For intraday models the extension respects the session boundaries
+        derived from the model's own timestamps (earliest and latest
+        time-of-day actually present in the data) and skips weekends.
+        For daily+ models it simply skips weekends.
+        """
         cache = self._dt_cache
         if cache is None or len(cache) < 2:
             return
-        n = min(50, len(cache) - 1)
-        total_span = cache[-1] - cache[-1 - n]
-        avg_delta = total_span / n
-        if avg_delta <= np.timedelta64(0):
-            return
-        base = cache[-1]
-        extension = np.array(
-            [base + avg_delta * (i + 1) for i in range(extra_points)],
-            dtype='datetime64[ns]',
-        )
+
+        ts_index = pd.DatetimeIndex(cache)
+
+        is_intraday = False
+        meta = self._model_metadata or {}
+        ts_val = (meta.get('timespan') or '').lower()
+        if ts_val.startswith('min') or ts_val.startswith('hour'):
+            is_intraday = True
+
+        if is_intraday:
+            bar_delta, session_open, session_close = \
+                self._derive_intraday_params(ts_index)
+            if bar_delta is None:
+                return
+            extension = self._generate_intraday_extension(
+                ts_index[-1], bar_delta, session_open, session_close,
+                extra_points)
+        else:
+            diffs = np.diff(cache.astype('int64'))
+            diffs = diffs[diffs > 0]
+            if len(diffs) == 0:
+                return
+            avg_ns = int(np.median(diffs))
+            avg_delta = np.timedelta64(avg_ns, 'ns')
+            base = cache[-1]
+            pts = []
+            current = pd.Timestamp(base)
+            while len(pts) < extra_points:
+                current = current + pd.Timedelta(avg_delta)
+                if current.weekday() >= 5:
+                    current += pd.Timedelta(days=(7 - current.weekday()))
+                pts.append(current.value)
+            extension = np.array(pts, dtype='datetime64[ns]')
+
         self._dt_cache = np.concatenate([cache, extension])
+
+    def _derive_intraday_params(self, ts_index: pd.DatetimeIndex):
+        """Derive bar interval and session open/close from actual data."""
+        times = ts_index.time
+        unique_times = sorted(set(times))
+        if len(unique_times) < 2:
+            return None, None, None
+
+        session_open = unique_times[0]
+        session_close = unique_times[-1]
+
+        diffs_ns = np.diff(ts_index.asi8)
+        diffs_ns = diffs_ns[diffs_ns > 0]
+        if len(diffs_ns) == 0:
+            return None, None, None
+
+        one_day_ns = int(24 * 3600 * 1e9)
+        intraday_diffs = diffs_ns[diffs_ns < one_day_ns]
+        if len(intraday_diffs) == 0:
+            return None, None, None
+
+        bar_delta_ns = int(np.median(intraday_diffs))
+        bar_delta = pd.Timedelta(nanoseconds=bar_delta_ns)
+
+        return bar_delta, session_open, session_close
+
+    @staticmethod
+    def _generate_intraday_extension(last_ts, bar_delta, session_open,
+                                     session_close, count):
+        """Generate *count* future timestamps within session boundaries."""
+        current = pd.Timestamp(last_ts) + bar_delta
+        pts: list = []
+
+        safety = count * 20
+        while len(pts) < count and safety > 0:
+            safety -= 1
+            if current.weekday() >= 5:
+                days_ahead = 7 - current.weekday()
+                current += pd.Timedelta(days=days_ahead)
+                current = current.replace(
+                    hour=session_open.hour, minute=session_open.minute,
+                    second=0, microsecond=0)
+                continue
+
+            cur_time = current.time()
+            if cur_time < session_open:
+                current = current.replace(
+                    hour=session_open.hour, minute=session_open.minute,
+                    second=0, microsecond=0)
+                cur_time = current.time()
+
+            if cur_time > session_close:
+                current += pd.Timedelta(days=1)
+                current = current.replace(
+                    hour=session_open.hour, minute=session_open.minute,
+                    second=0, microsecond=0)
+                continue
+
+            pts.append(current.value)
+            current += bar_delta
+
+        return np.array(pts, dtype='datetime64[ns]')
 
     def _resample_df(self, df: pd.DataFrame) -> pd.DataFrame:
         """Aggregate *df* into coarser bars using dt.floor() for grouping.
