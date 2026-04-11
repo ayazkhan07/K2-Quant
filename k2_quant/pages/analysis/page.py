@@ -629,9 +629,17 @@ class AnalysisPageWidget(QWidget):
             k2_logger.error(f"Strategy execution failed: {result.get('error')}", "ANALYSIS")
             return
         
-        # ── Route forecast tab writes if the strategy produced any ──
+        # ── Route tab writes (forecast + working) if the strategy produced any ──
         tab_writes = result.get('_tab_writes', [])
         forecast_writes = [w for w in tab_writes if w.get("type") == "forecast"]
+        working_writes = [w for w in tab_writes if w.get("type") == "working"]
+
+        if working_writes:
+            self._on_tab_writes(working_writes)
+            k2_logger.info(
+                f"Strategy '{strategy_name}' wrote {len(working_writes)} working column(s)",
+                "ANALYSIS",
+            )
 
         if forecast_writes:
             for w in forecast_writes:

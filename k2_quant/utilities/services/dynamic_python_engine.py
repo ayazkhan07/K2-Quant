@@ -1,7 +1,7 @@
 """
 Dynamic Python Engine (DPE) for K2 Quant
 
-Executes saved strategies via exec() with forecast-tab output support.
+Executes saved strategies via exec() with forecast-tab and working-sheet output support.
 """
 
 import io
@@ -81,6 +81,30 @@ class StrategyExecutor:
                         "close_values": _clean(close_values),
                     })
 
+            def _to_working(column_name, values, scope='model', column=None,
+                           sheet=None):
+                """Write a column to a Working Data sheet (Tab 3)."""
+                if isinstance(values, (pd.Series, np.ndarray)):
+                    values = values.tolist()
+                cleaned = []
+                for v in values:
+                    if v is None:
+                        cleaned.append(None)
+                    elif isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
+                        cleaned.append(None)
+                    else:
+                        cleaned.append(v)
+                write_entry = {
+                    "type": "working",
+                    "column_name": str(column_name),
+                    "values": cleaned,
+                    "scope": str(scope),
+                    "sheet": sheet or "Sheet 1",
+                }
+                if column is not None:
+                    write_entry["column"] = str(column).upper().strip()
+                tab_writes.append(write_entry)
+
             exec_context = {
                 'pd': pd,
                 'np': np,
@@ -88,6 +112,7 @@ class StrategyExecutor:
                 'timedelta': timedelta,
                 'data': data.copy(),
                 'to_forecast': _to_forecast,
+                'to_working': _to_working,
             }
             exec_context['df'] = exec_context['data']
 
