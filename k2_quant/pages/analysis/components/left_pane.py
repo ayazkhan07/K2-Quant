@@ -22,6 +22,8 @@ class LeftPaneWidget(QFrame):
     # Signals
     model_selected = pyqtSignal(str)  # table_name
     strategy_toggled = pyqtSignal(str, bool)  # strategy_name, enabled
+    # Handler on analysis page: DB delete + cascade run purge + outputs refresh
+    # (see k2_quant.utilities.services.strategy_lifecycle_rules).
     strategy_deleted = pyqtSignal(str)  # strategy_name
     indicator_toggled = pyqtSignal(str, bool)  # indicator_name, enabled
     
@@ -298,6 +300,10 @@ class LeftPaneWidget(QFrame):
             if isinstance(widget, QCheckBox):
                 widget.setChecked(False)
         self.active_strategies.clear()
+
+    def discard_active_strategy(self, name: str):
+        """Remove a name from the active set (e.g. deleted via Thinkspace)."""
+        self.active_strategies.discard(name)
     
     def refresh_models(self):
         """Refresh the models list from database"""

@@ -138,7 +138,7 @@ def _format_cell(value, col_name: str, indicator_names: set = None) -> str:
             return str(value)
     if col_lower in PERCENT_COLUMNS:
         try:
-            return f"{float(value):.2f}"
+            return f"{float(value):.3f}"
         except (ValueError, TypeError):
             return str(value)
     if indicator_names and col_name in indicator_names:
@@ -146,14 +146,14 @@ def _format_cell(value, col_name: str, indicator_names: set = None) -> str:
             if isinstance(value, (int, np.integer)):
                 return f"{value:,}"
             if isinstance(value, (float, np.floating)):
-                return f"{value:.2f}" if 0.01 < abs(value) < 10000 else f"{value:.4f}"
+                return f"{float(value):.3f}"
         except (ValueError, TypeError):
             pass
         return str(value)
     if isinstance(value, (int, np.integer)):
         return f"{value:,}"
     if isinstance(value, (float, np.floating)):
-        return f"{value:.2f}" if 0.01 < abs(value) < 10000 else f"{value:.4f}"
+        return f"{float(value):.3f}"
     return str(value)
 
 

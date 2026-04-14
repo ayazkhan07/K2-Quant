@@ -32,10 +32,11 @@ import numpy as np
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from k2_quant.utilities.logger import k2_logger
+from k2_quant.utilities.numeric_rounding import round_price_scalar
 from k2_quant.utilities.data.db_manager import db_manager
 from k2_quant.utilities.config import api_config
 from k2_quant.utilities.services.strategy_service import strategy_service
-from k2_quant.utilities.strategy_validator import validate_strategy, format_errors
+from k2_quant.utilities.strategy_validator import format_errors, format_warnings
 
 MAX_AGENT_ITERATIONS = 15
 
@@ -257,7 +258,7 @@ class TableController(QObject):
                         elif isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
                             out.append(None)
                         else:
-                            out.append(float(v))
+                            out.append(round_price_scalar(float(v)))
                     return out[:500]
 
                 if isinstance(column_name_or_set_index, str):
@@ -839,7 +840,8 @@ STRATEGY MANAGEMENT:
 - get_strategy(name): Retrieve a saved strategy's full code and metadata.
 - list_strategies(): List all saved strategies with names and descriptions (no code).
 - rename_strategy(old_name, new_name): Rename an existing strategy.
-- delete_strategy(name): Permanently delete a strategy. Confirm with the user first.
+- delete_strategy(name): Permanently delete a strategy and all its saved OUTPUTS
+  run history for that name (same DB transaction). Confirm with the user first.
 - duplicate_strategy(source_name, new_name): Copy a strategy under a new name.
 - IMPORTANT: Strategy names must be EXACT. Before any get_strategy, rename_strategy,
   delete_strategy, or duplicate_strategy call, ALWAYS call list_strategies() first to
@@ -904,6 +906,10 @@ STRATEGY CODE REQUIREMENTS (save_strategy will REJECT code that fails):
        report_table("Forecast Columns Written",
            ["Column", "Length"],
            [[name, len(vals)] for name, vals in forecast_pairs])
+
+  6. DATAFRAME COLUMNS: Use canonical names on df (e.g. open_pct, open, date_time_market).
+     Legacy UI names such as Open_% or Open are rejected on save. See the project's
+     strategy_frame_contract.json for the full list and aliases.
 
   The DPE execution context provides: df, pd, np, datetime, timedelta,
   to_forecast(), report_header(), report_config(), report_table().
@@ -1376,8 +1382,9 @@ STRATEGY CODE REQUIREMENTS (save_strategy will REJECT code that fails):
                             strategies_saved: list) -> Dict[str, Any]:
         """Validate then persist a strategy via strategy_service."""
         try:
-            passed, errors = validate_strategy(code)
-            if not passed:
+            ok, errors, warnings = strategy_service.save_strategy(
+                name, code, description=description or "")
+            if not ok:
                 msg = format_errors(errors)
                 k2_logger.warning(
                     f"Strategy '{name}' rejected by validator: {errors}",
@@ -1392,18 +1399,21 @@ STRATEGY CODE REQUIREMENTS (save_strategy will REJECT code that fails):
                         f"Fix the code and call save_strategy again."
                     ),
                 }
-
-            ok = strategy_service.save_strategy(
-                name, code, description=description or "")
-            if not ok:
-                return {"error": "strategy_service.save_strategy returned False",
-                        "type": "error"}
             strategies_saved.append({"name": name, "code": code,
                                      "description": description or ""})
             k2_logger.info(f"Strategy saved via tool: {name}", "TABLE_CTRL")
-            return {"type": "strategy_saved", "name": name,
-                    "message": f"Strategy '{name}' saved. It now appears in "
-                               f"the Strategies panel for the user to toggle."}
+            out: Dict[str, Any] = {
+                "type": "strategy_saved",
+                "name": name,
+                "message": (
+                    f"Strategy '{name}' saved. It now appears in the Strategies "
+                    f"panel for the user to toggle."
+                ),
+            }
+            if warnings:
+                out["nomenclature_warnings"] = warnings
+                out["message"] += "\n\n" + format_warnings(warnings)
+            return out
         except Exception as e:
             return {"error": f"Failed to save strategy: {e}", "type": "error"}
 
@@ -1469,7 +1479,10 @@ STRATEGY CODE REQUIREMENTS (save_strategy will REJECT code that fails):
             strategies_saved.append({"name": name, "deleted": True})
             k2_logger.info(f"Strategy deleted via tool: {name}", "TABLE_CTRL")
             return {"type": "strategy_deleted", "name": name,
-                    "message": f"Strategy '{name}' permanently deleted."}
+                    "message": (
+                        f"Strategy '{name}' permanently deleted, including all "
+                        f"OUTPUTS run records for that name."
+                    )}
         except Exception as e:
             return {"error": f"Failed to delete strategy: {e}", "type": "error"}
 

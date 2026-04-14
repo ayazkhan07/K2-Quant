@@ -15,7 +15,18 @@ from datetime import datetime, timedelta
 from contextlib import redirect_stdout, redirect_stderr
 
 from k2_quant.utilities.logger import k2_logger
-from k2_quant.utilities.report_helpers import report_header, report_config, report_table
+from k2_quant.utilities.numeric_rounding import round_price_scalar
+from k2_quant.utilities.report_helpers import (
+    report_header,
+    report_config,
+    report_table,
+    start_report_capture,
+    end_report_capture,
+)
+from k2_quant.utilities.strategy_execution_reporting import (
+    format_strategy_execution_failure,
+    snapshot_dataframe_for_report,
+)
 
 
 class StrategyExecutor:
@@ -46,6 +57,8 @@ class StrategyExecutor:
 
         stdout_capture = io.StringIO()
         stderr_capture = io.StringIO()
+        exec_context: Optional[Dict[str, Any]] = None
+        report_blocks = start_report_capture()
 
         try:
             def _to_forecast(column_name_or_set_index, values_or_open=None,
@@ -63,7 +76,7 @@ class StrategyExecutor:
                         elif isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
                             out.append(None)
                         else:
-                            out.append(float(v))
+                            out.append(round_price_scalar(float(v)))
                     return out[:500]
 
                 if isinstance(column_name_or_set_index, str):
@@ -116,7 +129,6 @@ class StrategyExecutor:
             elif 'df' in exec_context:
                 result['data'] = exec_context['df']
 
-            result['output'] = stdout_capture.getvalue()
             result['metrics'] = {
                 'execution_time': time.time() - start_time,
                 'original_rows': len(data),
@@ -128,11 +140,27 @@ class StrategyExecutor:
                 monitor_callback('complete', result['metrics'])
 
         except Exception as e:
-            result['error'] = str(e)
             result['traceback'] = traceback.format_exc()
+            df_any = None
+            if exec_context is not None:
+                df_any = exec_context.get('df')
+                if df_any is None:
+                    df_any = exec_context.get('data')
+            snap = snapshot_dataframe_for_report(df_any)
+            fail_metrics = {
+                'original_rows': len(data),
+                'original_columns': len(data.columns),
+            }
+            result['metrics'] = fail_metrics
+            result['error'] = format_strategy_execution_failure(
+                e,
+                code,
+                metrics=fail_metrics,
+                df_summary=snap,
+            )
             stderr_output = stderr_capture.getvalue()
             if stderr_output:
-                result['error'] += f"\nStderr: {stderr_output}"
+                result['error'] += f"\n\n--- captured stderr ---\n{stderr_output.strip()}"
 
             if monitor_callback:
                 monitor_callback('error', {'error': str(e)})
@@ -140,7 +168,16 @@ class StrategyExecutor:
             k2_logger.error(f"Strategy execution failed: {str(e)}", "DPE")
 
         finally:
-            result['execution_time'] = time.time() - start_time
+            end_report_capture()
+            # stdout: optional print() diagnostics only; tables live in _report_blocks
+            result['output'] = stdout_capture.getvalue()
+            result['_report_blocks'] = list(report_blocks)
+
+            elapsed = time.time() - start_time
+            result['execution_time'] = elapsed
+            m = result.get('metrics')
+            if isinstance(m, dict):
+                m['execution_time'] = elapsed
 
         return result
 

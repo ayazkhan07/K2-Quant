@@ -42,6 +42,7 @@ from PyQt6.QtWidgets import (QFrame, QVBoxLayout, QHBoxLayout, QWidget,
 from PyQt6.QtCore import Qt, pyqtSignal
 
 from k2_quant.utilities.logger import k2_logger
+from k2_quant.utilities.numeric_rounding import round_dataframe_numeric_columns
 
 # Updated import path for ChartWidget facade
 from k2_quant.pages.analysis.widgets.chart import ChartWidget
@@ -366,7 +367,10 @@ class MiddlePaneWidget(QFrame):
                             df[indicator_name] = padded_values
                 except Exception as e:
                     k2_logger.warning(f"Could not align indicator {indicator_name}: {e}", "MIDDLE_PANE")
-        
+
+        df = round_dataframe_numeric_columns(df)
+        self.current_data = df
+
         # Delegate display to the DataTabsWidget (Tab 1 – Current Data)
         self.data_tabs.load_current_data(df, self.active_indicators)
     

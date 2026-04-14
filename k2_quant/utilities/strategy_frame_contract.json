@@ -1,0 +1,47 @@
+{
+  "_meta": {
+    "version": 1,
+    "description": "Canonical column names on the strategy execution DataFrame (after apply_strategy). Expand canonical_columns and aliases as the runner evolves."
+  },
+  "dataframe_roots": [
+    "df",
+    "data",
+    "df_sorted",
+    "df_work",
+    "model_df",
+    "working"
+  ],
+  "strict_unknown_columns": false,
+  "canonical_columns": [
+    "#",
+    "Date",
+    "Time",
+    "date_time_market",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "vwap",
+    "open_pct",
+    "high_pct",
+    "low_pct",
+    "close_pct",
+    "elasticity",
+    "close_open_pct"
+  ],
+  "aliases": {
+    "Open": "open",
+    "High": "high",
+    "Low": "low",
+    "Close": "close",
+    "Volume": "volume",
+    "VWAP": "vwap",
+    "Open_%": "open_pct",
+    "High_%": "high_pct",
+    "Low_%": "low_pct",
+    "Close_%": "close_pct",
+    "Close-Open_%": "close_open_pct",
+    "Elasticity": "elasticity"
+  }
+}

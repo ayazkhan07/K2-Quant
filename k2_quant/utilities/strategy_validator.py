@@ -2,29 +2,30 @@
 Strategy code validator for K2 Quant.
 
 Enforces structural AND quality requirements before a strategy can be saved.
-Called by table_controller (AI save path) and outputs_panel (manual edit path).
+Used from strategy_service.save_strategy (all save paths).
 
-Returns (passed: bool, errors: list[str]) so the caller can relay
-rejection reasons back to the AI or show them in a dialog.
+Returns (passed, errors, warnings). Warnings do not block save; errors do.
 """
 
 import ast
-import re
 from typing import List, Tuple
 
+from k2_quant.utilities.strategy_frame_nomenclature import check_nomenclature
 
-def validate_strategy(code: str) -> Tuple[bool, List[str]]:
+
+def validate_strategy(code: str) -> Tuple[bool, List[str], List[str]]:
     """Validate strategy code against all required rules.
 
-    Returns (True, []) if the code passes, or (False, [error_messages]).
+    Returns (True, [], warnings) if the code passes, or (False, errors, warnings).
     """
     errors: List[str] = []
+    warnings: List[str] = []
 
     try:
         tree = ast.parse(code)
     except SyntaxError as e:
         errors.append(f"Code has a syntax error: {e}")
-        return (False, errors)
+        return (False, errors, warnings)
 
     _check_no_unicode(code, errors)
 
@@ -36,7 +37,11 @@ def validate_strategy(code: str) -> Tuple[bool, List[str]]:
     _check_to_forecast(code, calls, errors)
     _check_forecast_documentation(code, calls, errors)
 
-    return (len(errors) == 0, errors)
+    nom_err, nom_warn = check_nomenclature(code)
+    errors.extend(nom_err)
+    warnings.extend(nom_warn)
+
+    return (len(errors) == 0, errors, warnings)
 
 
 def format_errors(errors: List[str]) -> str:
@@ -46,6 +51,18 @@ def format_errors(errors: List[str]) -> str:
         lines.append(f"  {i}. {err}")
     lines.append("")
     lines.append("Fix these issues and try saving again.")
+    return "\n".join(lines)
+
+
+def format_warnings(warnings: List[str]) -> str:
+    """Format non-blocking nomenclature / contract notices."""
+    if not warnings:
+        return ""
+    lines = ["Strategy frame contract notices (save allowed):", ""]
+    for i, w in enumerate(warnings, 1):
+        lines.append(f"  {i}. {w}")
+    lines.append("")
+    lines.append("Update k2_quant/utilities/strategy_frame_contract.json if these are expected.")
     return "\n".join(lines)
 
 

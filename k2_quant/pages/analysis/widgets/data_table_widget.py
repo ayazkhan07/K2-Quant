@@ -18,6 +18,15 @@ from PyQt6.QtGui import QFont
 
 from k2_quant.utilities.logger import k2_logger
 
+_PERCENT_DISPLAY_COLS = frozenset({
+    "open_%",
+    "high_%",
+    "low_%",
+    "close_%",
+    "close-open_%",
+    "elasticity",
+})
+
 
 class NumericTableWidgetItem(QTableWidgetItem):
     """QTableWidgetItem subclass that sorts by numeric value, not string."""
@@ -334,13 +343,15 @@ class DataTableWidget(QWidget):
                         text = f"{float(value):.2f}"
                     except (ValueError, TypeError):
                         text = str(value)
+                elif col_name_lower in _PERCENT_DISPLAY_COLS or col_name_lower.endswith("_pct"):
+                    try:
+                        text = f"{float(value):.3f}"
+                    except (ValueError, TypeError):
+                        text = str(value)
                 elif isinstance(value, (int, np.integer)):
                     text = f"{value:,}"
                 elif isinstance(value, (float, np.floating)):
-                    if abs(value) < 10000 and abs(value) > 0.01:
-                        text = f"{value:.2f}"
-                    else:
-                        text = f"{value:.4f}"
+                    text = f"{float(value):.3f}"
                 else:
                     text = str(value)
                 

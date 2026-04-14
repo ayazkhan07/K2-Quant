@@ -3,15 +3,19 @@ Strategy Service for K2 Quant
 
 Manages custom trading strategies with database persistence.
 Stores both code and metadata for complex strategies.
+
+Lifecycle invariants (deletion, outputs sync): see
+``k2_quant.utilities.services.strategy_lifecycle_rules``.
 """
 
 import json
 import sqlite3
 from datetime import datetime
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 from pathlib import Path
 
 from k2_quant.utilities.logger import k2_logger
+from k2_quant.utilities.strategy_validator import validate_strategy
 
 
 class StrategyService:
@@ -66,14 +70,34 @@ class StrategyService:
                 ON strategy_runs (strategy_name, run_timestamp DESC)
             """)
 
+            cur2 = conn.cursor()
+            cur2.execute("PRAGMA table_info(strategy_runs)")
+            run_cols = {row[1] for row in cur2.fetchall()}
+            if "report_blocks_json" not in run_cols:
+                cursor.execute(
+                    "ALTER TABLE strategy_runs ADD COLUMN report_blocks_json TEXT"
+                )
+
             conn.commit()
         
         k2_logger.info("Strategy database initialized", "STRATEGY")
     
     def save_strategy(self, name: str, code: str, description: str = "",
                      parameters: Dict[str, Any] = None,
-                     category: str = "custom") -> bool:
-        """Save a new strategy or update existing one"""
+                     category: str = "custom") -> Tuple[bool, List[str], List[str]]:
+        """Save a new strategy or update existing one.
+
+        Validates before persist. Returns (success, errors, warnings).
+        errors block save; warnings are advisory (e.g. unknown frame columns).
+        """
+        passed, val_errors, val_warnings = validate_strategy(code)
+        if not passed:
+            k2_logger.warning(
+                f"Strategy '{name}' save rejected by validator: {val_errors}",
+                "STRATEGY",
+            )
+            return False, val_errors, val_warnings
+
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
@@ -105,11 +129,11 @@ class StrategyService:
                     k2_logger.info(f"Strategy saved: {name}", "STRATEGY")
                 
                 conn.commit()
-                return True
+                return True, [], val_warnings
                 
         except Exception as e:
             k2_logger.error(f"Failed to save strategy: {str(e)}", "STRATEGY")
-            return False
+            return False, [f"Failed to save strategy: {str(e)}"], val_warnings
     
     def get_strategy(self, name: str) -> Optional[Dict[str, Any]]:
         """Get a strategy by name"""
@@ -191,29 +215,39 @@ class StrategyService:
             source = self.get_strategy(source_name)
             if not source:
                 return False
-            return self.save_strategy(
+            ok, _, _ = self.save_strategy(
                 new_name, source['code'],
                 description=source.get('description', ''),
                 category=source.get('category', 'custom'),
             )
+            return ok
         except Exception as e:
             k2_logger.error(f"Failed to duplicate strategy: {str(e)}", "STRATEGY")
             return False
 
     def delete_strategy(self, name: str) -> bool:
-        """Hard delete a strategy from the database"""
+        """Remove strategy and all OUTPUTS history for that name (same transaction).
+
+        See ``strategy_lifecycle_rules.RULE 1``.
+        """
+        name = (name or "").strip()
+        if not name:
+            return False
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
-                
                 cursor.execute(
-                    "DELETE FROM strategies WHERE name = ?", (name,)
+                    "DELETE FROM strategy_runs WHERE strategy_name = ?", (name,)
                 )
-                
+                runs_removed = cursor.rowcount or 0
+                cursor.execute("DELETE FROM strategies WHERE name = ?", (name,))
                 conn.commit()
-                k2_logger.info(f"Strategy deleted: {name}", "STRATEGY")
+                k2_logger.info(
+                    f"Strategy deleted: {name} (removed {runs_removed} run record(s))",
+                    "STRATEGY",
+                )
                 return True
-                
+
         except Exception as e:
             k2_logger.error(f"Failed to delete strategy: {str(e)}", "STRATEGY")
             return False
@@ -250,8 +284,9 @@ class StrategyService:
                     INSERT INTO strategy_runs
                         (strategy_name, model_table, run_timestamp, success,
                          execution_time_ms, stdout_output, error_output,
-                         tab_writes_json, metrics_json, code_snapshot)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         tab_writes_json, metrics_json, code_snapshot,
+                         report_blocks_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     strategy_name,
                     model_table or "",
@@ -263,6 +298,7 @@ class StrategyService:
                     json.dumps(tw_safe, default=str),
                     json.dumps(result.get('metrics', {}), default=str),
                     code_snapshot,
+                    json.dumps(result.get('_report_blocks', []), default=str),
                 ))
                 conn.commit()
                 run_id = cursor.lastrowid
@@ -315,14 +351,41 @@ class StrategyService:
             k2_logger.error(f"Failed to get run {run_id}: {e}", "STRATEGY")
             return None
 
-    def get_strategy_names_with_runs(self) -> List[str]:
-        """Return distinct strategy names that have at least one run."""
+    def prune_orphan_strategy_runs(self) -> int:
+        """Delete run rows whose strategy no longer exists (legacy / failed deletes).
+
+        ``strategy_runs`` is not a foreign-key child of ``strategies``; this heals
+        orphans so the OUTPUTS tree cannot list removed strategies.
+        """
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
-                    SELECT DISTINCT strategy_name FROM strategy_runs
-                    ORDER BY strategy_name
+                    DELETE FROM strategy_runs
+                    WHERE strategy_name NOT IN (SELECT name FROM strategies)
+                """)
+                removed = cursor.rowcount or 0
+                conn.commit()
+                if removed:
+                    k2_logger.info(
+                        f"Pruned {removed} orphan strategy run row(s)",
+                        "STRATEGY",
+                    )
+                return removed
+        except Exception as e:
+            k2_logger.error(f"prune_orphan_strategy_runs failed: {e}", "STRATEGY")
+            return 0
+
+    def get_strategy_names_with_runs(self) -> List[str]:
+        """Return distinct strategy names that have runs and still exist in ``strategies``."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT DISTINCT r.strategy_name
+                    FROM strategy_runs r
+                    INNER JOIN strategies s ON s.name = r.strategy_name
+                    ORDER BY r.strategy_name
                 """)
                 return [row[0] for row in cursor.fetchall()]
         except Exception as e:

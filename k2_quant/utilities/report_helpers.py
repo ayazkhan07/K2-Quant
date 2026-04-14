@@ -1,29 +1,113 @@
 """
-Report formatting helpers injected into the DPE strategy execution context.
+Report helpers injected into the DPE strategy execution context.
 
-Strategies call these to produce structured, tabular stdout output that
-appears in the OUTPUTS Report tab.  The validator enforces their use.
+When capture is active (during normal DPE runs), structured blocks are recorded
+for the OUTPUTS panel (dark grid tables). Plain ``print`` box-drawing is
+skipped so stdout stays clean. If capture is off, legacy ASCII tables are
+printed for ad-hoc use.
 """
 
-from typing import List, Tuple, Any, Optional
+from __future__ import annotations
+
+import math
+import numbers
+from contextvars import ContextVar
+from typing import Any, List, Tuple, Optional
+
+from k2_quant.utilities.numeric_rounding import (
+    COMPUTATION_DECIMALS,
+    format_computation_for_display,
+)
+
+_active_blocks: ContextVar[Optional[List[dict]]] = ContextVar(
+    "_active_blocks", default=None
+)
 
 
-def _fmt_val(v) -> str:
+def start_report_capture() -> List[dict]:
+    """Begin collecting structured report blocks. Returns the live list."""
+    blocks: List[dict] = []
+    _active_blocks.set(blocks)
+    return blocks
+
+
+def end_report_capture() -> None:
+    _active_blocks.set(None)
+
+
+def _blocks() -> Optional[List[dict]]:
+    return _active_blocks.get()
+
+
+def _serialize_cell(v: Any) -> Any:
     if v is None:
-        return ""
-    if isinstance(v, float):
-        if abs(v) >= 1_000:
-            return f"{v:,.2f}"
-        if abs(v) < 0.01 and v != 0:
-            return f"{v:.6f}"
-        return f"{v:.4f}"
-    if isinstance(v, int):
-        return f"{v:,}"
+        return None
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, numbers.Integral):
+        return int(v)
+    if isinstance(v, numbers.Real):
+        x = float(v)
+        if math.isnan(x) or math.isinf(x):
+            return None
+        return round(x, COMPUTATION_DECIMALS)
     return str(v)
 
 
+def _fmt_val(v: Any) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, numbers.Integral):
+        return f"{int(v):,}"
+    if isinstance(v, numbers.Real):
+        return format_computation_for_display(v)
+    return str(v)
+
+
+def _plain_cell(v: Any) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, (bool, numbers.Integral, numbers.Real)):
+        return _fmt_val(v)
+    return str(v)
+
+
+def format_blocks_plain(blocks: Optional[List[dict]]) -> str:
+    """Readable plain text (tab-separated) for DB stdout / Thinkspace — no ASCII art."""
+    if not blocks:
+        return ""
+    lines: List[str] = []
+    for b in blocks:
+        kind = b.get("kind")
+        if kind == "header":
+            lines.append(str(b.get("title", "")))
+            lines.append("")
+        elif kind == "config":
+            lines.append("Configuration")
+            hdrs = b.get("headers") or []
+            lines.append("\t".join(str(h) for h in hdrs))
+            for row in b.get("rows") or []:
+                lines.append("\t".join(_plain_cell(x) for x in row))
+            lines.append("")
+        elif kind == "table":
+            lines.append(str(b.get("title", "")))
+            hdrs = b.get("headers") or []
+            lines.append("\t".join(str(h) for h in hdrs))
+            for row in b.get("rows") or []:
+                lines.append("\t".join(_plain_cell(x) for x in row))
+            lines.append("")
+    return "\n".join(lines).rstrip()
+
+
 def report_header(title: str) -> None:
-    """Print a strategy title banner."""
+    title = str(title).strip()
+    bl = _blocks()
+    if bl is not None:
+        bl.append({"kind": "header", "title": title})
+        return
+
     width = max(64, len(title) + 4)
     border = "=" * width
     print(border)
@@ -33,11 +117,21 @@ def report_header(title: str) -> None:
 
 
 def report_config(params: List[Tuple[str, Any, str]]) -> None:
-    """Print a configuration table.
-
-    params: list of (name, value, description) tuples.
-    """
     if not params:
+        return
+
+    bl = _blocks()
+    if bl is not None:
+        rows = [
+            [str(name), _fmt_val(value), str(desc)]
+            for name, value, desc in params
+        ]
+        bl.append({
+            "kind": "config",
+            "title": "Configuration",
+            "headers": ["Parameter", "Value", "Description"],
+            "rows": rows,
+        })
         return
 
     col_name = "Parameter"
@@ -56,7 +150,10 @@ def report_config(params: List[Tuple[str, Any, str]]) -> None:
     print(hdr)
     print(sep)
     for name, value, desc in params:
-        print(f"| {str(name):<{w_name}} | {_fmt_val(value):<{w_val}} | {str(desc):<{w_desc}} |")
+        print(
+            f"| {str(name):<{w_name}} | {_fmt_val(value):<{w_val}} | "
+            f"{str(desc):<{w_desc}} |"
+        )
     print(sep)
     print()
 
@@ -67,25 +164,43 @@ def report_table(
     rows: List[List[Any]],
     max_rows: int = 200,
 ) -> None:
-    """Print a titled data table.
-
-    title:   section heading (e.g. 'Step 1: Survivor Filtering')
-    headers: column names
-    rows:    list of row-lists (same length as headers)
-    max_rows: truncate display after this many rows
-    """
     if not headers:
         return
 
     n_cols = len(headers)
-    str_rows = []
+    str_rows: List[List[Any]] = []
     for row in rows[:max_rows]:
         padded = list(row) + [""] * (n_cols - len(row))
-        str_rows.append([_fmt_val(v) for v in padded[:n_cols]])
+        str_rows.append([_serialize_cell(v) for v in padded[:n_cols]])
+
+    bl = _blocks()
+    if bl is not None:
+        bl.append({
+            "kind": "table",
+            "title": str(title),
+            "headers": [str(h) for h in headers],
+            "rows": str_rows,
+            "truncated": max(0, len(rows) - max_rows),
+        })
+        return
+
+    def _legacy_cell(v: Any) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, bool):
+            return str(v).lower()
+        if isinstance(v, numbers.Real):
+            return _fmt_val(float(v))
+        if isinstance(v, numbers.Integral):
+            return _fmt_val(int(v))
+        return str(v)
 
     widths = [len(h) for h in headers]
+    display_rows = []
     for sr in str_rows:
-        for i, cell in enumerate(sr):
+        dr = [_legacy_cell(v) for v in sr]
+        display_rows.append(dr)
+        for i, cell in enumerate(dr):
             widths[i] = max(widths[i], len(cell))
 
     sep = "+-" + "-+-".join("-" * w for w in widths) + "-+"
@@ -95,8 +210,8 @@ def report_table(
     print(sep)
     print(hdr_line)
     print(sep)
-    for sr in str_rows:
-        print("| " + " | ".join(cell.ljust(w) for cell, w in zip(sr, widths)) + " |")
+    for dr in display_rows:
+        print("| " + " | ".join(cell.ljust(w) for cell, w in zip(dr, widths)) + " |")
     print(sep)
 
     if len(rows) > max_rows:

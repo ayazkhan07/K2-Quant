@@ -44,6 +44,12 @@ try:
 except ImportError:
     stock_service = None
 
+try:
+    from k2_quant.utilities.numeric_rounding import round_dataframe_numeric_columns
+except ImportError:
+    def round_dataframe_numeric_columns(df):
+        return df
+
 
 # Time span enumeration
 class TimeSpan(Enum):
@@ -280,7 +286,7 @@ class TimeAxisManager:
 
     def __init__(self):
         self.max_labels = 20
-        self.min_label_spacing = 50
+        self.min_label_spacing = 100
 
     def calculate_time_labels(self, dt_cache, x_range, axis_width,
                               is_intraday: bool = False):
@@ -335,15 +341,18 @@ class TimeAxisManager:
                 continue
             x_pos = axis_width * ((idx - x_range[0]) / x_span)
 
+            is_boundary = False
             if month_fmt and last_month is not None and dt.month != last_month:
                 txt = safe_strftime(dt, month_fmt, '')
+                is_boundary = True
             elif date_fmt and last_day is not None and dt.day != last_day:
                 txt = safe_strftime(dt, date_fmt, '')
+                is_boundary = True
             else:
                 txt = safe_strftime(dt, major_fmt, '')
 
             if txt and txt != last_txt:
-                labels.append((txt, x_pos))
+                labels.append((txt, x_pos, is_boundary))
                 last_txt = txt
             last_day = dt.day
             last_month = dt.month
@@ -351,7 +360,12 @@ class TimeAxisManager:
         return labels
     
     def calculate_grid_positions(self, dt_cache, x_range):
-        """Calculate grid positions using binary search on cached datetimes."""
+        """Calculate grid positions using binary search on cached datetimes.
+
+        Returns list of (idx, is_date_boundary) tuples.  Date boundaries
+        (day-change for intraday, month-change for daily+) get a brighter
+        grid line so the user can orient quickly.
+        """
         if dt_cache is None or len(dt_cache) == 0:
             return []
 
@@ -362,13 +376,13 @@ class TimeAxisManager:
 
         visible = x_max - x_min + 1
         if visible <= 50:
-            return list(range(x_min, x_max + 1))
+            return [(i, False) for i in range(x_min, x_max + 1)]
 
         start_date = pd.Timestamp(dt_cache[x_min])
         end_date = pd.Timestamp(dt_cache[x_max])
         if pd.isna(start_date) or pd.isna(end_date):
             step = max(1, visible // 50)
-            return list(range(x_min, x_max + 1, step))
+            return [(i, False) for i in range(x_min, x_max + 1, step)]
 
         time_span, _ = get_time_span(start_date, end_date)
         _GRID = {
@@ -385,12 +399,19 @@ class TimeAxisManager:
 
         target_ns = dt_cache.astype('int64')
         positions = []
+        prev_date = None
         cur = snap_to_time_boundary(start_date, time_span)
         while cur <= end_date and len(positions) < 100:
             idx = int(np.searchsorted(target_ns, np.int64(pd.Timestamp(cur).value)))
             idx = min(idx, len(dt_cache) - 1)
             if x_min <= idx <= x_max:
-                positions.append(idx)
+                cur_date = pd.Timestamp(dt_cache[idx])
+                is_boundary = (prev_date is not None
+                               and not pd.isna(cur_date)
+                               and cur_date.date() != prev_date)
+                positions.append((idx, is_boundary))
+                if not pd.isna(cur_date):
+                    prev_date = cur_date.date()
             cur += grid_interval
         return positions
 
@@ -486,6 +507,7 @@ class DiscreteViewBox(pg.ViewBox):
         super().__init__(*args, **kwargs)
         self.setLimits(xMin=0, xMax=1e6, yMin=0, yMax=1e6)
         self.data_x_max = 0
+        self.data_x_actual = 0
         self.data_y_min = 0.0
         self.data_y_max = 1e6
 
@@ -509,14 +531,22 @@ class DiscreteViewBox(pg.ViewBox):
 
     # -- helpers --------------------------------------------------------
 
-    _OVERSCROLL = 0.25  # allow 25% of viewport beyond data edges
+    _OVERSCROLL = 0.25
+    _RIGHT_FUTURE_RATIO = 0.75
 
     def _clamp_x(self, x_min, x_max):
-        """Clamp X viewport allowing 1/4 viewport of overscroll past data edges."""
+        """Clamp X viewport: free scroll left, right-limited so the last real
+        bar stays within the left portion of the viewport.  Future x-axis
+        labels are still visible but data never shrinks to an unreadable sliver."""
         span = x_max - x_min
         overshoot = span * self._OVERSCROLL
         left_wall = 0.0 - overshoot
-        right_wall = (float(self.data_x_max) if self.data_x_max > 0 else span) + overshoot
+
+        actual = float(self.data_x_actual) if self.data_x_actual > 0 else span
+        hard_right = (float(self.data_x_max) if self.data_x_max > 0 else span) + overshoot
+        soft_right = actual + span * self._RIGHT_FUTURE_RATIO
+        right_wall = min(hard_right, soft_right + overshoot)
+
         if x_min < left_wall:
             x_min = left_wall
             x_max = x_min + span
@@ -725,15 +755,18 @@ class EmbeddedAxis(pg.GraphicsWidget):
         self.setZValue(1000000)
 
     def _setup_appearance(self):
-        self.font = QFont('Arial', 9)
-        self.small_font = QFont('Arial', 8)
-        self.text_color = QColor('#999999')
-        self.subtext_color = QColor('#666666')
-        self.bg_color = QColor(10, 10, 10, 230)
-        self.border_color = QColor(42, 42, 42)
+        self.font = QFont('Segoe UI', 10)
+        self.small_font = QFont('Segoe UI', 9)
+        self.bold_font = QFont('Segoe UI', 10, QFont.Weight.Bold)
+        self.text_color = QColor('#b0b0b0')
+        self.subtext_color = QColor('#808080')
+        self.highlight_color = QColor('#e0e0e0')
+        self.bg_color = QColor(13, 13, 13, 240)
+        self.border_color = QColor(50, 50, 50)
         self.pen = QPen(self.border_color, 1)
         self.text_pen = QPen(self.text_color)
         self.subtext_pen = QPen(self.subtext_color)
+        self.highlight_pen = QPen(self.highlight_color)
 
     def _setup_dimensions(self):
         if self.orientation == 'left':
@@ -774,22 +807,24 @@ class EmbeddedAxis(pg.GraphicsWidget):
                     text_rect = QRectF(5, pos - 10, self._width - 10, 20)
                     painter.drawText(text_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, label)
             else:
-                # Draw main labels - stacked: date on top, time on bottom
-                for label, pos in self.labels:
+                half_w = 46
+                for entry in self.labels:
+                    label, pos = entry[0], entry[1]
+                    is_boundary = entry[2] if len(entry) > 2 else False
                     if '\n' in label:
                         parts = label.split('\n')
-                        # Date on top (smaller, subdued)
                         painter.setFont(self.small_font)
                         painter.setPen(self.subtext_pen)
-                        text_rect = QRectF(pos - 45, 4, 90, 16)
+                        text_rect = QRectF(pos - half_w, 4, half_w * 2, 18)
                         painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, parts[0])
-                        # Time on bottom (normal, brighter)
-                        painter.setFont(self.font)
-                        painter.setPen(self.text_pen)
-                        text_rect = QRectF(pos - 45, 22, 90, 20)
+                        painter.setFont(self.bold_font if is_boundary else self.font)
+                        painter.setPen(self.highlight_pen if is_boundary else self.text_pen)
+                        text_rect = QRectF(pos - half_w, 24, half_w * 2, 22)
                         painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, parts[1])
                     else:
-                        text_rect = QRectF(pos - 45, 5, 90, self._height - 10)
+                        painter.setFont(self.bold_font if is_boundary else self.font)
+                        painter.setPen(self.highlight_pen if is_boundary else self.text_pen)
+                        text_rect = QRectF(pos - half_w, 6, half_w * 2, self._height - 12)
                         painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, label)
 
     def setLabels(self, labels):
@@ -995,16 +1030,16 @@ class ChartWidget(QWidget):
         
     def _init_grid_pool(self):
         """Initialize reusable grid line pool"""
-        # Create pool of vertical lines
+        self._grid_pen = pg.mkPen(QColor(40, 40, 40), width=1)
+        self._grid_boundary_pen = pg.mkPen(QColor(60, 60, 60), width=1)
         for _ in range(200):
-            line = pg.InfiniteLine(angle=90, pen=pg.mkPen('#1a1a1a', width=1))
+            line = pg.InfiniteLine(angle=90, pen=self._grid_pen)
             line.setVisible(False)
             self.main_plot.addItem(line, ignoreBounds=True)
             self._grid_pool['v'].append(line)
-            
-        # Create pool of horizontal lines  
+
         for _ in range(15):
-            line = pg.InfiniteLine(angle=0, pen=pg.mkPen('#1a1a1a', width=1))
+            line = pg.InfiniteLine(angle=0, pen=self._grid_pen)
             line.setVisible(False)
             self.main_plot.addItem(line, ignoreBounds=True)
             self._grid_pool['h'].append(line)
@@ -1287,10 +1322,13 @@ class ChartWidget(QWidget):
         grid_positions = self.time_axis_manager.calculate_grid_positions(
             self._dt_cache, x_range)
 
-        for i, pos in enumerate(grid_positions[:len(self._grid_pool['v'])]):
-            self._grid_pool['v'][i].setPos(pos)
-            self._grid_pool['v'][i].setVisible(True)
-        self._active_grids['v'] = min(len(grid_positions), len(self._grid_pool['v']))
+        pool = self._grid_pool['v']
+        for i, entry in enumerate(grid_positions[:len(pool)]):
+            pos, is_boundary = entry if isinstance(entry, tuple) else (entry, False)
+            pool[i].setPos(pos)
+            pool[i].setPen(self._grid_boundary_pen if is_boundary else self._grid_pen)
+            pool[i].setVisible(True)
+        self._active_grids['v'] = min(len(grid_positions), len(pool))
 
         self.x_axis.setLabels(labels)
         
@@ -1310,7 +1348,10 @@ class ChartWidget(QWidget):
 
         self.y_axis.setPos(vb_rect.right() - y_axis_width, vb_rect.top())
         self.x_axis.setPos(vb_rect.left(), vb_rect.bottom() - x_axis_height)
-        
+
+        # Labels use x_axis._width for pixel positions; refresh after size is final.
+        QTimer.singleShot(0, self.update_axis_labels_and_grid)
+
     def _get_price_interval(self, price_range):
         """Get appropriate price interval"""
         if price_range <= 0:
@@ -1364,6 +1405,7 @@ class ChartWidget(QWidget):
                 return
             for col in list(NUMERIC_COLUMNS & set(daily_df.columns)):
                 daily_df[col] = pd.to_numeric(daily_df[col], errors='coerce')
+            daily_df = round_dataframe_numeric_columns(daily_df)
             self.original_data = daily_df
             self._model_cache[table_name] = daily_df
 
@@ -1402,10 +1444,23 @@ class ChartWidget(QWidget):
     def _on_raw_data_ready(self, table_name: str, df):
         """Called on main thread when background fetch completes."""
         if df is not None and not df.empty:
+            df = round_dataframe_numeric_columns(df)
             self._model_cache[table_name] = df
             self._raw_ready.add(table_name)
             if self.current_table_name == table_name:
                 self.original_data = df
+                # Critical: phase-1 used ~daily bars and a matching x viewport.
+                # Replacing original_data with full-resolution rows changes the
+                # length of self.data after reprocess; old viewRange would squash
+                # the series on the left and crush x-axis labels.
+                self.clear_forecast_data()
+                self._process_timeframe_optimized()
+                self._global_start_index = 0
+                self._update_viewport_limits()
+                self._display_ohlc_optimized()
+                self._show_last_n_bars(DEFAULT_VISIBLE_BARS)
+                self.update_axis_geometry()
+                QTimer.singleShot(0, self.update_axis_labels_and_grid)
             k2_logger.info(
                 f"Background fetch done: {len(df)} raw rows for {table_name}",
                 "CHART")
@@ -1453,8 +1508,8 @@ class ChartWidget(QWidget):
             yMax=y_max + overscroll_y
         )
         
-        # Store data boundaries in ViewBox for clamping (includes forecast space)
         if isinstance(vb, DiscreteViewBox):
+            vb.data_x_actual = x_max
             vb.data_x_max = x_max_with_forecast
             vb.data_y_min = y_min
             vb.data_y_max = y_max
@@ -1785,6 +1840,45 @@ class ChartWidget(QWidget):
             vb._manual_y_mode = False
         self._show_last_n_bars(DEFAULT_VISIBLE_BARS)
 
+    def _forecast_max_x_excess(self) -> int:
+        """How far past the last OHLC index any forecast polyline extends."""
+        if self.data is None or len(self.data) == 0:
+            return 0
+        last_ohlc = len(self.data) - 1
+        mx = last_ohlc
+        for item in self._forecast_lines.values():
+            try:
+                xd = item.xData
+                if xd is None or len(xd) == 0:
+                    continue
+                arr = np.asarray(xd, dtype=float)
+                finite = arr[np.isfinite(arr)]
+                if len(finite):
+                    mx = max(mx, int(np.ceil(float(np.nanmax(finite)))))
+            except Exception:
+                continue
+        return max(0, mx - last_ohlc)
+
+    def _expand_x_if_forecast_clipped(self):
+        """If the view does not include all forecast x, widen to the right (clamped)."""
+        excess = self._forecast_max_x_excess()
+        if excess <= 0 or self.data is None:
+            return
+        vb = self.main_plot.getViewBox()
+        x_lo, x_hi = vb.viewRange()[0]
+        pad = max(4, min(80, excess // 8 + 2))
+        need_hi = float(len(self.data) - 1 + excess + pad)
+        if x_hi >= need_hi - 0.5:
+            return
+        span = max(x_hi - x_lo, float(max(10, excess + pad)))
+        new_hi = need_hi
+        new_lo = new_hi - span
+        if isinstance(vb, DiscreteViewBox):
+            new_lo, new_hi = vb._clamp_x(new_lo, new_hi)
+        vb.setXRange(new_lo, new_hi, padding=0)
+        self.auto_scale_y_for_visible_data()
+        self._emit_viewport_changed()
+
     def _show_last_n_bars(self, n: int):
         """Position the viewport to show the last *n* bars (or all bars if
         fewer than *n* exist)."""
@@ -1794,7 +1888,8 @@ class ChartWidget(QWidget):
         visible = min(n, total)
         end_idx = total - 1
         start_idx = max(0, end_idx - visible)
-        buf = max(2, visible // 20)
+        fpad = self._forecast_max_x_excess()
+        buf = max(max(2, visible // 20), fpad + 2)
         self.main_plot.setXRange(start_idx, end_idx + buf, padding=0)
         self._auto_scale_y_range(start_idx, end_idx)
         self.last_default_x_range = (start_idx, end_idx + buf)
@@ -2532,6 +2627,7 @@ class ChartWidget(QWidget):
         self.main_plot.addItem(plot_item)
         self._forecast_lines[column_name] = plot_item
         k2_logger.info(f"Added forecast line '{column_name}' to chart", "CHART")
+        self._expand_x_if_forecast_clipped()
 
     def remove_forecast_line(self, column_name: str):
         """Remove a single named forecast line from the chart."""
@@ -2590,6 +2686,7 @@ class ChartWidget(QWidget):
         total = len(self._forecast_lines)
         if total:
             k2_logger.info(f"Added {total} forecast line(s) to chart", "CHART")
+            self._expand_x_if_forecast_clipped()
 
     def clear_forecast_data(self):
         """Remove all forecast (dashed) lines from the chart."""

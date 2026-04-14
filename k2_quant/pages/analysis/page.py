@@ -49,6 +49,8 @@ from k2_quant.utilities.services.technical_analysis_service import ta_service
 from k2_quant.utilities.services.stock_data_service import stock_service
 from k2_quant.utilities.data.saved_models_manager import saved_models_manager
 from k2_quant.utilities.services.strategy_service import strategy_service
+from k2_quant.utilities.report_helpers import format_blocks_plain
+from k2_quant.utilities.numeric_rounding import round_dataframe_numeric_columns
 from k2_quant.utilities.services.dynamic_python_engine import dpe_service
 
 # Import the three pane components
@@ -226,6 +228,8 @@ class AnalysisPageWidget(QWidget):
         # Right pane connections
         self.right_pane.message_sent.connect(self.on_ai_message_sent)
         self.right_pane.strategy_generated.connect(self.on_strategy_generated)
+        self.right_pane.strategy_removed_remotely.connect(
+            self.on_strategy_removed_by_thinkspace)
         self.right_pane.data_modified.connect(self._on_ai_data_modified)
         self.right_pane.tab_writes_ready.connect(self._on_tab_writes)
         self.right_pane.workspace_provider = self._get_workspace_state
@@ -664,7 +668,35 @@ class AnalysisPageWidget(QWidget):
         
         df['date_time_market'] = pd.to_datetime(df['Date'].astype(str) + ' ' + df['Time'].astype(str))
         df = df.rename(columns={'Open':'open','High':'high','Low':'low','Close':'close','Volume':'volume','VWAP':'vwap'})
-        
+        # Display fetch uses UI labels; strategies and DB use snake_case.
+        df = df.rename(columns={
+            'Open_%': 'open_pct',
+            'High_%': 'high_pct',
+            'Low_%': 'low_pct',
+            'Close_%': 'close_pct',
+            'Elasticity': 'elasticity',
+            'Close-Open_%': 'close_open_pct',
+        })
+        # Legacy tables may omit derived columns from SELECT; mirror db_manager.compute_derived_columns.
+        if 'open_pct' not in df.columns and all(c in df.columns for c in ('open', 'high', 'low', 'close')):
+            df = df.sort_values('date_time_market', kind='mergesort').reset_index(drop=True)
+            for c in ('open', 'high', 'low', 'close'):
+                prev = df[c].astype(float).shift(1)
+                cur = df[c].astype(float)
+                df[f'{c}_pct'] = np.where(
+                    (prev != 0) & prev.notna() & cur.notna(),
+                    (cur - prev) / prev * 100.0,
+                    np.nan,
+                )
+            lo = df['low'].astype(float)
+            o_ = df['open'].astype(float)
+            cl = df['close'].astype(float)
+            hi = df['high'].astype(float)
+            df['elasticity'] = np.where(lo != 0, (hi - lo) / lo * 100.0, np.nan)
+            df['close_open_pct'] = np.where(o_ != 0, (cl - o_) / o_ * 100.0, np.nan)
+
+        df = round_dataframe_numeric_columns(df)
+
         result = dpe_service.execute_strategy(code, df)
 
         strategy_service.save_run(
@@ -809,13 +841,31 @@ class AnalysisPageWidget(QWidget):
         k2_logger.info(f"Strategy generated: {name}", "ANALYSIS")
         self.refresh_left_pane_data()
 
-    def on_strategy_deleted(self, name: str):
-        """Delete strategy from DB, clean up any active projections, refresh UI."""
-        k2_logger.info(f"Strategy deleted: {name}", "ANALYSIS")
-        strategy_service.delete_strategy(name)
+    def on_strategy_removed_by_thinkspace(self, name: str):
+        """delete_strategy tool already purged DB + runs; refresh panes and projections."""
+        name = (name or "").strip()
+        if not name:
+            return
+        k2_logger.info(f"Strategy removed via Thinkspace: {name}", "ANALYSIS")
+        self.left_pane.discard_active_strategy(name)
         if self.current_model:
             self.remove_strategy(name)
         self.refresh_left_pane_data()
+        self.outputs_panel.handle_strategy_deleted(name)
+
+    def on_strategy_deleted(self, name: str):
+        """Delete strategy from DB, clean up any active projections, refresh UI."""
+        name = (name or "").strip()
+        if not name:
+            return
+        k2_logger.info(f"Strategy deleted: {name}", "ANALYSIS")
+        ok = strategy_service.delete_strategy(name)
+        if not ok:
+            k2_logger.error(f"Strategy delete failed for {name!r}", "ANALYSIS")
+        if self.current_model:
+            self.remove_strategy(name)
+        self.refresh_left_pane_data()
+        self.outputs_panel.handle_strategy_deleted(name)
     
     def _on_right_tab_changed(self, index: int):
         """Auto-refresh the Outputs panel when its tab is selected."""
@@ -834,9 +884,19 @@ class AnalysisPageWidget(QWidget):
             f"Time: {run['run_timestamp']}\n"
             f"Status: {'SUCCESS' if run.get('success') else 'FAILED'}\n"
         )
+        rb = run.get("report_blocks_json")
+        if rb:
+            try:
+                blocks = json.loads(rb)
+                if isinstance(blocks, list) and blocks:
+                    plain = format_blocks_plain(blocks)
+                    if plain:
+                        summary += f"\nReport:\n{plain}\n"
+            except (json.JSONDecodeError, TypeError):
+                pass
         stdout = (run.get('stdout_output') or '').strip()
         if stdout:
-            summary += f"\nOutput:\n{stdout}\n"
+            summary += f"\nLog (stdout):\n{stdout}\n"
         error = (run.get('error_output') or '').strip()
         if error:
             summary += f"\nError:\n{error}\n"

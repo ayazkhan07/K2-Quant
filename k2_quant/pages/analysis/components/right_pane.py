@@ -106,7 +106,10 @@ class RightPaneWidget(QFrame):
 
     # Signals
     message_sent = pyqtSignal(str)
+    # Emitted after any strategy tool mutates the library (save/rename/etc.).
     strategy_generated = pyqtSignal(str, str)
+    # Thinkspace delete_strategy already removed this name from the DB; analysis page syncs UI.
+    strategy_removed_remotely = pyqtSignal(str)
     projection_requested = pyqtSignal(dict)
     data_modified = pyqtSignal()
     tab_writes_ready = pyqtSignal(list)
@@ -946,6 +949,8 @@ class RightPaneWidget(QFrame):
             strategies_changed = False
             for strat in result.get('_strategies_saved', []):
                 s_name = strat.get('name', '')
+                if strat.get('deleted') and s_name:
+                    self.strategy_removed_remotely.emit(s_name)
                 s_code = strat.get('code', '')
                 strategies_changed = True
                 if s_name and s_code:
