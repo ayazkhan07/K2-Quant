@@ -49,6 +49,7 @@ class CommandWorker(QThread):
         conversation_history: Optional[List[Dict[str, str]]] = None,
         initial_workspace: Optional[Dict] = None,
         model_key: str = DEFAULT_MODEL,
+        market_hours_only: bool = False,
     ):
         super().__init__()
         self.table_name = table_name
@@ -56,6 +57,7 @@ class CommandWorker(QThread):
         self.conversation_history = conversation_history or []
         self.initial_workspace = initial_workspace
         self.model_key = model_key
+        self.market_hours_only = market_hours_only
         self._cancelled = False
 
     def cancel(self):
@@ -76,6 +78,7 @@ class CommandWorker(QThread):
                 initial_workspace=self.initial_workspace,
                 cancel_check=self.is_cancelled,
                 model_key=self.model_key,
+                market_hours_only=self.market_hours_only,
             )
             if self._cancelled:
                 self.result_ready.emit({
@@ -522,9 +525,10 @@ class RightPaneWidget(QFrame):
                 pass
 
         model_key = self.model_combo.currentText()
+        mkt_hours = self.current_context.get('market_hours_only', False) if self.current_context else False
         self.worker = CommandWorker(
             table_name, message, history_for_agent, initial_workspace,
-            model_key)
+            model_key, market_hours_only=mkt_hours)
         self.worker.result_ready.connect(self._on_worker_result)
         self.worker.error_occurred.connect(self._on_worker_error)
         self.worker.step_update.connect(self._on_step_update)

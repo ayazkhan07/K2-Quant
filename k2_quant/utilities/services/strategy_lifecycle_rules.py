@@ -39,6 +39,22 @@ RULE 4 — Orphan run cleanup on OUTPUTS refresh
 ---------------------------------------------------------------------------
 ``OutputsPanel.refresh()`` calls ``prune_orphan_strategy_runs()`` so any run
 rows left behind after an older client or a partial failure are removed.
-``get_strategy_names_with_runs()`` only returns names that still exist in
-``strategies`` (INNER JOIN), so the tree cannot show a deleted strategy.
+The tree now uses ``get_all_strategy_names()`` to list **every** active
+strategy (Strategy Review), with runs shown as children when available.
+
+---------------------------------------------------------------------------
+RULE 6 — Outputs panel refresh after strategy save
+---------------------------------------------------------------------------
+When Thinkspace (or any AI tool) saves a new or updated strategy, the
+``strategy_generated`` signal triggers ``OutputsPanel.refresh()`` alongside
+``refresh_left_pane_data()`` so the OUTPUTS tree reflects the new strategy
+immediately without requiring a tab switch.
+
+---------------------------------------------------------------------------
+RULE 5 — Run retention: last N per strategy
+---------------------------------------------------------------------------
+``StrategyService.MAX_RUNS_PER_STRATEGY`` (default 5) caps how many run
+records are kept per strategy name. After each ``save_run``, older rows
+beyond this limit are deleted inside the same connection. The Outputs panel
+UI requests at most ``MAX_RUNS_PER_STRATEGY`` rows when building the tree.
 """

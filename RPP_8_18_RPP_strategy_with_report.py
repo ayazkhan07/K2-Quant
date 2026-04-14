@@ -45,6 +45,10 @@ report_config([
     ('N_FOCAL (tunable)', N_FOCAL, 'How many past # values feed the focal series.'),
 ])
 
+# --- Clear stale forecasts from prior runs ---
+for _fc in ('Mh_Avg', 'Mh_Min', 'Mh_Max', 'ML_Avg', 'ML_Min', 'ML_Max'):
+    to_forecast(_fc, [])
+
 # --- STEP 1: Base Series ---
 df_sorted = df.sort_values('#').reset_index(drop=True) if '#' in df.columns else df.sort_values('date_time_market').reset_index(drop=True)
 
@@ -108,6 +112,14 @@ def run_recursive_match(series_name, focal_val, focal_series, I_arr, H_arr, L_ar
     all_vals = H_arr if series_name == 'H' else L_arr
     mx = int(I_arr.max())
 
+    target_mid = (r2lo + r2hi) / 2.0
+    best_surv_count = 0
+    best_params = None
+    best_step_log = None
+    deepest_step = 0
+    combos_tried = 0
+    pools_entered = 0
+
     for tp in range(1, 30):
         t = tp / 100.0
         tL_bound = focal_val - abs(focal_val) * t
@@ -120,10 +132,13 @@ def run_recursive_match(series_name, focal_val, focal_series, I_arr, H_arr, L_ar
         if ic < r2hi:
             continue
 
+        pools_entered += 1
+
         for ts in range(10, 200, 5):
             t1s = ts / 100.0
             for ti in range(5, 200, 5):
                 t1i = ti / 100.0
+                combos_tried += 1
 
                 surv = init_I.copy()
                 slog = []
@@ -168,14 +183,35 @@ def run_recursive_match(series_name, focal_val, focal_series, I_arr, H_arr, L_ar
                         ok = False
                         break
 
-                if ok and r2lo <= len(surv) <= r2hi:
+                final_count = len(surv)
+                last_step = slog[-1]['step'] if slog else 0
+
+                if last_step > deepest_step:
+                    deepest_step = last_step
+
+                if abs(final_count - target_mid) < abs(best_surv_count - target_mid) or best_params is None:
+                    best_surv_count = final_count
+                    best_params = {'t': t, 't1_start': t1s, 't1_inc': t1i}
+                    best_step_log = list(slog)
+
+                if ok and r2lo <= final_count <= r2hi:
                     return {
+                        'success': True,
                         't': t, 't1_start': t1s, 't1_inc': t1i,
                         'survivors': surv, 'step_log': slog,
                         'tL': tL_bound, 'tU': tU_bound,
                         'initial_matches': ic,
                     }
-    return None
+
+    return {
+        'success': False,
+        'best_surv_count': best_surv_count,
+        'best_params': best_params,
+        'best_step_log': best_step_log,
+        'deepest_step': deepest_step,
+        'combos_tried': combos_tried,
+        'pools_entered': pools_entered,
+    }
 
 
 h_result = run_recursive_match('H', h_focal, Hf_arr, I, H, L, idx_to_pos, R1, R2_Lo, R2_Hi)
@@ -183,8 +219,15 @@ l_result = run_recursive_match('L', l_focal, Lf_arr, I, H, L, idx_to_pos, R1, R2
 
 
 def _summarize_match(label, res):
-    if res is None:
-        return [label, '-', '-', '0', 'No valid tolerance path in search grid']
+    if not res.get('success', False):
+        bp = res.get('best_params') or {}
+        return [
+            label,
+            f"FAIL (best t={bp.get('t', '-')})",
+            str(res.get('pools_entered', 0)),
+            f"{res.get('best_surv_count', 0)} (need {R2_Lo}-{R2_Hi})",
+            f"deepest step={res.get('deepest_step', 0)}, combos={res.get('combos_tried', 0)}",
+        ]
     slog = res.get('step_log') or []
     last = slog[-1] if slog else {}
     return [
@@ -205,7 +248,49 @@ report_table(
     ],
 )
 
-if h_result is None or l_result is None:
+h_ok = h_result.get('success', False)
+l_ok = l_result.get('success', False)
+
+if not h_ok or not l_ok:
+    # --- Diagnostic summary for failed tracks ---
+    fail_diag_rows = []
+    for label, res in [('High (H)', h_result), ('Low (L)', l_result)]:
+        if not res.get('success', False):
+            bp = res.get('best_params') or {}
+            fail_diag_rows.append([
+                label,
+                res.get('best_surv_count', 0),
+                f"t={bp.get('t', '-')}, t1s={bp.get('t1_start', '-')}, t1i={bp.get('t1_inc', '-')}",
+                res.get('deepest_step', 0),
+                res.get('combos_tried', 0),
+                res.get('pools_entered', 0),
+            ])
+        else:
+            fail_diag_rows.append([label, 'OK', '-', '-', '-', '-'])
+
+    report_table(
+        'Step 2-3: Failure diagnostics',
+        ['Track', 'Best surv count', 'Best params', 'Deepest step', 'Combos tried', 'Tol pools entered'],
+        fail_diag_rows,
+    )
+
+    # --- Best near-miss step traces ---
+    for label, res in [('High (H)', h_result), ('Low (L)', l_result)]:
+        if not res.get('success', False):
+            bsl = res.get('best_step_log')
+            if bsl:
+                trace_rows = [
+                    [s['step'], f"{s['t_k']:.3f}", f"{s['focal_k']:.3f}",
+                     f"[{s['tL_k']:.4f}, {s['tU_k']:.4f}]",
+                     s['in_count'], s['out_count']]
+                    for s in bsl
+                ]
+                report_table(
+                    f'Step 2-3: {label} best near-miss trace',
+                    ['k', 't_k', 'focal_k', 'Band [tL, tU]', 'in_count', 'out_count'],
+                    trace_rows,
+                )
+
     report_table(
         'Step 2-3: Outcome',
         ['Status', 'Detail'],
@@ -214,9 +299,17 @@ if h_result is None or l_result is None:
                 'FAILED',
                 'No parameter set satisfied R1 recursive steps and '
                 f'[{R2_Lo}, {R2_Hi}] survivor band for both H and L. '
-                'No forecast columns written.',
+                'Forecast columns cleared.',
             ],
         ],
+    )
+
+    for _fc in ('Mh_Avg', 'Mh_Min', 'Mh_Max', 'ML_Avg', 'ML_Min', 'ML_Max'):
+        to_forecast(_fc, [])
+    report_table(
+        'Forecast Columns Cleared',
+        ['Action', 'Detail'],
+        [['Cleared all 6 forecast columns', 'No valid projection available this run']],
     )
 else:
     h_slog = h_result.get('step_log') or []

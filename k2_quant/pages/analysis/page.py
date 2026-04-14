@@ -67,6 +67,17 @@ from k2_quant.pages.analysis.components.right_pane import (
 from k2_quant.pages.analysis.components.outputs_panel import OutputsPanel
 
 
+_INTRADAY_TIMESPANS = {'minute', 'min', 'hour'}
+
+
+def _should_filter_market_hours(metadata: dict) -> bool:
+    """Return True when the model's data is intraday and market-hours filtering applies."""
+    if metadata.get('market_hours_only', False):
+        return True
+    ts = str(metadata.get('timespan', '')).lower()
+    return any(ts.startswith(prefix) for prefix in _INTRADAY_TIMESPANS)
+
+
 class AnalysisPageWidget(QWidget):
     """Main Analysis page widget - orchestrates three pane components"""
     
@@ -268,13 +279,15 @@ class AnalysisPageWidget(QWidget):
         
         try:
             from k2_quant.utilities.data.db_manager import db_manager as _db
-            rows, total_count = stock_service.get_display_data(table_name, limit=500)
+            base_metadata = saved_models_manager.get_model_metadata(table_name) or {'symbol': table_name}
+            mkt_hours = _should_filter_market_hours(base_metadata)
+            rows, total_count = stock_service.get_display_data(
+                table_name, limit=500, market_hours_only=mkt_hours)
             
             if rows:
                 self.current_model = table_name
                 self.current_data = rows
                 
-                base_metadata = saved_models_manager.get_model_metadata(table_name) or {'symbol': table_name}
                 parts = table_name.split('_')
                 symbol = parts[1].upper() if len(parts) > 1 else 'UNKNOWN'
                 has_row_number = _db._check_column_exists(table_name, '#')
@@ -286,6 +299,7 @@ class AnalysisPageWidget(QWidget):
                     'total_records': total_count,
                     'symbol': symbol,
                     'has_row_number': has_row_number,
+                    'market_hours_only': mkt_hours,
                 })
                 
                 # Update status
@@ -301,7 +315,8 @@ class AnalysisPageWidget(QWidget):
                 ctx = {
                     'symbol': self.current_metadata.get('symbol', table_name),
                     'records': total_count,
-                    'table_name': table_name
+                    'table_name': table_name,
+                    'market_hours_only': mkt_hours,
                 }
                 self.right_pane.set_data_context(ctx)
                 
@@ -655,8 +670,10 @@ class AnalysisPageWidget(QWidget):
             k2_logger.warning(f"Strategy code not found: {strategy_name}", "ANALYSIS")
             return
         
-        # Load full dataset
-        rows, _ = stock_service.get_display_data(table_name, limit=10**9)
+        # Load full dataset, respecting the model's market-hours preference
+        mkt_hours = self.current_metadata.get('market_hours_only', False)
+        rows, _ = stock_service.get_display_data(
+            table_name, limit=10**9, market_hours_only=mkt_hours)
         has_rn = self.current_metadata.get('has_row_number', False)
         if has_rn:
             all_columns = ['#','Date','Time','Open','High','Low','Close','Volume','VWAP',
@@ -754,7 +771,9 @@ class AnalysisPageWidget(QWidget):
                 chart_range=None
             )
             
-            rows, total_count = stock_service.get_display_data(table_name, limit=500)
+            mkt_hours = self.current_metadata.get('market_hours_only', False)
+            rows, total_count = stock_service.get_display_data(
+                table_name, limit=500, market_hours_only=mkt_hours)
             self.middle_pane.load_data(rows, self.current_metadata)
             self.model_label.setText(f"Model: {table_name} ({total_count:,} records)")
     
@@ -784,7 +803,9 @@ class AnalysisPageWidget(QWidget):
             chart_range=None
         )
         
-        rows, total_count = stock_service.get_display_data(table_name, limit=500)
+        mkt_hours = self.current_metadata.get('market_hours_only', False)
+        rows, total_count = stock_service.get_display_data(
+            table_name, limit=500, market_hours_only=mkt_hours)
         self.middle_pane.load_data(rows, self.current_metadata)
         self.model_label.setText(f"Model: {table_name} ({total_count:,} records)")
     
@@ -837,9 +858,10 @@ class AnalysisPageWidget(QWidget):
         # In full implementation, would process with AI service
     
     def on_strategy_generated(self, name: str, code: str):
-        """Handle strategy generation from AI — refresh left pane."""
+        """Handle strategy generation from AI — refresh left pane and outputs."""
         k2_logger.info(f"Strategy generated: {name}", "ANALYSIS")
         self.refresh_left_pane_data()
+        self.outputs_panel.refresh()
 
     def on_strategy_removed_by_thinkspace(self, name: str):
         """delete_strategy tool already purged DB + runs; refresh panes and projections."""

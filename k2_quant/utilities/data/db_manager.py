@@ -217,13 +217,13 @@ class DatabaseManager:
                 conn.autocommit = False
 
     @log_performance
-    def store_stock_data(self, symbol: str, timespan: str, range_val: str, data: List[Dict], market_hours_only: bool = False) -> str:
+    def store_stock_data(self, symbol: str, timespan: str, range_val: str, data: List[Dict], market_hours_only: bool = False) -> Tuple[str, int]:
         table_name = self.create_stock_table(symbol, timespan, range_val)
-        self.bulk_insert_stock_data(table_name, data, market_hours_only=market_hours_only)
+        inserted_count = self.bulk_insert_stock_data(table_name, data, market_hours_only=market_hours_only)
         self.convert_to_logged_table(table_name)
         self.create_indexes(table_name)
         self.compute_derived_columns(table_name)
-        return table_name
+        return table_name, inserted_count
 
     def compute_derived_columns(self, table_name: str):
         """Populate open_pct, high_pct, low_pct, close_pct, elasticity, close_open_pct.
@@ -461,43 +461,57 @@ class DatabaseManager:
         Get market hours WHERE clause that works with both old and new table schemas.
         Checks if market_time column exists to determine which approach to use.
         """
-        # Check if we have the new market_time column
         if table_name and self._check_column_exists(table_name, 'market_time'):
-            # New schema with market_time column
             return "market_time BETWEEN TIME '09:30:00' AND TIME '16:00:00'"
         else:
-            # Legacy approach using date_time_market (works on all tables)
             return "CAST(date_time_market AS TIME) BETWEEN TIME '09:30:00' AND TIME '16:00:00'"
 
-    def get_record_count(self, table_name: str, market_hours_only: bool = False) -> int:
+    def _get_time_filter_clause(self, table_name: str, market_hours_only: bool = False,
+                                time_start: str = None, time_end: str = None) -> str:
+        """Build a WHERE-clause fragment for time-of-day filtering.
+
+        Priority: explicit time_start/time_end > market_hours_only.
+        Returns an empty string when no filtering is needed.
+        """
+        if time_start and time_end:
+            ts = time_start if len(time_start) > 5 else f"{time_start}:00"
+            te = time_end if len(time_end) > 5 else f"{time_end}:00"
+            if self._check_column_exists(table_name, 'market_time'):
+                return f"market_time BETWEEN TIME '{ts}' AND TIME '{te}'"
+            else:
+                return f"CAST(date_time_market AS TIME) BETWEEN TIME '{ts}' AND TIME '{te}'"
+        elif market_hours_only:
+            return self._get_market_hours_where_clause(table_name)
+        return ""
+
+    def get_record_count(self, table_name: str, market_hours_only: bool = False,
+                         time_start: str = None, time_end: str = None) -> int:
         with self.get_connection() as conn:
             with self.get_cursor(conn) as cur:
-                if market_hours_only:
-                    query = f"""
-                        SELECT COUNT(*) FROM {table_name}
-                        WHERE {self._get_market_hours_where_clause(table_name)}
-                    """
+                time_filter = self._get_time_filter_clause(
+                    table_name, market_hours_only, time_start, time_end)
+                if time_filter:
+                    query = f"SELECT COUNT(*) FROM {table_name} WHERE {time_filter}"
                 else:
                     query = f"SELECT COUNT(*) FROM {table_name}"
                 cur.execute(query)
                 return cur.fetchone()[0]
 
-    def fetch_display_data(self, table_name: str, limit: int = 1000, market_hours_only: bool = False) -> Tuple[List[Tuple], int]:
+    def fetch_display_data(self, table_name: str, limit: int = 1000, market_hours_only: bool = False,
+                           time_start: str = None, time_end: str = None) -> Tuple[List[Tuple], int]:
         with self.get_connection() as conn:
             with self.get_cursor(conn) as cur:
-                total_count = self.get_record_count(table_name, market_hours_only)
-                
-                # Check if we have the new columns
+                total_count = self.get_record_count(table_name, market_hours_only, time_start, time_end)
+
                 has_new_columns = self._check_column_exists(table_name, 'market_date')
                 has_derived = self._check_column_exists(table_name, 'open_pct')
                 has_row_num = self._check_column_exists(table_name, '#')
-                
+
                 row_num_prefix = '"#", ' if has_row_num else ''
                 derived_clause = ""
                 if has_derived:
                     derived_clause = ", open_pct, high_pct, low_pct, close_pct, elasticity, close_open_pct"
-                
-                # Build appropriate SELECT clause based on table schema
+
                 if has_new_columns:
                     select_clause = f"""
                         {row_num_prefix}market_date,
@@ -510,9 +524,11 @@ class DatabaseManager:
                         CAST(date_time_market AS TIME) AS market_time,
                         open, high, low, close, volume, vwap{derived_clause}
                     """
-                
-                where_clause = f"WHERE {self._get_market_hours_where_clause(table_name)}" if market_hours_only else ""
-                
+
+                time_filter = self._get_time_filter_clause(
+                    table_name, market_hours_only, time_start, time_end)
+                where_clause = f"WHERE {time_filter}" if time_filter else ""
+
                 if total_count <= limit:
                     query = f"""
                         SELECT {select_clause}
@@ -522,53 +538,34 @@ class DatabaseManager:
                         LIMIT {limit}
                     """
                 else:
-                    if market_hours_only:
-                        query = f"""
-                            (
-                                SELECT {select_clause}
-                                FROM {table_name}
-                                WHERE {self._get_market_hours_where_clause(table_name)}
-                                ORDER BY timestamp ASC
-                                LIMIT {limit // 2}
-                            )
-                            UNION ALL
-                            (
-                                SELECT {select_clause}
-                                FROM {table_name}
-                                WHERE {self._get_market_hours_where_clause(table_name)}
-                                ORDER BY timestamp DESC
-                                LIMIT {limit // 2}
-                            )
-                            ORDER BY 1, 2
-                        """
-                    else:
-                        query = f"""
-                            (
-                                SELECT {select_clause}
-                                FROM {table_name}
-                                ORDER BY timestamp ASC
-                                LIMIT {limit // 2}
-                            )
-                            UNION ALL
-                            (
-                                SELECT {select_clause}
-                                FROM {table_name}
-                                ORDER BY timestamp DESC
-                                LIMIT {limit // 2}
-                            )
-                            ORDER BY 1, 2
-                        """
+                    query = f"""
+                        (
+                            SELECT {select_clause}
+                            FROM {table_name}
+                            {where_clause}
+                            ORDER BY timestamp ASC
+                            LIMIT {limit // 2}
+                        )
+                        UNION ALL
+                        (
+                            SELECT {select_clause}
+                            FROM {table_name}
+                            {where_clause}
+                            ORDER BY timestamp DESC
+                            LIMIT {limit // 2}
+                        )
+                        ORDER BY 1, 2
+                    """
                 cur.execute(query)
                 rows = cur.fetchall()
                 return rows, total_count
 
-    def fetch_export_data(self, table_name: str, offset: int, limit: int, market_hours_only: bool = False) -> List[Tuple]:
+    def fetch_export_data(self, table_name: str, offset: int, limit: int, market_hours_only: bool = False,
+                          time_start: str = None, time_end: str = None) -> List[Tuple]:
         with self.get_connection() as conn:
             with self.get_cursor(conn) as cur:
-                # Check if we have the new columns
                 has_new_columns = self._check_column_exists(table_name, 'market_date')
-                
-                # Build appropriate SELECT clause based on table schema
+
                 if has_new_columns:
                     select_clause = """
                         market_date,
@@ -581,9 +578,11 @@ class DatabaseManager:
                         CAST(date_time_market AS TIME) AS market_time,
                         open, high, low, close, volume, vwap
                     """
-                
-                where_clause = f"WHERE {self._get_market_hours_where_clause(table_name)}" if market_hours_only else ""
-                
+
+                time_filter = self._get_time_filter_clause(
+                    table_name, market_hours_only, time_start, time_end)
+                where_clause = f"WHERE {time_filter}" if time_filter else ""
+
                 query = f"""
                     SELECT {select_clause}
                     FROM {table_name}
@@ -593,16 +592,19 @@ class DatabaseManager:
                 """
                 cur.execute(query, (limit, offset))
                 rows = cur.fetchall()
-                k2_logger.database_operation(f"Export fetch from {table_name}", 
-                    f"Retrieved {len(rows)} records (offset: {offset}, limit: {limit}, market_hours_only: {market_hours_only})")
+                k2_logger.database_operation(f"Export fetch from {table_name}",
+                    f"Retrieved {len(rows)} records (offset: {offset}, limit: {limit})")
                 return rows
 
-    def fetch_daily_bars(self, table_name: str) -> List[Tuple]:
+    def fetch_daily_bars(self, table_name: str, market_hours_only: bool = False) -> List[Tuple]:
         """Server-side daily aggregation — returns (date, '00:00:00', O, H, L, C, V, VWAP)."""
         with self.get_connection() as conn:
             with self.get_cursor(conn) as cur:
                 has_new = self._check_column_exists(table_name, 'market_date')
                 date_col = 'market_date' if has_new else 'DATE(date_time_market)'
+                time_filter = self._get_time_filter_clause(
+                    table_name, market_hours_only)
+                where_clause = f"WHERE {time_filter}" if time_filter else ""
                 query = f"""
                     SELECT {date_col}                       AS "Date",
                            '00:00:00'                       AS "Time",
@@ -613,6 +615,7 @@ class DatabaseManager:
                            SUM(volume)                      AS "Volume",
                            (ARRAY_AGG(vwap ORDER BY timestamp DESC))[1]  AS "VWAP"
                     FROM {table_name}
+                    {where_clause}
                     GROUP BY {date_col}
                     ORDER BY {date_col}
                 """

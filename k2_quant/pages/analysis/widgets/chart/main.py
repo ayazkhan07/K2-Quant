@@ -450,15 +450,18 @@ class _RawDataWorker(QThread):
     """Background worker that fetches all raw rows from Postgres."""
     finished = pyqtSignal(str, object)  # (table_name, DataFrame or None)
 
-    def __init__(self, table_name: str, total_records: int, parent=None):
+    def __init__(self, table_name: str, total_records: int,
+                 market_hours_only: bool = False, parent=None):
         super().__init__(parent)
         self._table_name = table_name
         self._total = total_records
+        self._market_hours_only = market_hours_only
 
     def run(self):
         try:
             df = stock_service.get_chart_data_chunk(
-                self._table_name, 0, self._total)
+                self._table_name, 0, self._total,
+                market_hours_only=self._market_hours_only)
             if isinstance(df, pd.DataFrame) and not df.empty:
                 for col in list(NUMERIC_COLUMNS & set(df.columns)):
                     df[col] = pd.to_numeric(df[col], errors='coerce')
@@ -1399,8 +1402,9 @@ class ChartWidget(QWidget):
             self.original_data = self._model_cache.get(table_name)
         else:
             daily_df = None
+            mkt_hours = metadata.get('market_hours_only', False) if metadata else False
             if stock_service:
-                daily_df = stock_service.get_daily_bars(table_name)
+                daily_df = stock_service.get_daily_bars(table_name, market_hours_only=mkt_hours)
             if daily_df is None or daily_df.empty:
                 return
             for col in list(NUMERIC_COLUMNS & set(daily_df.columns)):
@@ -1436,7 +1440,8 @@ class ChartWidget(QWidget):
             self._bg_worker.quit()
             self._bg_worker.wait(2000)
 
-        self._bg_worker = _RawDataWorker(table_name, self.total_records, self)
+        mkt_hours = self._model_metadata.get('market_hours_only', False) if self._model_metadata else False
+        self._bg_worker = _RawDataWorker(table_name, self.total_records, mkt_hours, self)
         self._bg_worker.finished.connect(self._on_raw_data_ready)
         self._bg_worker.start()
         k2_logger.info(f"Background fetch started for {table_name}", "CHART")
@@ -1522,8 +1527,9 @@ class ChartWidget(QWidget):
             return
 
         try:
+            mkt_h = self._model_metadata.get('market_hours_only', False) if self._model_metadata else False
             sample_df = stock_service.get_chart_data_chunk(
-                self.current_table_name, 0, 100)
+                self.current_table_name, 0, 100, market_hours_only=mkt_h)
             if sample_df is None or sample_df.empty or 'Time' not in sample_df.columns:
                 self._update_timeframe_buttons('1D')
                 return

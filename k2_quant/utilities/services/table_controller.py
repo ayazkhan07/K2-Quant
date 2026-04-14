@@ -73,6 +73,7 @@ class TableController(QObject):
         initial_workspace: Optional[Dict[str, pd.DataFrame]] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
         model_key: str = DEFAULT_MODEL,
+        market_hours_only: bool = False,
     ) -> Dict[str, Any]:
         """Run the agent loop with a persistent Python namespace.
 
@@ -91,6 +92,8 @@ class TableController(QObject):
             the Working Data tab so the AI can read what is already displayed.
         cancel_check : callable, optional
             Returns True when the user has requested cancellation.
+        market_hours_only : bool
+            When True, filter the loaded DataFrame to 09:30–16:00 bars only.
         """
         try:
             model_info = AI_MODELS.get(model_key, AI_MODELS[DEFAULT_MODEL])
@@ -111,7 +114,8 @@ class TableController(QObject):
                 from anthropic import Anthropic
                 client = Anthropic(api_key=api_key)
 
-            system_prompt = self._build_system_prompt(table, initial_workspace)
+            system_prompt = self._build_system_prompt(
+                table, initial_workspace, market_hours_only=market_hours_only)
             tools = self._build_tools(table)
 
             messages: list = [{"role": "system", "content": system_prompt}]
@@ -131,6 +135,11 @@ class TableController(QObject):
 
             # ── Persistent engine: load data & workspace once ────────
             df = db_manager.fetch_dataframe(table)
+            if market_hours_only and 'market_time' in df.columns:
+                from datetime import time as dt_time
+                df = df[
+                    df['market_time'].between(dt_time(9, 30), dt_time(16, 0))
+                ].reset_index(drop=True)
 
             workspace: Dict[str, Dict[str, list]] = {}
             if initial_workspace and 'sheets' in initial_workspace:
@@ -612,9 +621,12 @@ class TableController(QObject):
     # ── system prompt ──────────────────────────────────────────────
 
     def _build_system_prompt(self, table: str,
-                             initial_workspace: Optional[Dict] = None) -> str:
+                             initial_workspace: Optional[Dict] = None,
+                             market_hours_only: bool = False) -> str:
         """Build system prompt with schema, sample data, summary stats, and workspace state."""
         try:
+            mkt_where = (" WHERE market_time BETWEEN TIME '09:30:00' AND TIME '16:00:00'"
+                         if market_hours_only else "")
             with db_manager.get_connection() as conn:
                 with db_manager.get_cursor(conn) as cur:
                     cur.execute(
@@ -626,24 +638,27 @@ class TableController(QObject):
                     )
                     columns = cur.fetchall()
 
-                    cur.execute(f"SELECT COUNT(*) FROM {table}")
+                    cur.execute(f"SELECT COUNT(*) FROM {table}{mkt_where}")
                     row_count = cur.fetchone()[0]
 
                     sample_col_names = [c[0] for c in columns[:12]]
                     sample_cols_sql = ", ".join(sample_col_names)
 
-                    cur.execute(f"SELECT {sample_cols_sql} FROM {table} ORDER BY timestamp ASC LIMIT 3")
+                    cur.execute(
+                        f"SELECT {sample_cols_sql} FROM {table}{mkt_where} ORDER BY timestamp ASC LIMIT 3")
                     first_rows = cur.fetchall()
                     col_headers = [desc[0] for desc in cur.description]
 
-                    cur.execute(f"SELECT {sample_cols_sql} FROM {table} ORDER BY timestamp DESC LIMIT 3")
+                    cur.execute(
+                        f"SELECT {sample_cols_sql} FROM {table}{mkt_where} ORDER BY timestamp DESC LIMIT 3")
                     last_rows = cur.fetchall()
 
                     price_cols = [c[0] for c in columns if c[0] in ("open", "high", "low", "close", "volume", "vwap")]
                     stats = {}
                     for pc in price_cols:
                         try:
-                            cur.execute(f"SELECT MIN({pc}), MAX({pc}), AVG({pc})::numeric(12,2) FROM {table}")
+                            cur.execute(
+                                f"SELECT MIN({pc}), MAX({pc}), AVG({pc})::numeric(12,2) FROM {table}{mkt_where}")
                             row = cur.fetchone()
                             stats[pc] = {
                                 "min": float(row[0]) if row[0] is not None else None,

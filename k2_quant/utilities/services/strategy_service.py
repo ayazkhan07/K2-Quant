@@ -278,7 +278,7 @@ class StrategyService:
                     entry['preview'] = w['values'][:5]
                 tw_safe.append(entry)
 
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=5) as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
                     INSERT INTO strategy_runs
@@ -302,6 +302,7 @@ class StrategyService:
                 ))
                 conn.commit()
                 run_id = cursor.lastrowid
+                self._prune_excess_runs(strategy_name, conn)
 
             k2_logger.info(
                 f"Strategy run saved: {strategy_name} (id={run_id}, ok={success})",
@@ -312,6 +313,33 @@ class StrategyService:
             k2_logger.error(f"Failed to save strategy run: {e}", "STRATEGY")
             return None
 
+    MAX_RUNS_PER_STRATEGY = 5
+
+    def _prune_excess_runs(self, strategy_name: str, conn: sqlite3.Connection):
+        """Keep only the most recent ``MAX_RUNS_PER_STRATEGY`` runs per strategy."""
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                DELETE FROM strategy_runs
+                WHERE strategy_name = ?
+                  AND id NOT IN (
+                      SELECT id FROM strategy_runs
+                      WHERE strategy_name = ?
+                      ORDER BY run_timestamp DESC
+                      LIMIT ?
+                  )
+            """, (strategy_name, strategy_name, self.MAX_RUNS_PER_STRATEGY))
+            removed = cursor.rowcount or 0
+            if removed:
+                conn.commit()
+                k2_logger.info(
+                    f"Pruned {removed} old run(s) for '{strategy_name}' "
+                    f"(kept last {self.MAX_RUNS_PER_STRATEGY})",
+                    "STRATEGY",
+                )
+        except Exception as e:
+            k2_logger.error(f"_prune_excess_runs failed: {e}", "STRATEGY")
+
     def get_runs(
         self,
         strategy_name: Optional[str] = None,
@@ -319,7 +347,7 @@ class StrategyService:
     ) -> List[Dict[str, Any]]:
         """Return recent runs, optionally filtered by strategy name."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=1) as conn:
                 conn.row_factory = sqlite3.Row
                 cursor = conn.cursor()
                 if strategy_name:
@@ -356,9 +384,13 @@ class StrategyService:
 
         ``strategy_runs`` is not a foreign-key child of ``strategies``; this heals
         orphans so the OUTPUTS tree cannot list removed strategies.
+
+        Uses a very short timeout so this never blocks the UI thread; if the DB
+        is busy (e.g. a run is being saved), the prune is silently skipped —
+        it will succeed on the next refresh.
         """
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=0.3) as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
                     DELETE FROM strategy_runs
@@ -373,13 +405,13 @@ class StrategyService:
                     )
                 return removed
         except Exception as e:
-            k2_logger.error(f"prune_orphan_strategy_runs failed: {e}", "STRATEGY")
+            k2_logger.debug(f"prune_orphan_strategy_runs skipped (DB busy): {e}", "STRATEGY")
             return 0
 
     def get_strategy_names_with_runs(self) -> List[str]:
         """Return distinct strategy names that have runs and still exist in ``strategies``."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=1) as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
                     SELECT DISTINCT r.strategy_name
@@ -390,6 +422,21 @@ class StrategyService:
                 return [row[0] for row in cursor.fetchall()]
         except Exception as e:
             k2_logger.error(f"Failed to list strategy names with runs: {e}", "STRATEGY")
+            return []
+
+    def get_all_strategy_names(self) -> List[str]:
+        """Return all active strategy names (regardless of whether they have runs)."""
+        try:
+            with sqlite3.connect(self.db_path, timeout=1) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT name FROM strategies
+                    WHERE is_active = 1
+                    ORDER BY name
+                """)
+                return [row[0] for row in cursor.fetchall()]
+        except Exception as e:
+            k2_logger.debug(f"get_all_strategy_names skipped (DB busy): {e}", "STRATEGY")
             return []
 
 

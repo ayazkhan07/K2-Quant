@@ -1,10 +1,13 @@
 """
-Outputs Panel — strategy run history, reports, and code viewer.
+Outputs Panel — Strategy Review: code viewer, run history, and reports.
 
 Lives as the second tab in the right pane alongside Thinkspace.
 
+Lists **all** saved strategies so users can review code at any time.
+Runs (with reports) appear as children when available.
+
 When strategies are deleted, the analysis page calls ``handle_strategy_deleted``
-so the run tree matches the DB — see ``strategy_lifecycle_rules``.
+so the tree matches the DB — see ``strategy_lifecycle_rules``.
 """
 
 import json
@@ -68,7 +71,7 @@ class OutputsPanel(QFrame):
 
         # ── left: run tree ───────────────────────────────────────
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["Strategy / Run"])
+        self.tree.setHeaderLabels(["STRATEGIES"])
         self.tree.setIndentation(16)
         self.tree.setRootIsDecorated(True)
         self.tree.header().setStretchLastSection(True)
@@ -327,8 +330,8 @@ class OutputsPanel(QFrame):
         for r, row in enumerate(rows):
             for c in range(ncols):
                 raw = row[c] if c < len(row) else None
-                hdr = headers[c] if c < len(headers) else ""
-                txt = self._report_cell_text(raw, hdr)
+                col_hdr = headers[c] if c < len(headers) else ""
+                txt = self._report_cell_text(raw, col_hdr)
                 item = QTableWidgetItem(txt)
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 if isinstance(raw, bool):
@@ -414,15 +417,19 @@ class OutputsPanel(QFrame):
         self.ref_btn.setEnabled(False)
 
     def refresh(self):
-        """Reload the run tree from the database."""
+        """Reload the strategy tree from the database.
+
+        Lists **all** saved strategies (Strategy Review) so users can review
+        code for any strategy.  Runs are shown as children when available.
+        """
         strategy_service.prune_orphan_strategy_runs()
         self.tree.clear()
-        names = strategy_service.get_strategy_names_with_runs()
+        names = strategy_service.get_all_strategy_names()
         for name in names:
             parent = QTreeWidgetItem(self.tree, [name])
             parent.setData(0, Qt.ItemDataRole.UserRole, {"type": "strategy", "name": name})
             parent.setExpanded(False)
-            runs = strategy_service.get_runs(strategy_name=name, limit=50)
+            runs = strategy_service.get_runs(strategy_name=name, limit=strategy_service.MAX_RUNS_PER_STRATEGY)
             for run in runs:
                 ts = run.get('run_timestamp', '')
                 ok = "OK" if run.get('success') else "FAIL"

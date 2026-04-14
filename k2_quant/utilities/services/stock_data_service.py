@@ -60,31 +60,38 @@ class StockService:
         return self.polygon.validate_symbol(symbol)
 
     @log_performance
-    def fetch_and_store_stock_data(self, symbol: str, time_range: str, frequency: str, market_hours_only: bool = False) -> Dict:
+    def fetch_and_store_stock_data(self, symbol: str, time_range: str, frequency: str,
+                                   market_hours_only: bool = False,
+                                   custom_start: str = None, custom_end: str = None) -> Dict:
         start_time = datetime.now()
         k2_logger.step(1, 6, "Converting parameters")
-        timespan, start_date, end_date, multiplier = self.convert_ui_parameters(time_range, frequency)
+        timespan, computed_start, computed_end, multiplier = self.convert_ui_parameters(time_range, frequency)
+        api_start = custom_start if custom_start else computed_start
+        api_end = custom_end if custom_end else computed_end
         k2_logger.step(2, 6, f"Validating symbol {symbol}")
         if not self.validate_symbol(symbol):
             raise ValueError(f"Invalid symbol: {symbol}")
         k2_logger.step(3, 6, "Fetching data from Polygon API")
-        all_results = self._parallel_fetch_data(symbol, timespan, start_date, end_date, multiplier)
+        all_results = self._parallel_fetch_data(symbol, timespan, api_start, api_end, multiplier)
         if not all_results:
             raise ValueError(f"No data available for {symbol}")
         k2_logger.step(4, 6, "Storing data in database")
-        table_name = self.db.store_stock_data(symbol, timespan, time_range.lower(), all_results, market_hours_only=market_hours_only)
+        table_name, inserted_count = self.db.store_stock_data(
+            symbol, timespan, time_range.lower(), all_results, market_hours_only=market_hours_only)
         execution_time = (datetime.now() - start_time).total_seconds()
-        records_per_sec = int(len(all_results) / execution_time) if execution_time > 0 else 0
+        records_per_sec = int(inserted_count / execution_time) if execution_time > 0 else 0
         k2_logger.step(5, 6, "Calculating metrics")
         k2_logger.performance_metric("Total execution time", execution_time, "seconds")
-        k2_logger.performance_metric("Records processed", len(all_results), "records")
+        k2_logger.performance_metric("Records fetched", len(all_results), "records")
+        if market_hours_only and inserted_count != len(all_results):
+            k2_logger.performance_metric("Records after market-hours filter", inserted_count, "records")
         k2_logger.performance_metric("Processing speed", records_per_sec, "records/second")
         result = {
             'symbol': symbol,
             'range': time_range,
             'frequency': frequency,
             'table_name': table_name,
-            'total_records': len(all_results),
+            'total_records': inserted_count,
             'execution_time': execution_time,
             'records_per_second': records_per_sec,
         }
@@ -147,29 +154,36 @@ class StockService:
             k2_logger.error(f"Chunk fetch failed: {str(e)}", "API")
             return []
 
-    def get_display_data(self, table_name: str, limit: int = 1000, market_hours_only: bool = False) -> Tuple[List[Tuple], int]:
-        return self.db.fetch_display_data(table_name, limit, market_hours_only)
+    def get_display_data(self, table_name: str, limit: int = 1000, market_hours_only: bool = False,
+                         time_start: str = None, time_end: str = None) -> Tuple[List[Tuple], int]:
+        return self.db.fetch_display_data(table_name, limit, market_hours_only, time_start, time_end)
 
-    def get_export_data(self, table_name: str, offset: int, limit: int, market_hours_only: bool = False) -> List[Tuple]:
+    def get_export_data(self, table_name: str, offset: int, limit: int, market_hours_only: bool = False,
+                        time_start: str = None, time_end: str = None) -> List[Tuple]:
         try:
             k2_logger.database_operation(
                 f"Fetching export data from {table_name}",
-                f"Offset: {offset}, Limit: {limit}, Market hours filter: {market_hours_only}")
-            rows = self.db.fetch_export_data(table_name, offset, limit, market_hours_only)
+                f"Offset: {offset}, Limit: {limit}")
+            rows = self.db.fetch_export_data(table_name, offset, limit, market_hours_only, time_start, time_end)
             k2_logger.database_operation("Export data fetched", f"Retrieved {len(rows)} records")
             return rows
         except Exception as e:
             k2_logger.error(f"Failed to fetch export data: {str(e)}", "EXPORT")
             raise
 
-    def get_export_data_streaming(self, table_name: str, batch_size: int = None, market_hours_only: bool = False) -> Generator[List[Tuple], None, None]:
+    def get_export_data_streaming(self, table_name: str, batch_size: int = None, market_hours_only: bool = False,
+                                  time_start: str = None, time_end: str = None) -> Generator[List[Tuple], None, None]:
         if batch_size is None:
             batch_size = self.EXPORT_BATCH_SIZE
         try:
-            _, total_count = self.get_display_data(table_name, limit=1, market_hours_only=market_hours_only)
+            _, total_count = self.get_display_data(
+                table_name, limit=1, market_hours_only=market_hours_only,
+                time_start=time_start, time_end=time_end)
             offset = 0
             while offset < total_count:
-                batch = self.get_export_data(table_name, offset, batch_size, market_hours_only)
+                batch = self.get_export_data(
+                    table_name, offset, batch_size, market_hours_only,
+                    time_start=time_start, time_end=time_end)
                 if not batch:
                     break
                 yield batch
@@ -237,10 +251,10 @@ class StockService:
             k2_logger.error(f"Failed to create filtered table: {e}", "STOCK_SERVICE")
             return False
 
-    def get_daily_bars(self, table_name: str) -> pd.DataFrame:
+    def get_daily_bars(self, table_name: str, market_hours_only: bool = False) -> pd.DataFrame:
         """Return all daily OHLCV bars aggregated server-side."""
         try:
-            rows = self.db.fetch_daily_bars(table_name)
+            rows = self.db.fetch_daily_bars(table_name, market_hours_only=market_hours_only)
             if not rows:
                 return pd.DataFrame()
             columns = ['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'VWAP']
@@ -249,13 +263,15 @@ class StockService:
             k2_logger.error(f"get_daily_bars failed: {str(e)}", "CHART_DATA")
             return pd.DataFrame()
 
-    def get_chart_data_chunk(self, table_name: str, start_idx: int, end_idx: int) -> pd.DataFrame:
+    def get_chart_data_chunk(self, table_name: str, start_idx: int, end_idx: int,
+                             market_hours_only: bool = False) -> pd.DataFrame:
         """Return a DataFrame of rows [start_idx, end_idx) in display format."""
         try:
             limit = max(0, end_idx - start_idx)
             if limit <= 0:
                 return pd.DataFrame()
-            rows = self.db.fetch_export_data(table_name, offset=start_idx, limit=limit, market_hours_only=False)
+            rows = self.db.fetch_export_data(
+                table_name, offset=start_idx, limit=limit, market_hours_only=market_hours_only)
             if not rows:
                 return pd.DataFrame()
             columns = ['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'VWAP']

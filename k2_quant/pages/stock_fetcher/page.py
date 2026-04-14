@@ -5,15 +5,16 @@ Stock Fetcher UI - Page-driven version
 import sys
 import os
 import glob
-from datetime import datetime
+from datetime import datetime, timedelta, time as dt_time
 from typing import List
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QPushButton, QLineEdit,
                              QFrame, QTableWidget, QTableWidgetItem,
-                             QHeaderView, QGridLayout, QProgressDialog, QMessageBox, QCheckBox)
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QFont
+                             QHeaderView, QGridLayout, QProgressDialog, QMessageBox,
+                             QCheckBox, QDateEdit, QComboBox, QCalendarWidget)
+from PyQt6.QtCore import Qt, pyqtSignal, QDate, QThread
+from PyQt6.QtGui import QFont, QTextCharFormat, QColor
 
 from k2_quant.utilities.config.api_config import api_config
 from k2_quant.utilities.services.stock_data_service import stock_service
@@ -21,6 +22,325 @@ from k2_quant.utilities.logger import k2_logger
 from k2_quant.utilities.dialogs import (
     show_warning, show_error, show_info, show_question, show_confirm_delete, show_data_clear_options
 )
+
+
+# ---------------------------------------------------------------------------
+# NYSE holiday / market-calendar helpers
+# ---------------------------------------------------------------------------
+
+def _easter_sunday(year: int) -> QDate:
+    """Compute Easter Sunday via the Anonymous Gregorian algorithm."""
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    el = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * el) // 451
+    month = (h + el - 7 * m + 114) // 31
+    day = ((h + el - 7 * m + 114) % 31) + 1
+    return QDate(year, month, day)
+
+
+def _observed(date: QDate) -> QDate:
+    """Shift Sat→Fri, Sun→Mon for fixed holidays observed by NYSE."""
+    dow = date.dayOfWeek()
+    if dow == 6:
+        return date.addDays(-1)
+    if dow == 7:
+        return date.addDays(1)
+    return date
+
+
+def _nth_weekday(year: int, month: int, day_of_week: int, n: int) -> QDate:
+    """Return the *n*-th occurrence of *day_of_week* (1=Mon … 7=Sun) in *month*."""
+    first = QDate(year, month, 1)
+    offset = (day_of_week - first.dayOfWeek()) % 7
+    return first.addDays(offset + 7 * (n - 1))
+
+
+def _last_weekday(year: int, month: int, day_of_week: int) -> QDate:
+    last_day = QDate(year, month, 1).addMonths(1).addDays(-1)
+    offset = (last_day.dayOfWeek() - day_of_week) % 7
+    return last_day.addDays(-offset)
+
+
+def _nyse_holidays_for_year(year: int) -> list:
+    holidays = [
+        _observed(QDate(year, 1, 1)),                       # New Year's Day
+        _nth_weekday(year, 1, 1, 3),                        # MLK Day
+        _nth_weekday(year, 2, 1, 3),                        # Presidents' Day
+        _easter_sunday(year).addDays(-2),                   # Good Friday
+        _last_weekday(year, 5, 1),                          # Memorial Day
+        _observed(QDate(year, 6, 19)),                      # Juneteenth
+        _observed(QDate(year, 7, 4)),                       # Independence Day
+        _nth_weekday(year, 9, 1, 1),                        # Labor Day
+        _nth_weekday(year, 11, 4, 4),                       # Thanksgiving
+        _observed(QDate(year, 12, 25)),                     # Christmas
+    ]
+    return holidays
+
+
+def _build_nyse_holiday_set() -> set:
+    holidays = set()
+    for year in range(2000, 2036):
+        holidays.update(_nyse_holidays_for_year(year))
+    return holidays
+
+
+NYSE_HOLIDAYS = _build_nyse_holiday_set()
+
+
+class MarketCalendar(QCalendarWidget):
+    """QCalendarWidget that visually greys-out and prevents selection of
+    weekends and NYSE holidays."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._updating = False
+        self._last_valid = self.selectedDate()
+        self.selectionChanged.connect(self._on_selection_changed)
+        self._apply_disabled_formats()
+
+    def _is_disabled(self, date: QDate) -> bool:
+        return date.dayOfWeek() in (6, 7) or date in NYSE_HOLIDAYS
+
+    def _on_selection_changed(self):
+        if self._updating:
+            return
+        date = self.selectedDate()
+        if self._is_disabled(date):
+            self._updating = True
+            self.setSelectedDate(self._last_valid)
+            self._updating = False
+        else:
+            self._last_valid = date
+
+    def _apply_disabled_formats(self):
+        disabled = QTextCharFormat()
+        disabled.setForeground(QColor(60, 60, 60))
+        self.setWeekdayTextFormat(Qt.DayOfWeek.Saturday, disabled)
+        self.setWeekdayTextFormat(Qt.DayOfWeek.Sunday, disabled)
+        for d in NYSE_HOLIDAYS:
+            self.setDateTextFormat(d, disabled)
+
+
+def _snap_to_trading_day(date: QDate) -> QDate:
+    """Walk backwards until a trading day is found."""
+    while date.dayOfWeek() in (6, 7) or date in NYSE_HOLIDAYS:
+        date = date.addDays(-1)
+    return date
+
+
+def _generate_time_items(start_h, start_m, end_h, end_m):
+    """Return list of (display_text, value_24h) tuples in 15-min steps."""
+    items = []
+    h, m = start_h, start_m
+    while (h < end_h) or (h == end_h and m <= end_m):
+        t = dt_time(h, m)
+        display = t.strftime("%I:%M %p").lstrip("0")
+        value = t.strftime("%H:%M")
+        items.append((display, value))
+        m += 15
+        if m >= 60:
+            h += 1
+            m = 0
+    return items
+
+
+MARKET_HOURS_TIMES = _generate_time_items(9, 30, 16, 0)
+EXTENDED_HOURS_TIMES = _generate_time_items(4, 0, 20, 0)
+
+FREQ_TO_MINUTES = {
+    '1min': 1, '5min': 5, '15min': 15, '30min': 30, '1H': 60,
+}
+
+
+def _last_bar_minutes(close_h: int, close_m: int, freq_min: int) -> int:
+    """Minute-of-day of the last interval-aligned bar strictly before close."""
+    return ((close_h * 60 + close_m - 1) // freq_min) * freq_min
+
+
+def _build_time_items(open_h, open_m, close_h, close_m, freq_str):
+    """Generate (display, value) time items from open to the last bar before close.
+
+    Uses 15-minute steps for the main grid.  If the computed last-bar time
+    does not land on a 15-minute boundary it is appended as a final entry
+    so the combo always contains the correct default end.
+
+    Returns (items_list, default_end_value_24h).
+    """
+    freq_min = FREQ_TO_MINUTES.get(freq_str, 1)
+    last_min = _last_bar_minutes(close_h, close_m, freq_min)
+
+    items = []
+    cur = open_h * 60 + open_m
+    step = 15
+    while cur <= last_min:
+        h, m = divmod(cur, 60)
+        t = dt_time(h, m)
+        display = t.strftime("%I:%M %p").lstrip("0")
+        value = t.strftime("%H:%M")
+        items.append((display, value))
+        cur += step
+
+    last_h, last_m = divmod(last_min, 60)
+    last_value = dt_time(last_h, last_m).strftime("%H:%M")
+    if not items or items[-1][1] != last_value:
+        t = dt_time(last_h, last_m)
+        display = t.strftime("%I:%M %p").lstrip("0")
+        items.append((display, last_value))
+
+    return items, last_value
+
+
+# ---------------------------------------------------------------------------
+# Background workers – keep the UI thread free during I/O-heavy operations
+# ---------------------------------------------------------------------------
+
+class _FetchWorker(QThread):
+    """Runs stock_service.fetch_and_store_stock_data off the main thread."""
+
+    result_ready = pyqtSignal(dict)
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, symbol, active_range, active_frequency, custom_start, custom_end,
+                 market_hours_only=False):
+        super().__init__()
+        self._symbol = symbol
+        self._range = active_range
+        self._frequency = active_frequency
+        self._custom_start = custom_start
+        self._custom_end = custom_end
+        self._market_hours_only = market_hours_only
+
+    def run(self):
+        try:
+            result = stock_service.fetch_and_store_stock_data(
+                self._symbol, self._range, self._frequency,
+                market_hours_only=self._market_hours_only,
+                custom_start=self._custom_start, custom_end=self._custom_end)
+            self.result_ready.emit(result)
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+
+
+class _DbLoadWorker(QThread):
+    """Queries display rows from the database off the main thread."""
+
+    result_ready = pyqtSignal(object, int)
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, table_name, limit, time_start, time_end):
+        super().__init__()
+        self._table_name = table_name
+        self._limit = limit
+        self.time_start = time_start
+        self.time_end = time_end
+
+    def run(self):
+        try:
+            rows, total_count = stock_service.get_display_data(
+                self._table_name,
+                self._limit,
+                market_hours_only=False,
+                time_start=self.time_start,
+                time_end=self.time_end,
+            )
+            self.result_ready.emit(rows, total_count)
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+
+
+class _ExportWorker(QThread):
+    """Streams data from the database to CSV files off the main thread."""
+
+    progress = pyqtSignal(int)
+    finished_ok = pyqtSignal(str)
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, current_data, current_table, market_hours_only, time_start, time_end):
+        super().__init__()
+        self._data = current_data
+        self._table = current_table
+        self._market_hours = market_hours_only
+        self._time_start = time_start
+        self._time_end = time_end
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        import csv
+        try:
+            downloads_dir = os.path.expanduser("~/Downloads")
+            os.makedirs(downloads_dir, exist_ok=True)
+            market_suffix = "_market_hours" if self._market_hours else ""
+            base_name = (
+                f"{self._data['symbol']}_{self._data['range']}_"
+                f"{self._data['frequency']}{market_suffix}"
+            )
+            MAX_ROWS_PER_FILE = 1_000_000
+
+            def open_part(part_idx):
+                part_path = os.path.join(downloads_dir, f"{base_name}_part{part_idx:02d}.csv")
+                f = open(part_path, 'w', newline='', encoding='utf-8')
+                w = csv.writer(f)
+                market_tz_local = os.getenv('MARKET_TIMEZONE', 'US/Eastern').split('/')[-1]
+                w.writerow([
+                    f'Date ({market_tz_local})', f'Time ({market_tz_local})',
+                    'Open', 'High', 'Low', 'Close', 'Volume', 'VWAP',
+                ])
+                return f, w, part_path
+
+            part = 1
+            rows_in_part = 0
+            file_handle, writer, filename = open_part(part)
+            batch_count = 0
+
+            try:
+                for batch in stock_service.get_export_data_streaming(
+                        self._table, market_hours_only=False,
+                        time_start=self._time_start, time_end=self._time_end):
+                    if self._cancelled:
+                        break
+                    for row in batch:
+                        if self._cancelled:
+                            break
+                        md, mt = row[0], row[1]
+                        date_str = md.strftime('%Y-%m-%d') if hasattr(md, 'strftime') else str(md)
+                        time_str = mt.strftime('%H:%M:%S') if hasattr(mt, 'strftime') else str(mt)
+                        o = float(row[2]); h = float(row[3]); l = float(row[4]); c = float(row[5])
+                        vol = int(row[6]); vw = float(row[7])
+                        writer.writerow([
+                            date_str, time_str,
+                            f"{o:.2f}", f"{h:.2f}", f"{l:.2f}", f"{c:.2f}",
+                            vol, f"{vw:.2f}",
+                        ])
+                        rows_in_part += 1
+                        if rows_in_part >= MAX_ROWS_PER_FILE:
+                            file_handle.close()
+                            part += 1
+                            rows_in_part = 0
+                            file_handle, writer, filename = open_part(part)
+                    batch_count += 1
+                    self.progress.emit(min(99, batch_count * 5))
+            finally:
+                try:
+                    file_handle.close()
+                except Exception:
+                    pass
+
+            if not self._cancelled:
+                self.finished_ok.emit(filename)
+        except Exception as e:
+            self.error_occurred.emit(str(e))
 
 
 class StockFetcherWidget(QMainWindow):
@@ -31,9 +351,17 @@ class StockFetcherWidget(QMainWindow):
     model_saved = pyqtSignal(str)  # NEW SIGNAL for model saved
     database_cleared = pyqtSignal()  # Emitted after full DB deletion & analysis reset request
 
+    INTRADAY_FREQUENCIES = {'1min', '5min', '15min', '30min', '1H'}
+    RANGE_DAYS = {
+        '1D': 1, '1W': 7, '1M': 30, '3M': 90,
+        '6M': 180, '1Y': 365, '2Y': 730, '5Y': 1825,
+        '10Y': 3650, '20Y': 7300,
+    }
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.worker_thread = None
+        self._db_load_worker = None
         self.export_worker = None
         self.current_data = None
         self.current_table = None
@@ -74,7 +402,7 @@ class StockFetcherWidget(QMainWindow):
 
         sidebar_layout = QVBoxLayout()
         sidebar_layout.setContentsMargins(20, 20, 20, 20)
-        sidebar_layout.setSpacing(16)
+        sidebar_layout.setSpacing(12)
         sidebar.setLayout(sidebar_layout)
 
         ticker_section = self.create_ticker_section()
@@ -83,11 +411,17 @@ class StockFetcherWidget(QMainWindow):
         range_section = self.create_range_section()
         sidebar_layout.addWidget(range_section)
 
+        date_range_section = self.create_date_range_section()
+        sidebar_layout.addWidget(date_range_section)
+
         freq_section = self.create_frequency_section()
         sidebar_layout.addWidget(freq_section)
 
         filters_section = self.create_filters_section()
         sidebar_layout.addWidget(filters_section)
+
+        time_range_section = self.create_time_range_section()
+        sidebar_layout.addWidget(time_range_section)
 
         metrics_frame = self.create_metrics_frame()
         sidebar_layout.addWidget(metrics_frame)
@@ -98,7 +432,6 @@ class StockFetcherWidget(QMainWindow):
         actions_section = self.create_actions_section()
         sidebar_layout.addWidget(actions_section)
 
-        # Keep content cohesive without pushing actions off-screen
         sidebar_layout.addStretch()
 
         parent_layout.addWidget(sidebar)
@@ -147,6 +480,54 @@ class StockFetcherWidget(QMainWindow):
         range_layout.addLayout(range_grid)
         return range_section
 
+    def create_date_range_section(self) -> QFrame:
+        section = QFrame()
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        section.setLayout(layout)
+
+        title = QLabel("DATE RANGE")
+        title.setObjectName("sectionTitle")
+        layout.addWidget(title)
+
+        # --- FROM row ---
+        from_row = QHBoxLayout()
+        from_label = QLabel("FROM")
+        from_label.setObjectName("fieldLabel")
+        from_label.setFixedWidth(36)
+        from_row.addWidget(from_label)
+
+        self.date_from = QDateEdit()
+        self.date_from.setObjectName("dateEdit")
+        self.date_from.setDisplayFormat("MM-dd-yyyy")
+        self.date_from.setCalendarPopup(True)
+        cal_from = MarketCalendar()
+        self.date_from.setCalendarWidget(cal_from)
+        from_row.addWidget(self.date_from)
+        layout.addLayout(from_row)
+
+        # --- TO row ---
+        to_row = QHBoxLayout()
+        to_label = QLabel("TO")
+        to_label.setObjectName("fieldLabel")
+        to_label.setFixedWidth(36)
+        to_row.addWidget(to_label)
+
+        self.date_to = QDateEdit()
+        self.date_to.setObjectName("dateEdit")
+        self.date_to.setDisplayFormat("MM-dd-yyyy")
+        self.date_to.setCalendarPopup(True)
+        cal_to = MarketCalendar()
+        self.date_to.setCalendarWidget(cal_to)
+        to_row.addWidget(self.date_to)
+        layout.addLayout(to_row)
+
+        # Populate initial dates from default range (1M)
+        self._populate_dates_from_range(self.active_range)
+
+        return section
+
     def create_frequency_section(self) -> QFrame:
         freq_section = QFrame()
         freq_layout = QVBoxLayout()
@@ -185,17 +566,61 @@ class StockFetcherWidget(QMainWindow):
 
         self.market_hours_checkbox = QCheckBox("Market Hours Only")
         self.market_hours_checkbox.setObjectName("filterCheckbox")
-        self.market_hours_checkbox.setToolTip("Show only data from 9:30 AM to 4:00 PM EST")
+        self.market_hours_checkbox.setToolTip("Clamp time range to regular market hours")
         self.market_hours_checkbox.setChecked(False)
+        self.market_hours_checkbox.setEnabled(False)
         self.market_hours_checkbox.stateChanged.connect(self.apply_market_hours_filter)
         filters_layout.addWidget(self.market_hours_checkbox)
 
-        info_label = QLabel("(9:30 AM - 4:00 PM EST)")
-        info_label.setObjectName("filterInfoLabel")
-        info_label.setStyleSheet("color: #666; font-size: 10px; margin-left: 20px;")
-        filters_layout.addWidget(info_label)
+        self.filter_info_label = QLabel("(9:30 AM - 4:00 PM ET)")
+        self.filter_info_label.setObjectName("filterInfoLabel")
+        self.filter_info_label.setStyleSheet("color: #666; font-size: 10px; margin-left: 20px;")
+        filters_layout.addWidget(self.filter_info_label)
 
         return filters_section
+
+    def create_time_range_section(self) -> QFrame:
+        section = QFrame()
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        section.setLayout(layout)
+
+        title = QLabel("TIME RANGE")
+        title.setObjectName("sectionTitle")
+        layout.addWidget(title)
+
+        # --- FROM row ---
+        from_row = QHBoxLayout()
+        from_label = QLabel("FROM")
+        from_label.setObjectName("fieldLabel")
+        from_label.setFixedWidth(36)
+        from_row.addWidget(from_label)
+
+        self.time_from = QComboBox()
+        self.time_from.setObjectName("timeCombo")
+        self.time_from.currentIndexChanged.connect(self._on_time_range_changed)
+        from_row.addWidget(self.time_from)
+        layout.addLayout(from_row)
+
+        # --- TO row ---
+        to_row = QHBoxLayout()
+        to_label = QLabel("TO")
+        to_label.setObjectName("fieldLabel")
+        to_label.setFixedWidth(36)
+        to_row.addWidget(to_label)
+
+        self.time_to = QComboBox()
+        self.time_to.setObjectName("timeCombo")
+        self.time_to.currentIndexChanged.connect(self._on_time_range_changed)
+        to_row.addWidget(self.time_to)
+        layout.addLayout(to_row)
+
+        # Default state: disabled (default freq is D)
+        self._populate_time_combos(MARKET_HOURS_TIMES, "09:30", "16:00")
+        self._set_time_controls_enabled(False)
+
+        return section
 
     def create_metrics_frame(self) -> QFrame:
         metrics_frame = QFrame()
@@ -377,7 +802,8 @@ class StockFetcherWidget(QMainWindow):
             """
             QMainWindow { background-color: #0a0a0a; }
             #sidebar { background-color: #0f0f0f; border-right: 1px solid #1a1a1a; }
-            #sectionTitle { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: #999; margin-bottom: 12px; font-weight: 600; }
+            #sectionTitle { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: #999; margin-bottom: 8px; font-weight: 600; }
+            #fieldLabel { font-size: 11px; color: #999; }
             #metricsFrame, #tableInfoFrame { background-color: #1a1a1a; border-radius: 4px; padding: 10px; }
             #metricLabel { font-size: 11px; color: #4a4; text-align: center; margin: 2px; }
             #tableInfoLabel { font-size: 10px; color: #888; text-align: center; }
@@ -385,8 +811,28 @@ class StockFetcherWidget(QMainWindow):
             QCheckBox#filterCheckbox { color: #ffffff; font-size: 12px; padding: 5px; }
             QCheckBox#filterCheckbox::indicator { width: 16px; height: 16px; background-color: #1a1a1a; border: 1px solid #3a3a3a; border-radius: 3px; }
             QCheckBox#filterCheckbox::indicator:checked { background-color: #4a4; border-color: #4a4; }
+            QCheckBox#filterCheckbox:disabled { color: #555; }
             QLineEdit { background-color: #1a1a1a; border: 1px solid #2a2a2a; color: #fff; padding: 12px; font-size: 14px; border-radius: 4px; }
             QLineEdit:focus { border-color: #3a3a3a; background-color: #222; }
+
+            QDateEdit#dateEdit { background-color: #1a1a1a; border: 1px solid #2a2a2a; color: #fff; padding: 6px 8px; font-size: 12px; border-radius: 3px; }
+            QDateEdit#dateEdit:focus { border-color: #3a3a3a; background-color: #222; }
+            QDateEdit#dateEdit::drop-down { subcontrol-origin: padding; subcontrol-position: center right; width: 18px; border: none; }
+            QDateEdit#dateEdit::down-arrow { image: none; border-left: 4px solid transparent; border-right: 4px solid transparent; border-top: 5px solid #999; }
+            QCalendarWidget { background-color: #1a1a1a; color: #fff; }
+            QCalendarWidget QWidget#qt_calendar_navigationbar { background-color: #111; }
+            QCalendarWidget QToolButton { color: #fff; background-color: #1a1a1a; border: none; padding: 4px 8px; font-size: 12px; }
+            QCalendarWidget QToolButton:hover { background-color: #2a2a2a; }
+            QCalendarWidget QAbstractItemView { background-color: #1a1a1a; color: #ccc; selection-background-color: #fff; selection-color: #000; font-size: 11px; }
+            QCalendarWidget QAbstractItemView:enabled { color: #ccc; }
+            QCalendarWidget QAbstractItemView:disabled { color: #444; }
+
+            QComboBox#timeCombo { background-color: #1a1a1a; border: 1px solid #2a2a2a; color: #fff; padding: 6px 8px; font-size: 12px; border-radius: 3px; }
+            QComboBox#timeCombo:disabled { color: #555; background-color: #111; border-color: #1a1a1a; }
+            QComboBox#timeCombo::drop-down { border: none; width: 18px; }
+            QComboBox#timeCombo::down-arrow { border-left: 4px solid transparent; border-right: 4px solid transparent; border-top: 5px solid #999; }
+            QComboBox#timeCombo QAbstractItemView { background-color: #1a1a1a; color: #fff; selection-background-color: #2a2a2a; selection-color: #fff; border: 1px solid #2a2a2a; }
+
             #rangeButton, #freqButton { background-color: #1a1a1a; border: 1px solid #2a2a2a; color: #999; padding: 8px; font-size: 12px; border-radius: 3px; }
             #rangeButton:hover, #freqButton:hover { background-color: #2a2a2a; color: #fff; }
             #rangeButton:checked, #freqButton:checked { background-color: #fff; color: #000; font-weight: 500; }
@@ -570,9 +1016,103 @@ class StockFetcherWidget(QMainWindow):
             elif reply == QMessageBox.StandardButton.No:
                 self.clear_ui()
 
-    # Keep all other methods unchanged
+    # ----- helpers for date / time controls -----
+
+    def _populate_dates_from_range(self, range_value: str):
+        days = self.RANGE_DAYS.get(range_value, 30)
+        end_qdate = _snap_to_trading_day(QDate.currentDate())
+        start_qdate = _snap_to_trading_day(QDate.currentDate().addDays(-days))
+        self.date_from.setDate(start_qdate)
+        self.date_to.setDate(end_qdate)
+
+    def _populate_time_combos(self, items, default_start: str, default_end: str):
+        """Repopulate both time combo-boxes without triggering reload."""
+        self.time_from.blockSignals(True)
+        self.time_to.blockSignals(True)
+        self.time_from.clear()
+        self.time_to.clear()
+        start_idx = end_idx = 0
+        for i, (display, value) in enumerate(items):
+            self.time_from.addItem(display, value)
+            self.time_to.addItem(display, value)
+            if value == default_start:
+                start_idx = i
+            if value == default_end:
+                end_idx = i
+        self.time_from.setCurrentIndex(start_idx)
+        self.time_to.setCurrentIndex(end_idx)
+        self.time_from.blockSignals(False)
+        self.time_to.blockSignals(False)
+
+    def _set_time_controls_enabled(self, enabled: bool):
+        self.time_from.setEnabled(enabled)
+        self.time_to.setEnabled(enabled)
+        self.market_hours_checkbox.setEnabled(enabled)
+        if not enabled:
+            self.filter_info_label.setText("")
+        else:
+            self._update_filter_info()
+
+    def _refresh_time_combos(self):
+        """Rebuild time combo items and defaults for the current frequency."""
+        if self.market_hours_only:
+            items, default_end = _build_time_items(9, 30, 16, 0, self.active_frequency)
+            default_start = "09:30"
+        else:
+            items, default_end = _build_time_items(4, 0, 20, 0, self.active_frequency)
+            default_start = "04:00"
+        self._populate_time_combos(items, default_start, default_end)
+        self._update_filter_info()
+
+    def _update_filter_info(self):
+        freq_min = FREQ_TO_MINUTES.get(self.active_frequency)
+        if self.market_hours_only:
+            if freq_min:
+                last_min = _last_bar_minutes(16, 0, freq_min)
+                h, m = divmod(last_min, 60)
+                end_display = dt_time(h, m).strftime("%I:%M %p").lstrip("0")
+            else:
+                end_display = "4:00 PM"
+            label = f"(9:30 AM - {end_display} ET)"
+        else:
+            if freq_min:
+                last_min = _last_bar_minutes(20, 0, freq_min)
+                h, m = divmod(last_min, 60)
+                end_display = dt_time(h, m).strftime("%I:%M %p").lstrip("0")
+            else:
+                end_display = "8:00 PM"
+            label = f"(4:00 AM - {end_display} ET)"
+        self.filter_info_label.setText(label)
+        self.market_hours_checkbox.setToolTip(f"Clamp time range to {label.strip('()')}")
+
+    def _get_current_time_filter(self):
+        """Return (time_start, time_end) 24h strings, or (None, None) for daily+.
+
+        The returned time_end is extended by (interval - 1) minutes so the SQL
+        BETWEEN clause captures all rows belonging to the last selected bar.
+        """
+        if self.active_frequency in self.INTRADAY_FREQUENCIES:
+            ts = self.time_from.currentData()
+            te = self.time_to.currentData()
+            if ts and te:
+                freq_min = FREQ_TO_MINUTES.get(self.active_frequency, 1)
+                if freq_min > 1:
+                    parts = te.split(':')
+                    end_total = int(parts[0]) * 60 + int(parts[1]) + freq_min - 1
+                    eh, em = divmod(min(end_total, 23 * 60 + 59), 60)
+                    te = f"{eh:02d}:{em:02d}"
+                return ts, te
+        return None, None
+
+    def _on_time_range_changed(self):
+        if self.current_table:
+            self.load_data_from_db()
+
+    # ----- core state handlers -----
+
     def apply_market_hours_filter(self):
         self.market_hours_only = self.market_hours_checkbox.isChecked()
+        self._refresh_time_combos()
         if self.current_table:
             k2_logger.ui_operation("Market hours filter changed", f"Filter active: {self.market_hours_only}")
             self.load_data_from_db()
@@ -589,12 +1129,28 @@ class StockFetcherWidget(QMainWindow):
         for btn in self.findChildren(QPushButton):
             if btn.objectName() == "rangeButton":
                 btn.setChecked(btn.text() == range_value)
+        self._populate_dates_from_range(range_value)
 
     def set_frequency(self, freq_value: str):
         self.active_frequency = freq_value
         for btn in self.findChildren(QPushButton):
             if btn.objectName() == "freqButton":
                 btn.setChecked(btn.text() == freq_value)
+        is_intraday = freq_value in self.INTRADAY_FREQUENCIES
+        if is_intraday:
+            self.market_hours_checkbox.setEnabled(True)
+            was_checked = self.market_hours_checkbox.isChecked()
+            if was_checked:
+                self._refresh_time_combos()
+            else:
+                self.market_hours_checkbox.setChecked(True)  # triggers apply_market_hours_filter
+            self._set_time_controls_enabled(True)
+        else:
+            self.market_hours_checkbox.blockSignals(True)
+            self.market_hours_checkbox.setChecked(False)
+            self.market_hours_only = False
+            self.market_hours_checkbox.blockSignals(False)
+            self._set_time_controls_enabled(False)
 
     def fetch_stock_data(self):
         symbol = self.ticker_input.text().strip().upper()
@@ -605,21 +1161,36 @@ class StockFetcherWidget(QMainWindow):
             show_error(self, "Configuration Error", "Polygon API key not configured.")
             return
 
+        from_date = self.date_from.date()
+        to_date = self.date_to.date()
+        if from_date > to_date:
+            show_warning(self, "Input Error", "FROM date must be before TO date.")
+            return
+
+        custom_start = from_date.toString("yyyy-MM-dd")
+        custom_end = to_date.toString("yyyy-MM-dd")
+
         self.fetch_button.setEnabled(False)
         self.fetch_button.setText("Fetching...")
         self.export_button.setEnabled(False)
         self.clear_metrics()
         self.show_empty_state()
 
-        # Execute synchronously (workers removed for portability in refactor)
-        try:
-            result = stock_service.fetch_and_store_stock_data(symbol, self.active_range, self.active_frequency, market_hours_only=self.market_hours_only)
-            self.display_stock_data(result)
-        except Exception as e:
-            k2_logger.error(f"Worker error: {str(e)}", "WORKER")
-            self.handle_error(str(e))
-        finally:
-            self.worker_finished()
+        self.worker_thread = _FetchWorker(
+            symbol, self.active_range, self.active_frequency,
+            custom_start, custom_end,
+            market_hours_only=self.market_hours_only)
+        self.worker_thread.result_ready.connect(self._on_fetch_finished)
+        self.worker_thread.error_occurred.connect(self._on_fetch_error)
+        self.worker_thread.finished.connect(self.worker_finished)
+        self.worker_thread.start()
+
+    def _on_fetch_finished(self, result: dict):
+        self.display_stock_data(result)
+
+    def _on_fetch_error(self, error_message: str):
+        k2_logger.error(f"Worker error: {error_message}", "WORKER")
+        self.handle_error(error_message)
 
     def display_stock_data(self, data: dict):
         self.current_data = data
@@ -649,26 +1220,32 @@ class StockFetcherWidget(QMainWindow):
     def load_data_from_db(self):
         if not self.current_table:
             return
-        try:
-            rows, total_count = stock_service.get_display_data(
-                self.current_table,
-                1000,
-                market_hours_only=self.market_hours_only
+        time_start, time_end = self._get_current_time_filter()
+        worker = _DbLoadWorker(self.current_table, 1000, time_start, time_end)
+        worker.result_ready.connect(self._on_db_load_finished)
+        worker.error_occurred.connect(self._on_db_load_error)
+        self._db_load_worker = worker
+        worker.start()
+
+    def _on_db_load_finished(self, rows, total_count):
+        time_start, time_end = self._get_current_time_filter()
+        if time_start and time_end:
+            ts_display = self.time_from.currentText()
+            te_display = self.time_to.currentText()
+            self.record_count.setText(f"{total_count:,} records ({ts_display} – {te_display})")
+        else:
+            self.record_count.setText(f"{total_count:,} records")
+        if total_count > 1000:
+            self.record_info.setText(
+                f"Showing first 500 and last 500 of {total_count:,} total records"
             )
-            if self.market_hours_only:
-                self.record_count.setText(f"{total_count:,} records (market hours only)")
-            else:
-                self.record_count.setText(f"{total_count:,} records")
-            if total_count > 1000:
-                self.record_info.setText(
-                    f"Showing first 500 and last 500 of {total_count:,} total records"
-                )
-                self.record_info.show()
-            else:
-                self.record_info.hide()
-            self.show_data_table(rows)
-        except Exception as e:
-            show_error(self, "Display Error", f"Failed to load data: {str(e)}")
+            self.record_info.show()
+        else:
+            self.record_info.hide()
+        self.show_data_table(rows)
+
+    def _on_db_load_error(self, error_message):
+        show_error(self, "Display Error", f"Failed to load data: {error_message}")
 
     def show_data_table(self, rows: list):
         self.empty_state.hide()
@@ -733,92 +1310,55 @@ class StockFetcherWidget(QMainWindow):
     def export_data_csv(self):
         if not self.current_data or not self.current_table:
             return
-        dlg = QProgressDialog("Preparing CSV export...", "Cancel", 0, 100, self)
-        dlg.setWindowTitle("Exporting Data")
-        dlg.setWindowModality(Qt.WindowModality.WindowModal)
-        dlg.setMinimumWidth(400)
-        dlg.show()
 
-        try:
-            # Validate export size (simple check)
-            ok, msg = stock_service.validate_export_size(self.current_table)
-            if not ok:
-                show_warning(self, "Export too large", msg)
-                return
+        ok, msg = stock_service.validate_export_size(self.current_table)
+        if not ok:
+            show_warning(self, "Export too large", msg)
+            return
 
-            # Export in chunks directly
-            downloads_dir = os.path.expanduser("~/Downloads")
-            os.makedirs(downloads_dir, exist_ok=True)
-            market_suffix = "_market_hours" if self.market_hours_only else ""
-            filename = os.path.join(
-                downloads_dir,
-                f"{self.current_data['symbol']}_{self.current_data['range']}_{self.current_data['frequency']}{market_suffix}.csv"
-            )
+        self.export_button.setEnabled(False)
+        self.export_button.setText("Exporting...")
 
-            # Streaming export with splitting into 1M-row parts
-            import csv
-            MAX_ROWS_PER_FILE = 1_000_000
+        self._export_dlg = QProgressDialog("Exporting CSV…", "Cancel", 0, 100, self)
+        self._export_dlg.setWindowTitle("Exporting Data")
+        self._export_dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        self._export_dlg.setMinimumWidth(400)
+        self._export_dlg.show()
 
-            base_name = f"{self.current_data['symbol']}_{self.current_data['range']}_{self.current_data['frequency']}{market_suffix}"
-            def open_part(part_idx: int):
-                part_path = os.path.join(downloads_dir, f"{base_name}_part{part_idx:02d}.csv")
-                f = open(part_path, 'w', newline='', encoding='utf-8')
-                w = csv.writer(f)
-                market_tz_local = os.getenv('MARKET_TIMEZONE', 'US/Eastern').split('/')[-1]
-                w.writerow([f'Date ({market_tz_local})', f'Time ({market_tz_local})', 'Open', 'High', 'Low', 'Close', 'Volume', 'VWAP'])
-                return f, w, part_path
+        time_start, time_end = self._get_current_time_filter()
+        self.export_worker = _ExportWorker(
+            self.current_data, self.current_table,
+            self.market_hours_only, time_start, time_end)
+        self.export_worker.progress.connect(self._export_dlg.setValue)
+        self.export_worker.finished_ok.connect(self._on_export_finished)
+        self.export_worker.error_occurred.connect(self._on_export_error)
+        self._export_dlg.canceled.connect(self.export_worker.cancel)
+        self.export_worker.start()
 
-            part = 1
-            rows_in_part = 0
-            file_handle, writer, filename = open_part(part)
+    def _on_export_finished(self, filename: str):
+        self._export_dlg.setValue(100)
+        self._export_dlg.close()
+        self.export_button.setEnabled(True)
+        self.export_button.setText("Export as CSV")
+        reply = show_question(
+            self,
+            "Export Complete",
+            f"Data exported successfully to:\n{filename}\n\nOpen containing folder?",
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            folder = os.path.dirname(filename)
+            if sys.platform == 'win32':
+                os.startfile(folder)
+            elif sys.platform == 'darwin':
+                os.system(f'open "{folder}"')
+            else:
+                os.system(f'xdg-open "{folder}"')
 
-            try:
-                for batch in stock_service.get_export_data_streaming(self.current_table, market_hours_only=self.market_hours_only):
-                    for row in batch:
-                        # Row layout: (market_date, market_time, open, high, low, close, volume, vwap)
-                        md, mt = row[0], row[1]
-                        date_str = md.strftime('%Y-%m-%d') if hasattr(md, 'strftime') else str(md)
-                        time_str = mt.strftime('%H:%M:%S') if hasattr(mt, 'strftime') else str(mt)
-                        o = float(row[2]); h = float(row[3]); l = float(row[4]); c = float(row[5])
-                        vol = int(row[6]); vw = float(row[7])
-
-                        writer.writerow([date_str, time_str, f"{o:.2f}", f"{h:.2f}", f"{l:.2f}", f"{c:.2f}", vol, f"{vw:.2f}"])
-                        rows_in_part += 1
-
-                        if rows_in_part >= MAX_ROWS_PER_FILE:
-                            file_handle.close()
-                            part += 1
-                            rows_in_part = 0
-                            file_handle, writer, filename = open_part(part)
-
-                    dlg.setValue(min(99, dlg.value() + 5))
-            finally:
-                try:
-                    file_handle.close()
-                except Exception:
-                    pass
-
-            dlg.setValue(100)
-            reply = show_question(
-                self,
-                "Export Complete",
-                f"Data exported successfully to:\n{filename}\n\nOpen containing folder?",
-            )
-            if reply == QMessageBox.StandardButton.Yes:
-                folder = os.path.dirname(filename)
-                if sys.platform == 'win32':
-                    os.startfile(folder)
-                elif sys.platform == 'darwin':
-                    os.system(f'open "{folder}"')
-                else:
-                    os.system(f'xdg-open "{folder}"')
-        except Exception as e:
-            dlg.close()
-            show_error(self, "Export Error", f"Failed to export data: {str(e)}")
-        finally:
-            dlg.close()
-            self.export_button.setEnabled(True)
-            self.export_button.setText("Export as CSV")
+    def _on_export_error(self, error_message: str):
+        self._export_dlg.close()
+        self.export_button.setEnabled(True)
+        self.export_button.setText("Export as CSV")
+        show_error(self, "Export Error", f"Failed to export data: {error_message}")
 
     def delete_table_and_clear(self):
         if not self.current_table:
@@ -840,8 +1380,12 @@ class StockFetcherWidget(QMainWindow):
         self.record_info.hide()
         self.clear_metrics()
         self.show_empty_state()
+        self.market_hours_checkbox.blockSignals(True)
         self.market_hours_checkbox.setChecked(False)
         self.market_hours_only = False
+        self.market_hours_checkbox.blockSignals(False)
+        self._set_time_controls_enabled(self.active_frequency in self.INTRADAY_FREQUENCIES)
+        self._populate_dates_from_range(self.active_range)
         self.export_button.setEnabled(False)
         self.save_model_btn.setEnabled(False)
         self.clear_btn.setEnabled(False)
@@ -879,21 +1423,16 @@ class StockFetcherWidget(QMainWindow):
                 show_error(self, "Error", f"Failed to delete tables: {str(e)}")
 
     def cleanup(self):
-        """Compatibility cleanup method."""
-        worker = getattr(self, 'worker_thread', None)
-        if worker is not None and hasattr(worker, 'isRunning') and worker.isRunning():
-            try:
-                worker.terminate()
-                worker.wait()
-            except Exception:
-                pass
-        exporter = getattr(self, 'export_worker', None)
-        if exporter is not None and hasattr(exporter, 'isRunning') and exporter.isRunning():
-            try:
-                exporter.cancel()
-                exporter.wait()
-            except Exception:
-                pass
+        """Stop any running background workers before teardown."""
+        for worker in (self.worker_thread, self._db_load_worker, self.export_worker):
+            if worker is not None and hasattr(worker, 'isRunning') and worker.isRunning():
+                try:
+                    if hasattr(worker, 'cancel'):
+                        worker.cancel()
+                    worker.terminate()
+                    worker.wait(3000)
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":
