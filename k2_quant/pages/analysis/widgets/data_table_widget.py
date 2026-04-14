@@ -19,6 +19,19 @@ from PyQt6.QtGui import QFont
 from k2_quant.utilities.logger import k2_logger
 
 
+class NumericTableWidgetItem(QTableWidgetItem):
+    """QTableWidgetItem subclass that sorts by numeric value, not string."""
+
+    def __init__(self, text: str, sort_value: float = None):
+        super().__init__(text)
+        self._sort_value = sort_value
+
+    def __lt__(self, other):
+        if self._sort_value is not None and isinstance(other, NumericTableWidgetItem) and other._sort_value is not None:
+            return self._sort_value < other._sort_value
+        return super().__lt__(other)
+
+
 class DataExportThread(QThread):
     """Thread for exporting large datasets"""
     
@@ -331,9 +344,18 @@ class DataTableWidget(QWidget):
                 else:
                     text = str(value)
                 
-                item = QTableWidgetItem(text)
-                
-                # Align text based on data type
+                sort_val = None
+                if col_name_lower not in ('date', 'time') and not pd.isna(value):
+                    try:
+                        sort_val = float(value)
+                    except (ValueError, TypeError):
+                        pass
+
+                if sort_val is not None:
+                    item = NumericTableWidgetItem(text, sort_val)
+                else:
+                    item = QTableWidgetItem(text)
+
                 if col_name_lower in ['date', 'time']:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
                 else:

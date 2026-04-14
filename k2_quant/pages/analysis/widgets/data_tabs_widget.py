@@ -32,6 +32,19 @@ PERCENT_COLUMNS = {'open_%', 'high_%', 'low_%', 'close_%', 'elasticity', 'close-
 FORECAST_OHLC = ['Open', 'High', 'Low', 'Close']
 
 
+class NumericTableWidgetItem(QTableWidgetItem):
+    """QTableWidgetItem subclass that sorts by numeric value, not string."""
+
+    def __init__(self, text: str, sort_value: float = None):
+        super().__init__(text)
+        self._sort_value = sort_value
+
+    def __lt__(self, other):
+        if self._sort_value is not None and isinstance(other, NumericTableWidgetItem) and other._sort_value is not None:
+            return self._sort_value < other._sort_value
+        return super().__lt__(other)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -786,9 +799,22 @@ class DataTabsWidget(QWidget):
             for c in range(len(df.columns)):
                 value = df.iloc[r, c]
                 col_name = df.columns[c]
+                col_lower = str(col_name).lower()
                 text = _format_cell(value, col_name, indicator_names)
-                item = QTableWidgetItem(text)
-                if str(col_name).lower() in ('#', 'date', 'time'):
+
+                sort_val = None
+                if col_lower not in ('date', 'time') and not pd.isna(value):
+                    try:
+                        sort_val = float(value)
+                    except (ValueError, TypeError):
+                        pass
+
+                if sort_val is not None:
+                    item = NumericTableWidgetItem(text, sort_val)
+                else:
+                    item = QTableWidgetItem(text)
+
+                if col_lower in ('#', 'date', 'time'):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
                 else:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -951,7 +977,8 @@ class DataTabsWidget(QWidget):
             if has_hash:
                 existing = table.item(r, ci)
                 if existing is None:
-                    num_item = QTableWidgetItem(str(self._last_row_number + r + 1))
+                    row_num = self._last_row_number + r + 1
+                    num_item = NumericTableWidgetItem(str(row_num), float(row_num))
                     num_item.setFlags(num_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                     num_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
                     table.setItem(r, ci, num_item)
@@ -1394,7 +1421,7 @@ class DataTabsWidget(QWidget):
 
         if not self._forecast_timestamps:
             k2_logger.warning(
-                "restore_forecast: no timestamps available — skipping",
+                "restore_forecast: no timestamps available -- skipping",
                 "DATA_TABS")
             return
 

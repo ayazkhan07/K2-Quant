@@ -35,6 +35,7 @@ from k2_quant.utilities.logger import k2_logger
 from k2_quant.utilities.data.db_manager import db_manager
 from k2_quant.utilities.config import api_config
 from k2_quant.utilities.services.strategy_service import strategy_service
+from k2_quant.utilities.strategy_validator import validate_strategy, format_errors
 
 MAX_AGENT_ITERATIONS = 15
 
@@ -85,7 +86,7 @@ class TableController(QObject):
         step_callback : callable, optional
             Called with a short string for each intermediate tool step.
         initial_workspace : dict, optional
-            ``{'model': DataFrame, 'global': DataFrame}`` — current state of
+            ``{'model': DataFrame, 'global': DataFrame}`` -- current state of
             the Working Data tab so the AI can read what is already displayed.
         cancel_check : callable, optional
             Returns True when the user has requested cancellation.
@@ -105,7 +106,7 @@ class TableController(QObject):
                 api_key = api_config.anthropic_api_key
                 if not api_key:
                     raise RuntimeError(
-                        "Missing ANTHROPIC_API_KEY — set it in your .env file")
+                        "Missing ANTHROPIC_API_KEY -- set it in your .env file")
                 from anthropic import Anthropic
                 client = Anthropic(api_key=api_key)
 
@@ -290,9 +291,76 @@ class TableController(QObject):
                 buf.seek(0)
                 png_b64 = base64.b64encode(buf.read()).decode('utf-8')
                 buf.close()
-                plt.close(target)
+                # Keep figure alive for interactive Qt canvas; detach from
+                # pyplot state so subsequent gcf() calls don't reuse it.
+                if plt.fignum_exists(target.number):
+                    plt.figure(target.number)
+                    plt.close(target.number)
+                # Re-parent figure so it can be embedded in FigureCanvasQTAgg
+                target.set_canvas(None)
                 charts.append({'png': png_b64, 'figure': target})
                 return f"Chart captured ({len(charts)} total)"
+
+            # ── Interactive-widget helpers ──────────────────────────────
+            matrices: list = []
+            tables: list = []
+            equations: list = []
+
+            def _show_matrix(data, label="", editable=True, headers=None):
+                """Display an interactive matrix/vector in the chat.
+
+                data : 2-D list, numpy array, or DataFrame.
+                """
+                if isinstance(data, np.ndarray):
+                    data = data.tolist()
+                elif isinstance(data, pd.DataFrame):
+                    if headers is None:
+                        headers = [str(c) for c in data.columns]
+                    data = data.values.tolist()
+                elif isinstance(data, (pd.Series, np.ndarray)):
+                    data = [[v] for v in data.tolist()]
+                rows = len(data)
+                cols = len(data[0]) if data else 0
+                matrices.append({
+                    'data': data,
+                    'label': str(label),
+                    'editable': bool(editable),
+                    'headers': headers,
+                })
+                return f"Matrix displayed ({rows}×{cols})"
+
+            def _show_table(data, headers=None, label="", editable=False):
+                """Display a sortable data table in the chat.
+
+                data : list of lists, list of dicts, or DataFrame.
+                """
+                if isinstance(data, pd.DataFrame):
+                    if headers is None:
+                        headers = [str(c) for c in data.columns]
+                    data = data.values.tolist()
+                elif data and isinstance(data[0], dict):
+                    if headers is None:
+                        headers = list(data[0].keys())
+                    data = [[row.get(h) for h in headers] for row in data]
+                rows_clean = []
+                for row in data:
+                    rows_clean.append([
+                        None if (isinstance(v, float) and (np.isnan(v) or np.isinf(v)))
+                        else v
+                        for v in row
+                    ])
+                tables.append({
+                    'rows': rows_clean,
+                    'headers': headers or [f"C{i}" for i in range(len(rows_clean[0]) if rows_clean else 0)],
+                    'label': str(label),
+                    'editable': bool(editable),
+                })
+                return f"Table displayed ({len(rows_clean)} rows × {len(headers or [])} cols)"
+
+            def _show_equation(latex, label=""):
+                """Render a LaTeX equation as a typeset image in the chat."""
+                equations.append({'latex': str(latex), 'label': str(label)})
+                return "Equation rendered"
 
             # Persistent namespace shared across all run_python calls
             exec_globals = {
@@ -303,6 +371,9 @@ class TableController(QObject):
                 "datetime": datetime,
                 "result": None,
                 "show_chart": _show_chart,
+                "show_matrix": _show_matrix,
+                "show_table": _show_table,
+                "show_equation": _show_equation,
                 "to_working": _to_working,
                 "read_working": _read_working,
                 "to_forecast": _to_forecast,
@@ -325,6 +396,9 @@ class TableController(QObject):
                         "cancelled": True,
                         "_tab_writes": tab_writes,
                         "_charts": charts,
+                        "_matrices": matrices,
+                        "_tables": tables,
+                        "_equations": equations,
                         "_strategies_saved": strategies_saved,
                     }
 
@@ -424,6 +498,9 @@ class TableController(QObject):
                                 "cancelled": True,
                                 "_tab_writes": tab_writes,
                                 "_charts": charts,
+                                "_matrices": matrices,
+                                "_tables": tables,
+                                "_equations": equations,
                                 "_strategies_saved": strategies_saved,
                             }
 
@@ -501,6 +578,9 @@ class TableController(QObject):
                     "iterations": iterations,
                     "_tab_writes": tab_writes,
                     "_charts": charts,
+                    "_matrices": matrices,
+                    "_tables": tables,
+                    "_equations": equations,
                     "_strategies_saved": strategies_saved,
                 }
                 self.operation_complete.emit(result)
@@ -514,6 +594,9 @@ class TableController(QObject):
                 "iterations": iterations,
                 "_tab_writes": tab_writes,
                 "_charts": charts,
+                "_matrices": matrices,
+                "_tables": tables,
+                "_equations": equations,
                 "_strategies_saved": strategies_saved,
             }
             self.operation_complete.emit(result)
@@ -608,7 +691,7 @@ INSTRUCTIONS:
 - When modifying data, briefly describe what changed so the user knows to check the dataframe.
 - NEVER use emojis or emoticons in your responses. Keep all output plain text.
 
-TAB SYSTEM — The UI has three data tabs the user can see:
+TAB SYSTEM -- The UI has three data tabs the user can see:
   Tab 1 (Model Data): Read-only stock data. Refreshes automatically.
   Tab 2 (Forecast Data): Pre-generated future timestamps for price projections.
   Tab 3 (Working Data): Editable grid workspace with MULTIPLE SHEETS (like Excel).
@@ -643,8 +726,8 @@ PYTHON NOTES:
 CHARTING (available inside run_python):
 - 'plt' (matplotlib.pyplot) is available with a dark theme pre-configured.
 - After building a chart, call show_chart() to display it inline in the chat.
-  show_chart(title=None, fig=None) — captures the current figure as an image.
-  Do NOT call plt.show() — it will freeze the application. Always use show_chart().
+  show_chart(title=None, fig=None) -- captures the current figure as an interactive widget.
+  Do NOT call plt.show() -- it will freeze the application. Always use show_chart().
 - Always call plt.figure() before creating a new chart.
 - You can create any matplotlib visualization: line plots, scatter plots, bar charts,
   histograms, mathematical function graphs, heatmaps, etc.
@@ -660,6 +743,32 @@ CHARTING (available inside run_python):
     plt.grid(True, alpha=0.3)
     show_chart()
 
+INTERACTIVE WIDGETS (available inside run_python):
+
+show_matrix(data, label='', editable=True, headers=None)
+  Display an interactive matrix or vector in the chat. The user can edit cells.
+  data: 2-D list, numpy array, or DataFrame. For a vector, pass [[1,2,3]] (row) or [[1],[2],[3]] (col).
+  headers: optional list of column names.
+  Example:
+    A = np.array([[1, 2], [3, 4]])
+    show_matrix(A, label='Covariance Matrix', editable=True)
+
+show_table(data, headers=None, label='', editable=False)
+  Display a sortable data table in the chat. Richer than text -- supports sort-on-click.
+  data: list-of-lists, list-of-dicts, or DataFrame.
+  Example:
+    show_table(df.head(20), label='Recent Prices')
+
+show_equation(latex, label='')
+  Render a LaTeX equation as a typeset image in the chat.
+  Pass raw LaTeX (no $ delimiters needed).
+  Supports fractions, matrices, integrals, Greek letters, etc.
+  Example:
+    show_equation('\\\\frac{{\\\\partial V}}{{\\\\partial t}} + ...', label='Black-Scholes PDE')
+
+  For matrices inside equations:
+    show_equation('\\\\begin{{bmatrix}} a & b \\\\\\\\ c & d \\\\end{{bmatrix}}', label='2x2 Matrix')
+
 VERIFICATION:
 - After every to_working() call, the system automatically returns a verification summary
   showing the column name and the first values written. ALWAYS inspect this verification
@@ -669,7 +778,7 @@ VERIFICATION:
 WEB SEARCH NOTES:
 - Use run_web_search for qualitative analysis: news events, economic data, Fed decisions,
   geopolitical events, earnings, or any context requiring real-world information.
-- Be specific in queries — include dates, ticker symbols, event names for best results.
+- Be specific in queries -- include dates, ticker symbols, event names for best results.
 - Results include source URLs. ALWAYS cite sources when presenting qualitative analysis.
 - For historical date analysis, search for events around the specific date.
 
@@ -684,7 +793,7 @@ TAB HELPER FUNCTIONS (available inside run_python):
     (or replaces an existing column with the same name).
     sheet: sheet name (e.g. 'Sheet 1', 'Sheet 2'). Defaults to 'Sheet 1'.
     ALIGNMENT: Match the length of values to the source column you are deriving
-    from. If computing from a 370-row column, write exactly 370 values — not the
+    from. If computing from a 370-row column, write exactly 370 values -- not the
     full grid row count. Check workspace_info() to verify dimensions before writing.
 
 - read_working(scope='model', columns=None, head=None, tail=None, sheet=None)
@@ -727,23 +836,79 @@ STRATEGY MANAGEMENT:
 - save_strategy(name, code, description): Save or update a strategy. It appears as a
   toggleable checkbox in the Strategies panel. First develop and test code with run_python,
   then save the final version.
-- get_strategy(name): Retrieve a saved strategy's full code and metadata. Use this when
-  the user asks to review, modify, or discuss an existing strategy.
+- get_strategy(name): Retrieve a saved strategy's full code and metadata.
 - list_strategies(): List all saved strategies with names and descriptions (no code).
 - rename_strategy(old_name, new_name): Rename an existing strategy.
 - delete_strategy(name): Permanently delete a strategy. Confirm with the user first.
-- duplicate_strategy(source_name, new_name): Copy a strategy under a new name for
-  creating variants without modifying the original.
-- The DPE execution context for saved strategies provides: df (DataFrame with columns
-  open, high, low, close, volume, vwap, date_time_market), pd, np, datetime, timedelta,
-  and to_forecast(column_name, values) to write named forecast columns.
-- IMPORTANT: When presenting strategy code to the user, ALWAYS include the full code
-  in a ```python code block so they can review it.
-- When asked to modify a strategy, use get_strategy to retrieve the current code, make
-  the changes, then save_strategy with the updated code.
+- duplicate_strategy(source_name, new_name): Copy a strategy under a new name.
 - IMPORTANT: Strategy names must be EXACT. Before any get_strategy, rename_strategy,
   delete_strategy, or duplicate_strategy call, ALWAYS call list_strategies() first to
   verify the exact name. Never guess or assume a strategy name.
+- When presenting strategy code to the user, ALWAYS include the full code in a
+  ```python code block so they can review it.
+- When asked to modify a strategy, use get_strategy to retrieve the current code, make
+  the changes, then save_strategy with the updated code.
+
+STRATEGY SAVE WORKFLOW (MANDATORY -- you MUST follow this process):
+  Before calling save_strategy you MUST present the report structure to the
+  user and get their explicit confirmation. The steps are:
+
+  A. Develop and test the strategy logic using run_python.
+  B. When the logic works, STOP and present the following to the user:
+     1. Strategy name (what report_header will display)
+     2. Configuration table: every tunable parameter with its value and a
+        plain-language description of what it means. Ask the user if any
+        should be added, removed, or renamed.
+     3. Step-by-step report plan: list which intermediate computations will
+        appear as report_table() tables, what columns each table will have,
+        and what values they show. Ask the user which steps matter to them.
+     4. Forecast columns: list every column that to_forecast() will write,
+        with its name and expected length. Ask the user to confirm.
+  C. Only AFTER the user approves all four items above, assemble the final
+     strategy code with the report_*() calls and call save_strategy.
+  D. Do NOT generate placeholder, empty, or minimal report content to bypass
+     validation. Every report_config entry must have a real description.
+     Every report_table must have real headers and real computed data.
+  E. If the user wants changes, revise and re-present before saving.
+
+STRATEGY CODE REQUIREMENTS (save_strategy will REJECT code that fails):
+  The system validates every strategy before saving. ALL of these are required:
+
+  1. REPORT HEADER: Call report_header('Strategy Name') at the top.
+
+  2. CONFIGURATION TABLE: Call report_config([(name, value, description), ...])
+     listing ALL tunable parameters with their values and meanings.
+     Must have at least 2 parameters. Descriptions must be meaningful
+     (not empty, not placeholders like "param 1").
+     Example:
+       report_config([
+           ("N_FORWARD", N_FORWARD, "Forward projection indices"),
+           ("N_PAST_MAX", N_PAST_MAX, "Maximum cascade depth"),
+       ])
+
+  3. STEP TABLES: Call report_table(title, headers, rows) at least once to show
+     computed values in structured tables. Use one per logical step.
+     Must have at least 2 columns and at least 1 data row.
+     Example:
+       report_table("Step 1: Survivor Filtering",
+           ["Cascade", "Open", "High", "Low", "Close"],
+           [["Initial", 1204, 1204, 1204, 1204],
+            ["Final", 48, 67, 53, 44]])
+
+  4. FORECAST OUTPUT: Call to_forecast(column_name, values) to write price
+     projections. Every strategy MUST produce forecast columns.
+
+  5. FORECAST DOCUMENTATION: Include a report_table() listing the forecast
+     columns being written (column name and length) so the report shows
+     what was published. Example:
+       report_table("Forecast Columns Written",
+           ["Column", "Length"],
+           [[name, len(vals)] for name, vals in forecast_pairs])
+
+  The DPE execution context provides: df, pd, np, datetime, timedelta,
+  to_forecast(), report_header(), report_config(), report_table().
+  print() can be used for additional debug output but is NOT a substitute
+  for the required report_*() calls.
 
 {self._format_workspace_snapshot(initial_workspace)}"""
 
@@ -785,11 +950,19 @@ STRATEGY MANAGEMENT:
                     "name": "run_python",
                     "description": (
                         f"Execute Python code on the '{table}' data. The environment "
-                        f"is persistent — variables, 'df', and workspace state survive "
+                        f"is persistent -- variables, 'df', and workspace state survive "
                         f"between calls. 'pd', 'np', 'datetime', 'plt' are available. "
                         f"Use read_working(sheet=…)/to_working(sheet=…) for workspace I/O. "
                         f"Use list_sheets() to see available sheets. "
                         f"Use show_chart() after plt calls to display charts inline (never plt.show()). "
+                        f"Use show_matrix(data, label='', editable=True, headers=None) to display "
+                        f"an interactive editable matrix/vector in the chat. data can be a 2-D list, "
+                        f"numpy array, or DataFrame. "
+                        f"Use show_table(data, headers=None, label='', editable=False) to display "
+                        f"a sortable data table in the chat. data can be list-of-lists, list-of-dicts, "
+                        f"or DataFrame. "
+                        f"Use show_equation(latex, label='') to render a LaTeX equation as a "
+                        f"typeset image in the chat. Pass raw LaTeX without $ delimiters. "
                         f"Assign to 'result' variable to return a computed value."
                     ),
                     "parameters": {
@@ -828,7 +1001,7 @@ STRATEGY MANAGEMENT:
                             "query": {
                                 "type": "string",
                                 "description": (
-                                    "The search query. Be specific — include dates, "
+                                    "The search query. Be specific -- include dates, "
                                     "ticker symbols, or event names for best results."
                                 ),
                             },
@@ -851,11 +1024,14 @@ STRATEGY MANAGEMENT:
                     "name": "save_strategy",
                     "description": (
                         "Save a Python strategy script so the user can toggle it "
-                        "on/off from the Strategies panel.  The code will be executed "
-                        "by the DPE when the user toggles the strategy on.  "
-                        "The execution context provides: df (DataFrame with columns "
+                        "on/off from the Strategies panel. The code is VALIDATED "
+                        "before saving -- it will be REJECTED if it does not include: "
+                        "report_header(), report_config(), at least one report_table(), "
+                        "to_forecast(), and a forecast documentation table. "
+                        "The DPE execution context provides: df (DataFrame with columns "
                         "open, high, low, close, volume, vwap, date_time_market), "
-                        "pd, np, datetime, timedelta, and to_forecast().  "
+                        "pd, np, datetime, timedelta, to_forecast(), "
+                        "report_header(), report_config(), report_table(). "
                         "Use this tool AFTER you have developed and tested the "
                         "strategy code via run_python."
                     ),
@@ -905,7 +1081,7 @@ STRATEGY MANAGEMENT:
                     "name": "list_strategies",
                     "description": (
                         "List all saved strategies with their names, descriptions, "
-                        "and metadata. Does not return code — use get_strategy for that."
+                        "and metadata. Does not return code -- use get_strategy for that."
                     ),
                     "parameters": {
                         "type": "object",
@@ -1198,8 +1374,25 @@ STRATEGY MANAGEMENT:
     def _tool_save_strategy(self, name: str, code: str,
                             description: str,
                             strategies_saved: list) -> Dict[str, Any]:
-        """Persist a strategy via strategy_service and track it for the UI."""
+        """Validate then persist a strategy via strategy_service."""
         try:
+            passed, errors = validate_strategy(code)
+            if not passed:
+                msg = format_errors(errors)
+                k2_logger.warning(
+                    f"Strategy '{name}' rejected by validator: {errors}",
+                    "TABLE_CTRL")
+                return {
+                    "type": "validation_failed",
+                    "error": msg,
+                    "errors": errors,
+                    "message": (
+                        f"Strategy '{name}' was NOT saved because it does "
+                        f"not meet the required structure.\n\n{msg}\n\n"
+                        f"Fix the code and call save_strategy again."
+                    ),
+                }
+
             ok = strategy_service.save_strategy(
                 name, code, description=description or "")
             if not ok:
@@ -1413,7 +1606,7 @@ STRATEGY MANAGEMENT:
         if not sheets:
             return "WORKSPACE GRID MAP: Empty (no columns in Working Data tab)."
 
-        parts = ["WORKSPACE GRID MAP (Tab 3 — Working Data):"]
+        parts = ["WORKSPACE GRID MAP (Tab 3 -- Working Data):"]
         parts.append("  Row 1 = column name (header).  Data starts at row 2.")
         has_content = False
 
@@ -1453,7 +1646,7 @@ STRATEGY MANAGEMENT:
             "\n    row 1 holds the column name, data starts at row 2."
             "\n  - Each column is INDEPENDENT and may have a different number of populated rows."
             "\n  - When the user references a column (e.g. 'for each Key Date'), operate on"
-            "\n    THAT column's populated rows — not the total grid row count."
+            "\n    THAT column's populated rows -- not the total grid row count."
             "\n  - When writing derived columns, match the row count to the source column."
             "\n  - Columns at adjacent positions with the same row count are likely related."
             "\n  - Use workspace_info(sheet='Sheet 1') to check per-column populated row counts."

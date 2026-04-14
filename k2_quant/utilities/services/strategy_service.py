@@ -7,6 +7,7 @@ Stores both code and metadata for complex strategies.
 
 import json
 import sqlite3
+from datetime import datetime
 from typing import Dict, List, Any, Optional
 from pathlib import Path
 
@@ -43,7 +44,28 @@ class StrategyService:
                     is_active BOOLEAN DEFAULT 1
                 )
             """)
-            
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS strategy_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    strategy_name TEXT NOT NULL,
+                    model_table TEXT,
+                    run_timestamp TEXT NOT NULL,
+                    success INTEGER NOT NULL DEFAULT 0,
+                    execution_time_ms REAL,
+                    stdout_output TEXT,
+                    error_output TEXT,
+                    tab_writes_json TEXT,
+                    metrics_json TEXT,
+                    code_snapshot TEXT NOT NULL
+                )
+            """)
+
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_runs_strategy
+                ON strategy_runs (strategy_name, run_timestamp DESC)
+            """)
+
             conn.commit()
         
         k2_logger.info("Strategy database initialized", "STRATEGY")
@@ -195,6 +217,117 @@ class StrategyService:
         except Exception as e:
             k2_logger.error(f"Failed to delete strategy: {str(e)}", "STRATEGY")
             return False
+
+    # ------------------------------------------------------------------
+    # Strategy Runs
+    # ------------------------------------------------------------------
+
+    def save_run(
+        self,
+        strategy_name: str,
+        code_snapshot: str,
+        result: Dict[str, Any],
+        model_table: str = "",
+    ) -> Optional[int]:
+        """Persist one strategy execution result.  Returns the new row id."""
+        try:
+            ts = datetime.now().isoformat(timespec='seconds')
+            success = 1 if result.get('success') else 0
+            exec_ms = (result.get('execution_time', 0)) * 1000
+
+            tab_writes = result.get('_tab_writes', [])
+            tw_safe = []
+            for w in tab_writes:
+                entry = {k: v for k, v in w.items() if k != 'values'}
+                if 'values' in w and w['values']:
+                    entry['length'] = len(w['values'])
+                    entry['preview'] = w['values'][:5]
+                tw_safe.append(entry)
+
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO strategy_runs
+                        (strategy_name, model_table, run_timestamp, success,
+                         execution_time_ms, stdout_output, error_output,
+                         tab_writes_json, metrics_json, code_snapshot)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    strategy_name,
+                    model_table or "",
+                    ts,
+                    success,
+                    exec_ms,
+                    result.get('output', ''),
+                    result.get('error', ''),
+                    json.dumps(tw_safe, default=str),
+                    json.dumps(result.get('metrics', {}), default=str),
+                    code_snapshot,
+                ))
+                conn.commit()
+                run_id = cursor.lastrowid
+
+            k2_logger.info(
+                f"Strategy run saved: {strategy_name} (id={run_id}, ok={success})",
+                "STRATEGY",
+            )
+            return run_id
+        except Exception as e:
+            k2_logger.error(f"Failed to save strategy run: {e}", "STRATEGY")
+            return None
+
+    def get_runs(
+        self,
+        strategy_name: Optional[str] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """Return recent runs, optionally filtered by strategy name."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                if strategy_name:
+                    cursor.execute("""
+                        SELECT * FROM strategy_runs
+                        WHERE strategy_name = ?
+                        ORDER BY run_timestamp DESC LIMIT ?
+                    """, (strategy_name, limit))
+                else:
+                    cursor.execute("""
+                        SELECT * FROM strategy_runs
+                        ORDER BY run_timestamp DESC LIMIT ?
+                    """, (limit,))
+                return [dict(r) for r in cursor.fetchall()]
+        except Exception as e:
+            k2_logger.error(f"Failed to query strategy runs: {e}", "STRATEGY")
+            return []
+
+    def get_run(self, run_id: int) -> Optional[Dict[str, Any]]:
+        """Fetch a single run by id."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM strategy_runs WHERE id = ?", (run_id,))
+                row = cursor.fetchone()
+                return dict(row) if row else None
+        except Exception as e:
+            k2_logger.error(f"Failed to get run {run_id}: {e}", "STRATEGY")
+            return None
+
+    def get_strategy_names_with_runs(self) -> List[str]:
+        """Return distinct strategy names that have at least one run."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT DISTINCT strategy_name FROM strategy_runs
+                    ORDER BY strategy_name
+                """)
+                return [row[0] for row in cursor.fetchall()]
+        except Exception as e:
+            k2_logger.error(f"Failed to list strategy names with runs: {e}", "STRATEGY")
+            return []
 
 
 # Singleton instance

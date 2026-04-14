@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from contextlib import redirect_stdout, redirect_stderr
 
 from k2_quant.utilities.logger import k2_logger
+from k2_quant.utilities.report_helpers import report_header, report_config, report_table
 
 
 class StrategyExecutor:
@@ -81,30 +82,6 @@ class StrategyExecutor:
                         "close_values": _clean(close_values),
                     })
 
-            def _to_working(column_name, values, scope='model', column=None,
-                           sheet=None):
-                """Write a column to a Working Data sheet (Tab 3)."""
-                if isinstance(values, (pd.Series, np.ndarray)):
-                    values = values.tolist()
-                cleaned = []
-                for v in values:
-                    if v is None:
-                        cleaned.append(None)
-                    elif isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
-                        cleaned.append(None)
-                    else:
-                        cleaned.append(v)
-                write_entry = {
-                    "type": "working",
-                    "column_name": str(column_name),
-                    "values": cleaned,
-                    "scope": str(scope),
-                    "sheet": sheet or "Sheet 1",
-                }
-                if column is not None:
-                    write_entry["column"] = str(column).upper().strip()
-                tab_writes.append(write_entry)
-
             exec_context = {
                 'pd': pd,
                 'np': np,
@@ -112,7 +89,9 @@ class StrategyExecutor:
                 'timedelta': timedelta,
                 'data': data.copy(),
                 'to_forecast': _to_forecast,
-                'to_working': _to_working,
+                'report_header': report_header,
+                'report_config': report_config,
+                'report_table': report_table,
             }
             exec_context['df'] = exec_context['data']
 

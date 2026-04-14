@@ -256,10 +256,10 @@ def debounce(wait_ms):
 class DrawingConfig:
     """Configuration for drawing tools"""
     trend: tuple = ('/', 'Trend Line', '#00ff00')
-    ray: tuple = ('→', 'Ray', '#ff00ff')
-    extended: tuple = ('↔', 'Extended Line', '#00ffff')
-    horizontal: tuple = ('─', 'Horizontal Line', '#ffff00')
-    vertical: tuple = ('│', 'Vertical Line', '#00ffff')
+    ray: tuple = ('->', 'Ray', '#ff00ff')
+    extended: tuple = ('<->', 'Extended Line', '#00ffff')
+    horizontal: tuple = ('--', 'Horizontal Line', '#ffff00')
+    vertical: tuple = ('|', 'Vertical Line', '#00ffff')
 
 
 @dataclass
@@ -1685,7 +1685,7 @@ class ChartWidget(QWidget):
             out = out.dropna(subset=['datetime']).reset_index(drop=True)
             k2_logger.info(
                 f"Resampled to {self.current_timeframe}: "
-                f"{len(df)} → {len(out)} bars", "CHART")
+                f"{len(df)} -> {len(out)} bars", "CHART")
             return out
 
         except Exception as e:
@@ -1872,7 +1872,7 @@ class ChartWidget(QWidget):
         
         x_label = x_snapped + (x_range[1] - x_range[0]) * 0.008 if (x_range[1] - x_range[0]) > 0 else x_snapped + 0.5
         
-        self.crosshair_date_label.setText(date_str or '—')
+        self.crosshair_date_label.setText(date_str or '--')
         self.crosshair_date_label.setPos(x_label, y_max)
         self.crosshair_date_label.setVisible(True)
         

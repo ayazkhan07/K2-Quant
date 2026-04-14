@@ -18,12 +18,21 @@ from PyQt6.QtWidgets import (QFrame, QVBoxLayout, QHBoxLayout, QTextEdit,
                              QPushButton, QLabel, QWidget,
                              QSizePolicy, QComboBox, QScrollArea)
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer, QEvent
-from PyQt6.QtGui import QColor, QFontMetrics, QPixmap
+from PyQt6.QtGui import QColor, QFontMetrics, QPixmap, QKeySequence, QShortcut
 
 from k2_quant.utilities.logger import k2_logger
 from k2_quant.utilities.services import table_controller
 from k2_quant.utilities.services.table_controller import AI_MODELS, DEFAULT_MODEL
 from k2_quant.utilities.text.math_formatter import MathFormatter
+from k2_quant.utilities.text.math_renderer import latex_to_pixmap
+from k2_quant.utilities.text.markdown_renderer import markdown_to_html
+from k2_quant.pages.analysis.widgets.matrix_widget import MatrixWidget
+from k2_quant.pages.analysis.widgets.data_view_widget import InlineDataView
+
+# Thinkspace width: resizable via main splitter; max = 2x default.
+THINKSPACE_DEFAULT_WIDTH = 998
+THINKSPACE_MIN_WIDTH = 380
+THINKSPACE_MAX_WIDTH = THINKSPACE_DEFAULT_WIDTH * 2
 
 
 class CommandWorker(QThread):
@@ -104,7 +113,12 @@ class RightPaneWidget(QFrame):
 
     def __init__(self):
         super().__init__()
-        self.setFixedWidth(998)
+        self.setMinimumWidth(THINKSPACE_MIN_WIDTH)
+        self.setMaximumWidth(THINKSPACE_MAX_WIDTH)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Expanding,
+        )
         self.setObjectName("rightPane")
 
         self.current_context: Optional[Dict[str, Any]] = None
@@ -141,9 +155,6 @@ class RightPaneWidget(QFrame):
         # Header row
         header_row = QHBoxLayout()
         header_row.setContentsMargins(0, 0, 0, 0)
-        ai_label = QLabel("THINKSPACE")
-        ai_label.setObjectName("sectionTitle")
-        header_row.addWidget(ai_label)
         header_row.addStretch()
 
         self.model_combo = QComboBox()
@@ -153,6 +164,12 @@ class RightPaneWidget(QFrame):
             self.model_combo.addItem(name)
         self.model_combo.setCurrentText(DEFAULT_MODEL)
         header_row.addWidget(self.model_combo)
+
+        self.copy_all_btn = QPushButton("Copy All")
+        self.copy_all_btn.setObjectName("clearChatBtn")
+        self.copy_all_btn.setFixedHeight(24)
+        self.copy_all_btn.clicked.connect(self._copy_all_chat)
+        header_row.addWidget(self.copy_all_btn)
 
         self.clear_btn = QPushButton("Clear")
         self.clear_btn.setObjectName("clearChatBtn")
@@ -179,8 +196,10 @@ class RightPaneWidget(QFrame):
         self.scroll_area.setWidget(self.scroll_content)
         layout.addWidget(self.scroll_area)
 
+        QShortcut(QKeySequence("Ctrl+Shift+C"), self, self._copy_all_chat)
+
         # Typing indicator
-        self.typing_indicator = QLabel("···")
+        self.typing_indicator = QLabel("...")
         self.typing_indicator.setObjectName("typingIndicator")
         self.typing_indicator.setAlignment(Qt.AlignmentFlag.AlignLeft)
         self.typing_indicator.setFixedHeight(18)
@@ -224,9 +243,16 @@ class RightPaneWidget(QFrame):
 
     # ── chat widget helpers ──────────────────────────────────────
 
-    def _scroll_to_bottom(self):
-        QTimer.singleShot(10, lambda: self.scroll_area.verticalScrollBar(
-            ).setValue(self.scroll_area.verticalScrollBar().maximum()))
+    def _is_near_bottom(self) -> bool:
+        sb = self.scroll_area.verticalScrollBar()
+        return sb.value() >= sb.maximum() - 80
+
+    def _scroll_to_bottom(self, force: bool = False):
+        def _do():
+            sb = self.scroll_area.verticalScrollBar()
+            if force or sb.value() >= sb.maximum() - 80:
+                sb.setValue(sb.maximum())
+        QTimer.singleShot(10, _do)
 
     def _add_widget(self, widget):
         self.chat_layout.addWidget(widget)
@@ -234,7 +260,7 @@ class RightPaneWidget(QFrame):
 
     def _start_typing_indicator(self):
         self._typing_dot_state = 0
-        self.typing_indicator.setText("·")
+        self.typing_indicator.setText(".")
         self.typing_indicator.show()
         self._typing_dot_timer = QTimer()
         self._typing_dot_timer.timeout.connect(self._update_typing_dots)
@@ -247,7 +273,7 @@ class RightPaneWidget(QFrame):
         self.typing_indicator.hide()
 
     def _update_typing_dots(self):
-        dots = ("·", "··", "···")
+        dots = (".", "..", "...")
         self._typing_dot_state = (self._typing_dot_state + 1) % 3
         self.typing_indicator.setText(dots[self._typing_dot_state])
 
@@ -300,7 +326,15 @@ class RightPaneWidget(QFrame):
         if self._has_markdown_table(text):
             lines = text.split('\n')
             parts = [prefix_html]
+            text_buffer: list = []
             i = 0
+
+            def _flush_text():
+                if text_buffer:
+                    chunk = '\n'.join(text_buffer)
+                    text_buffer.clear()
+                    parts.append(markdown_to_html(chunk))
+
             while i < len(lines):
                 stripped = lines[i].strip()
 
@@ -323,6 +357,7 @@ class RightPaneWidget(QFrame):
                             continue
                         break
                     if found_sep and len(table_lines) >= 2:
+                        _flush_text()
                         rows = []
                         for tl in table_lines:
                             cells = [c.strip() for c in tl.split('|')]
@@ -337,17 +372,14 @@ class RightPaneWidget(QFrame):
                         i = j
                         continue
 
-                if stripped:
-                    safe = html_mod.escape(stripped)
-                    parts.append(
-                        f'<span style="color:#ffffff;">{safe}</span><br>')
+                text_buffer.append(lines[i])
                 i += 1
+
+            _flush_text()
             return ''.join(parts)
 
         formatted = self.math_formatter.format_full(text)
-        safe = html_mod.escape(formatted).replace('\n', '<br>')
-        return (f'{prefix_html}'
-                f'<span style="color:#ffffff;">{safe}</span>')
+        return prefix_html + markdown_to_html(formatted)
 
     # ── code block helpers ────────────────────────────────────────
 
@@ -418,13 +450,11 @@ class RightPaneWidget(QFrame):
                 p = prefix if is_first_text else ""
                 is_first_text = False
                 formatted = self.math_formatter.format_full(seg[1])
-                safe = html_mod.escape(formatted).replace('\n', '<br>')
+                rendered = markdown_to_html(formatted)
                 prefix_html = (
                     f'<span style="color:#666666;">'
                     f'{html_mod.escape(p)}</span>') if p else ''
-                label = self._make_ai_bubble(
-                    f'{prefix_html}'
-                    f'<span style="color:#ffffff;">{safe}</span>')
+                label = self._make_ai_bubble(prefix_html + rendered)
                 self._add_widget(label)
             elif seg[0] == 'code':
                 is_first_text = False
@@ -444,6 +474,7 @@ class RightPaneWidget(QFrame):
             return
 
         self._add_widget(self._make_user_bubble(message))
+        self._scroll_to_bottom(force=True)
         self._message_records.append({'type': 'user', 'content': message})
 
         self.ai_input.clear()
@@ -634,13 +665,11 @@ class RightPaneWidget(QFrame):
             self.streaming_index += chunk_size
 
             text_so_far = self.streaming_text[:self.streaming_index]
-            safe = html_mod.escape(text_so_far).replace('\n', '<br>')
+            rendered = markdown_to_html(text_so_far)
             prefix_html = (
                 f'<span style="color:#666666;">'
                 f'{html_mod.escape(self._streaming_prefix)}</span>')
-            self._streaming_label.setText(
-                f'{prefix_html}'
-                f'<span style="color:#ffffff;">{safe}</span>')
+            self._streaming_label.setText(prefix_html + rendered)
             self._scroll_to_bottom()
         else:
             self.streaming_timer.stop()
@@ -727,12 +756,163 @@ class RightPaneWidget(QFrame):
         label.setPixmap(pixmap)
         self._add_widget(label)
 
+    # ── interactive widget insertion ──────────────────────────────
+
+    def _insert_matrices(self, items: list):
+        for item in items:
+            data = item.get('data', [])
+            if not data:
+                continue
+            widget = MatrixWidget(
+                data=data,
+                label=item.get('label', ''),
+                editable=item.get('editable', True),
+                headers=item.get('headers'),
+            )
+            widget.matrix_edited.connect(self._on_matrix_edited)
+            widget.send_to_workspace.connect(self._on_widget_to_workspace)
+            self._add_widget(widget)
+            self._message_records.append({
+                'type': 'matrix',
+                'data': data,
+                'label': item.get('label', ''),
+                'headers': item.get('headers'),
+            })
+
+    def _insert_tables(self, items: list):
+        for item in items:
+            rows = item.get('rows', [])
+            headers = item.get('headers', [])
+            if not rows:
+                continue
+            widget = InlineDataView(
+                rows=rows,
+                headers=headers,
+                label=item.get('label', ''),
+                editable=item.get('editable', False),
+            )
+            widget.cell_edited.connect(self._on_table_cell_edited)
+            widget.send_to_workspace.connect(self._on_table_to_workspace)
+            self._add_widget(widget)
+            self._message_records.append({
+                'type': 'table',
+                'rows': rows,
+                'headers': headers,
+                'label': item.get('label', ''),
+            })
+
+    def _insert_equations(self, items: list):
+        for item in items:
+            latex = item.get('latex', '')
+            if not latex:
+                continue
+            label_text = item.get('label', '')
+            pixmap = latex_to_pixmap(latex)
+            if pixmap is not None:
+                lbl = QLabel()
+                lbl.setPixmap(pixmap)
+                lbl.setAlignment(Qt.AlignmentFlag.AlignLeft)
+                lbl.setStyleSheet("background: transparent; padding: 4px 0;")
+                if label_text:
+                    container = QFrame()
+                    container.setStyleSheet("background: transparent;")
+                    v = QVBoxLayout(container)
+                    v.setContentsMargins(0, 0, 0, 0)
+                    v.setSpacing(2)
+                    cap = QLabel(f'<span style="color:#666; font-size:10px;">'
+                                 f'{html_mod.escape(label_text)}</span>')
+                    cap.setTextFormat(Qt.TextFormat.RichText)
+                    cap.setStyleSheet("background: transparent;")
+                    v.addWidget(cap)
+                    v.addWidget(lbl)
+                    self._add_widget(container)
+                else:
+                    self._add_widget(lbl)
+            else:
+                formatted = self.math_formatter.format_full(latex)
+                safe = html_mod.escape(formatted)
+                fallback = self._make_ai_bubble(
+                    f'<span style="color:#ffffff;">{safe}</span>')
+                self._add_widget(fallback)
+            self._message_records.append({
+                'type': 'equation',
+                'latex': latex,
+                'label': label_text,
+            })
+
+    # ── edit feedback handlers ────────────────────────────────────
+
+    def _on_matrix_edited(self, data: list):
+        """User edited a matrix cell; inject context into conversation."""
+        note = f"[User edited the matrix to: {self._summarize_matrix(data)}]"
+        self.conversation_history.append({
+            'role': 'user',
+            'content': note,
+            'timestamp': datetime.now().isoformat(),
+        })
+
+    @staticmethod
+    def _summarize_matrix(data: list) -> str:
+        rows = len(data)
+        cols = len(data[0]) if data else 0
+        if rows <= 4 and cols <= 6:
+            row_strs = [", ".join(str(v) for v in r) for r in data]
+            return "[" + "; ".join(row_strs) + "]"
+        return f"{rows}×{cols} matrix (too large to display inline)"
+
+    def _on_table_cell_edited(self, row: int, col: int, value: str):
+        note = f"[User edited table cell ({row},{col}) to: {value}]"
+        self.conversation_history.append({
+            'role': 'user',
+            'content': note,
+            'timestamp': datetime.now().isoformat(),
+        })
+
+    def _on_widget_to_workspace(self, data: list, label: str):
+        """Matrix → workspace: emit as tab_writes columns."""
+        if not data or not data[0]:
+            return
+        n_cols = len(data[0])
+        writes = []
+        for c in range(n_cols):
+            col_name = label or f"Matrix_col{c}"
+            if n_cols > 1:
+                col_name = f"{col_name}_{c}"
+            values = [row[c] if c < len(row) else None for row in data]
+            writes.append({
+                "type": "working",
+                "column_name": col_name,
+                "values": values,
+                "scope": "model",
+                "sheet": "Sheet 1",
+            })
+        self.tab_writes_ready.emit(writes)
+
+    def _on_table_to_workspace(self, rows: list, headers: list):
+        """Table → workspace: emit each column as a tab_write."""
+        if not rows or not headers:
+            return
+        writes = []
+        for c, hdr in enumerate(headers):
+            values = [row[c] if c < len(row) else None for row in rows]
+            writes.append({
+                "type": "working",
+                "column_name": hdr,
+                "values": values,
+                "scope": "model",
+                "sheet": "Sheet 1",
+            })
+        self.tab_writes_ready.emit(writes)
+
     # ── worker result handling ───────────────────────────────────
 
     def _on_worker_result(self, result: Dict[str, Any]):
         self._stop_typing_indicator()
         self._set_cancel_mode(False)
         self._pending_charts = result.get('_charts', [])
+        pending_matrices = result.get('_matrices', [])
+        pending_tables = result.get('_tables', [])
+        pending_equations = result.get('_equations', [])
 
         if result.get('cancelled'):
             self._pending_charts = []
@@ -757,6 +937,12 @@ class RightPaneWidget(QFrame):
                 self.data_modified.emit()
             if result.get('_tab_writes'):
                 self.tab_writes_ready.emit(result['_tab_writes'])
+
+            # ── Embed interactive widgets ────────────────────────
+            self._insert_matrices(pending_matrices)
+            self._insert_tables(pending_tables)
+            self._insert_equations(pending_equations)
+
             strategies_changed = False
             for strat in result.get('_strategies_saved', []):
                 s_name = strat.get('name', '')
@@ -882,6 +1068,42 @@ class RightPaneWidget(QFrame):
                 if png:
                     self._add_static_chart(png)
                 self._message_records.append(rec)
+            elif rtype == 'matrix':
+                data = rec.get('data', [])
+                if data:
+                    widget = MatrixWidget(
+                        data=data,
+                        label=rec.get('label', ''),
+                        editable=True,
+                        headers=rec.get('headers'),
+                    )
+                    widget.matrix_edited.connect(self._on_matrix_edited)
+                    widget.send_to_workspace.connect(
+                        self._on_widget_to_workspace)
+                    self.chat_layout.addWidget(widget)
+                self._message_records.append(rec)
+            elif rtype == 'table':
+                rows = rec.get('rows', [])
+                headers = rec.get('headers', [])
+                if rows:
+                    widget = InlineDataView(
+                        rows=rows, headers=headers,
+                        label=rec.get('label', ''),
+                    )
+                    widget.cell_edited.connect(self._on_table_cell_edited)
+                    widget.send_to_workspace.connect(
+                        self._on_table_to_workspace)
+                    self.chat_layout.addWidget(widget)
+                self._message_records.append(rec)
+            elif rtype == 'equation':
+                latex = rec.get('latex', '')
+                if latex:
+                    self._insert_equations([{
+                        'latex': latex,
+                        'label': rec.get('label', ''),
+                    }])
+                else:
+                    self._message_records.append(rec)
         self._scroll_to_bottom()
 
     def _rebuild_from_history(self, history: list):
@@ -911,6 +1133,55 @@ class RightPaneWidget(QFrame):
             if w:
                 w.deleteLater()
         self._message_records = []
+
+    def _copy_all_chat(self):
+        """Walk _message_records and copy the full chat transcript to clipboard."""
+        from PyQt6.QtWidgets import QApplication
+        lines: list = []
+        for rec in self._message_records:
+            rtype = rec.get('type', '')
+            content = rec.get('content', '')
+            if rtype == 'user':
+                lines.append(f"YOU: {content}")
+            elif rtype == 'ai':
+                prefix = rec.get('prefix', 'AI: ')
+                lines.append(f"{prefix}{content}")
+            elif rtype == 'step':
+                lines.append(f"  [{content}]")
+            elif rtype == 'matrix':
+                label = rec.get('label', 'Matrix')
+                data = rec.get('data', [])
+                headers = rec.get('headers')
+                parts = [f"[{label}]" if label else "[Matrix]"]
+                if headers:
+                    parts.append("\t".join(str(h) for h in headers))
+                for row in data:
+                    parts.append("\t".join(
+                        "" if v is None else f"{v:.6g}" if isinstance(v, float) else str(v)
+                        for v in row))
+                lines.append("\n".join(parts))
+            elif rtype == 'table':
+                label = rec.get('label', 'Table')
+                headers = rec.get('headers', [])
+                rows = rec.get('rows', [])
+                parts = [f"[{label}]" if label else "[Table]"]
+                if headers:
+                    parts.append("\t".join(str(h) for h in headers))
+                for row in rows:
+                    parts.append("\t".join(
+                        "" if v is None else f"{v:.6g}" if isinstance(v, float) else str(v)
+                        for v in row))
+                lines.append("\n".join(parts))
+            elif rtype == 'equation':
+                latex = rec.get('latex', '')
+                label = rec.get('label', '')
+                lines.append(f"[Equation{': ' + label if label else ''}] {latex}")
+            elif rtype == 'chart':
+                lines.append("[Chart]")
+
+        text = "\n\n".join(lines)
+        QApplication.clipboard().setText(text)
+        k2_logger.info(f"Chat copied to clipboard ({len(lines)} items)", "AI_CHAT")
 
     def clear_chat(self):
         self._clear_chat_widgets()

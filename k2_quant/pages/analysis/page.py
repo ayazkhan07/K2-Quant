@@ -52,9 +52,17 @@ from k2_quant.utilities.services.strategy_service import strategy_service
 from k2_quant.utilities.services.dynamic_python_engine import dpe_service
 
 # Import the three pane components
+from PyQt6.QtWidgets import QTabWidget
+
 from k2_quant.pages.analysis.components.left_pane import LeftPaneWidget
 from k2_quant.pages.analysis.components.middle_pane import MiddlePaneWidget
-from k2_quant.pages.analysis.components.right_pane import RightPaneWidget
+from k2_quant.pages.analysis.components.right_pane import (
+    RightPaneWidget,
+    THINKSPACE_DEFAULT_WIDTH,
+    THINKSPACE_MIN_WIDTH,
+    THINKSPACE_MAX_WIDTH,
+)
+from k2_quant.pages.analysis.components.outputs_panel import OutputsPanel
 
 
 class AnalysisPageWidget(QWidget):
@@ -100,17 +108,47 @@ class AnalysisPageWidget(QWidget):
         self.left_pane = LeftPaneWidget()
         self.middle_pane = MiddlePaneWidget()
         self.right_pane = RightPaneWidget()
-        
+        self.outputs_panel = OutputsPanel()
+
+        # Tabbed right container (Thinkspace + Outputs)
+        self.right_tabs = QTabWidget()
+        self.right_tabs.setObjectName("rightTabs")
+        self.right_tabs.setMinimumWidth(THINKSPACE_MIN_WIDTH)
+        self.right_tabs.setMaximumWidth(THINKSPACE_MAX_WIDTH)
+        self.right_tabs.addTab(self.right_pane, "THINKSPACE")
+        self.right_tabs.addTab(self.outputs_panel, "OUTPUTS")
+        self.right_tabs.setStyleSheet("""
+            #rightTabs { background: #0a0a0a; border: none; }
+            #rightTabs::pane { border: none; background: #0a0a0a; }
+            #rightTabs QTabBar::tab {
+                background: #1a1a1a; color: #999;
+                padding: 6px 18px; border: none;
+                border-bottom: 2px solid transparent;
+                font-size: 11px; font-weight: 600; letter-spacing: 1px;
+            }
+            #rightTabs QTabBar::tab:selected {
+                color: #4a9eff; border-bottom: 2px solid #4a9eff;
+                background: #0a0a0a;
+            }
+            #rightTabs QTabBar::tab:hover:!selected {
+                color: #ccc; background: #151515;
+            }
+        """)
+        self.right_tabs.currentChanged.connect(self._on_right_tab_changed)
+
         # Wire up signals
         self.setup_connections()
         
         # Add to splitter
         self.splitter.addWidget(self.left_pane)
         self.splitter.addWidget(self.middle_pane)
-        self.splitter.addWidget(self.right_pane)
-        
-        # Set sizes - left: 280px, middle: flexible, right: 380px
-        self.splitter.setSizes([280, 740, 380])
+        self.splitter.addWidget(self.right_tabs)
+
+        self.splitter.setStretchFactor(0, 0)
+        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setStretchFactor(2, 0)
+
+        self.splitter.setSizes([280, 740, THINKSPACE_DEFAULT_WIDTH])
         
         main_layout.addWidget(self.splitter)
         
@@ -193,6 +231,9 @@ class AnalysisPageWidget(QWidget):
         self.right_pane.workspace_provider = self._get_workspace_state
         self.right_pane.save_chat_callback = self._save_chat
         self.right_pane.load_chat_callback = self._load_chat
+
+        # Outputs panel connections
+        self.outputs_panel.reference_in_chat.connect(self._on_reference_run_in_chat)
     
     def refresh_left_pane_data(self):
         """Refresh all data in the left pane"""
@@ -625,6 +666,15 @@ class AnalysisPageWidget(QWidget):
         df = df.rename(columns={'Open':'open','High':'high','Low':'low','Close':'close','Volume':'volume','VWAP':'vwap'})
         
         result = dpe_service.execute_strategy(code, df)
+
+        strategy_service.save_run(
+            strategy_name=strategy_name,
+            code_snapshot=code,
+            result=result,
+            model_table=table_name,
+        )
+        self.outputs_panel.refresh()
+
         if not result.get('success'):
             k2_logger.error(f"Strategy execution failed: {result.get('error')}", "ANALYSIS")
             return
@@ -719,7 +769,7 @@ class AnalysisPageWidget(QWidget):
         """Clear all forecast lines when an empty dict arrives."""
         cw = getattr(self.middle_pane, "chart_widget", None)
         if cw is None:
-            k2_logger.warning("No chart widget — cannot render forecast lines", "ANALYSIS")
+            k2_logger.warning("No chart widget -- cannot render forecast lines", "ANALYSIS")
             return
         if not forecast_data:
             cw.clear_forecast_data()
@@ -767,12 +817,46 @@ class AnalysisPageWidget(QWidget):
             self.remove_strategy(name)
         self.refresh_left_pane_data()
     
+    def _on_right_tab_changed(self, index: int):
+        """Auto-refresh the Outputs panel when its tab is selected."""
+        if index == 1:
+            self.outputs_panel.refresh()
+
+    def _on_reference_run_in_chat(self, run_id: int, strategy_name: str):
+        """User clicked 'Send to Thinkspace' on a run — switch tab and inject context."""
+        run = strategy_service.get_run(run_id)
+        if not run:
+            return
+        summary = (
+            f"[Strategy Run Report]\n"
+            f"Strategy: {run['strategy_name']}\n"
+            f"Model: {run.get('model_table', '--')}\n"
+            f"Time: {run['run_timestamp']}\n"
+            f"Status: {'SUCCESS' if run.get('success') else 'FAILED'}\n"
+        )
+        stdout = (run.get('stdout_output') or '').strip()
+        if stdout:
+            summary += f"\nOutput:\n{stdout}\n"
+        error = (run.get('error_output') or '').strip()
+        if error:
+            summary += f"\nError:\n{error}\n"
+        code = (run.get('code_snapshot') or '').strip()
+        if code:
+            summary += f"\nCode:\n{code}\n"
+
+        self.right_pane.conversation_history.append({
+            'role': 'user',
+            'content': summary,
+        })
+        self.right_tabs.setCurrentIndex(0)
+        k2_logger.info(f"Run {run_id} injected into Thinkspace context", "ANALYSIS")
+
     def _on_ai_data_modified(self):
         """Refresh middle pane when the AI agent modifies table data."""
         if not self.current_model:
             return
         try:
-            k2_logger.info("AI modified data — refreshing middle pane", "ANALYSIS")
+            k2_logger.info("AI modified data -- refreshing middle pane", "ANALYSIS")
             rows, total_count = stock_service.get_display_data(self.current_model, limit=500)
             if rows:
                 self.current_data = rows
