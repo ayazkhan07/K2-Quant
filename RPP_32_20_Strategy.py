@@ -25,9 +25,11 @@ def log(msg):
 def write_forecasts(forecast_pairs):
     """Write all 12 forecast columns, halt on any failure."""
     failed = []
-    for col_name, vals in forecast_pairs:
+    for entry in forecast_pairs:
+        col_name, vals = entry[0], entry[1]
+        anchor = entry[2] if len(entry) > 2 else None
         try:
-            to_forecast(col_name, [float(v) for v in vals])
+            to_forecast(col_name, [float(v) for v in vals], anchor_price=anchor)
             log(f"  ✓ {col_name} ({len(vals)} values)")
         except Exception as e:
             failed.append((col_name, str(e)))
@@ -361,18 +363,18 @@ log("STEP 6 — Write to Forecast Tab")
 log("=" * 65)
 
 write_forecasts([
-    ('RPP32_Open_Avg_P',  price_projections['O_avg']),
-    ('RPP32_Open_Min_P',  price_projections['O_min']),
-    ('RPP32_Open_Max_P',  price_projections['O_max']),
-    ('RPP32_High_Avg_P',  price_projections['H_avg']),
-    ('RPP32_High_Min_P',  price_projections['H_min']),
-    ('RPP32_High_Max_P',  price_projections['H_max']),
-    ('RPP32_Low_Avg_P',   price_projections['L_avg']),
-    ('RPP32_Low_Min_P',   price_projections['L_min']),
-    ('RPP32_Low_Max_P',   price_projections['L_max']),
-    ('RPP32_Close_Avg_P', price_projections['C_avg']),
-    ('RPP32_Close_Min_P', price_projections['C_min']),
-    ('RPP32_Close_Max_P', price_projections['C_max']),
+    ('RPP32_Open_Avg_P',  price_projections['O_avg'],  T0_price['O']),
+    ('RPP32_Open_Min_P',  price_projections['O_min'],  T0_price['O']),
+    ('RPP32_Open_Max_P',  price_projections['O_max'],  T0_price['O']),
+    ('RPP32_High_Avg_P',  price_projections['H_avg'],  T0_price['H']),
+    ('RPP32_High_Min_P',  price_projections['H_min'],  T0_price['H']),
+    ('RPP32_High_Max_P',  price_projections['H_max'],  T0_price['H']),
+    ('RPP32_Low_Avg_P',   price_projections['L_avg'],  T0_price['L']),
+    ('RPP32_Low_Min_P',   price_projections['L_min'],  T0_price['L']),
+    ('RPP32_Low_Max_P',   price_projections['L_max'],  T0_price['L']),
+    ('RPP32_Close_Avg_P', price_projections['C_avg'],  T0_price['C']),
+    ('RPP32_Close_Min_P', price_projections['C_min'],  T0_price['C']),
+    ('RPP32_Close_Max_P', price_projections['C_max'],  T0_price['C']),
 ])
 
 # ═══════════════════════════════════════════════════════════════════

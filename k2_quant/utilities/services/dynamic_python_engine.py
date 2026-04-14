@@ -63,7 +63,7 @@ class StrategyExecutor:
         try:
             def _to_forecast(column_name_or_set_index, values_or_open=None,
                              high_values=None, low_values=None,
-                             close_values=None):
+                             close_values=None, anchor_price=None):
                 def _clean(vals):
                     if vals is None:
                         return None
@@ -80,11 +80,14 @@ class StrategyExecutor:
                     return out[:500]
 
                 if isinstance(column_name_or_set_index, str):
-                    tab_writes.append({
+                    entry = {
                         "type": "forecast",
                         "column_name": column_name_or_set_index,
                         "values": _clean(values_or_open),
-                    })
+                    }
+                    if anchor_price is not None:
+                        entry["anchor_price"] = float(anchor_price)
+                    tab_writes.append(entry)
                 else:
                     tab_writes.append({
                         "type": "forecast",

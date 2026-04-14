@@ -18,10 +18,11 @@ from PyQt6.QtWidgets import (
     QFrame, QVBoxLayout, QHBoxLayout, QSplitter, QTreeWidget,
     QTreeWidgetItem, QTextEdit, QLabel, QPushButton, QStackedWidget,
     QWidget, QHeaderView, QMessageBox, QScrollArea, QTableWidget,
-    QTableWidgetItem, QAbstractItemView, QSizePolicy,
+    QTableWidgetItem, QAbstractItemView, QSizePolicy, QApplication,
+    QMenu,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QEvent
-from PyQt6.QtGui import QFont, QColor
+from PyQt6.QtGui import QFont, QColor, QShortcut, QKeySequence
 
 from k2_quant.utilities.logger import k2_logger
 from k2_quant.utilities.services.strategy_service import strategy_service
@@ -215,7 +216,7 @@ class OutputsPanel(QFrame):
 
     def _append_meta_row(self, label: str, value: str):
         row = QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 2)
+        row.setContentsMargins(8, 0, 0, 2)
         a = QLabel(label)
         a.setStyleSheet("color: #777; font-size: 11px; min-width: 78px;")
         b = QLabel(value)
@@ -259,14 +260,80 @@ class OutputsPanel(QFrame):
 
     def _append_centered(self, widget: QWidget):
         row = QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
+        row.setContentsMargins(8, 0, 0, 0)
         row.setSpacing(0)
-        row.addStretch(1)
         row.addWidget(widget, 0, Qt.AlignmentFlag.AlignTop)
         row.addStretch(1)
         wrap = QWidget()
         wrap.setLayout(row)
         self.report_layout.addWidget(wrap)
+
+    # ── report table copy helpers ──────────────────────────────
+
+    def _copy_table_selection(self, tbl: QTableWidget):
+        """Copy selected cells as tab-separated text to clipboard."""
+        sel = tbl.selectedIndexes()
+        if not sel:
+            return
+        rows_map: dict = {}
+        for idx in sel:
+            rows_map.setdefault(idx.row(), {})[idx.column()] = idx.data() or ''
+        min_col = min(c for cols in rows_map.values() for c in cols)
+        max_col = max(c for cols in rows_map.values() for c in cols)
+        lines = []
+        for r in sorted(rows_map):
+            cells = [str(rows_map[r].get(c, '')) for c in range(min_col, max_col + 1)]
+            lines.append('\t'.join(cells))
+        QApplication.clipboard().setText('\n'.join(lines))
+
+    def _copy_table_row(self, tbl: QTableWidget, row: int):
+        ncols = tbl.columnCount()
+        cells = []
+        for c in range(ncols):
+            item = tbl.item(row, c)
+            cells.append(item.text() if item else '')
+        QApplication.clipboard().setText('\t'.join(cells))
+
+    def _copy_full_table(self, tbl: QTableWidget):
+        """Copy entire table including headers as TSV."""
+        ncols = tbl.columnCount()
+        nrows = tbl.rowCount()
+        hdr_cells = []
+        for c in range(ncols):
+            hi = tbl.horizontalHeaderItem(c)
+            hdr_cells.append(hi.text() if hi else '')
+        lines = ['\t'.join(hdr_cells)]
+        for r in range(nrows):
+            cells = []
+            for c in range(ncols):
+                item = tbl.item(r, c)
+                cells.append(item.text() if item else '')
+            lines.append('\t'.join(cells))
+        QApplication.clipboard().setText('\n'.join(lines))
+
+    def _report_table_context_menu(self, tbl: QTableWidget, pos):
+        menu = QMenu(tbl)
+        menu.setStyleSheet("""
+            QMenu { background: #1a1a1a; color: #ddd; border: 1px solid #333; }
+            QMenu::item:selected { background: #2a3f5f; }
+        """)
+        idx = tbl.indexAt(pos)
+        if idx.isValid():
+            cell_val = idx.data() or ''
+            act_cell = menu.addAction(f"Copy Cell")
+            act_cell.triggered.connect(
+                lambda: QApplication.clipboard().setText(str(cell_val)))
+            act_row = menu.addAction("Copy Row")
+            act_row.triggered.connect(
+                lambda: self._copy_table_row(tbl, idx.row()))
+        sel = tbl.selectedIndexes()
+        if sel and len(sel) > 1:
+            act_sel = menu.addAction(f"Copy Selection ({len(sel)} cells)")
+            act_sel.triggered.connect(lambda: self._copy_table_selection(tbl))
+        menu.addSeparator()
+        act_all = menu.addAction("Copy Entire Table")
+        act_all.triggered.connect(lambda: self._copy_full_table(tbl))
+        menu.exec(tbl.viewport().mapToGlobal(pos))
 
     @staticmethod
     def _size_table_to_full_content(tbl: QTableWidget) -> None:
@@ -297,10 +364,14 @@ class OutputsPanel(QFrame):
         tbl.setShowGrid(True)
         tbl.setAlternatingRowColors(True)
         tbl.setSortingEnabled(False)
-        tbl.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        tbl.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        tbl.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        tbl.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        tbl.setSelectionMode(QAbstractItemView.SelectionMode.ContiguousSelection)
+        tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
+        tbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        tbl.customContextMenuRequested.connect(
+            lambda pos, t=tbl: self._report_table_context_menu(t, pos)
+        )
         tbl.setWordWrap(False)
         tbl.verticalHeader().setDefaultSectionSize(20)
         tbl.setStyleSheet("""
@@ -315,6 +386,10 @@ class OutputsPanel(QFrame):
             QTableWidget::item {
                 padding: 1px 4px;
             }
+            QTableWidget::item:selected {
+                background-color: #1a3a5c;
+                color: #fff;
+            }
             QHeaderView::section {
                 background-color: #141414;
                 color: #9a9a9a;
@@ -324,6 +399,9 @@ class OutputsPanel(QFrame):
                 font-weight: 600;
             }
         """)
+        sc = QShortcut(QKeySequence.StandardKey.Copy, tbl)
+        sc.setContext(Qt.ShortcutContext.WidgetShortcut)
+        sc.activated.connect(lambda t=tbl: self._copy_table_selection(t))
         hdr = tbl.horizontalHeader()
         hdr.setStretchLastSection(False)
 

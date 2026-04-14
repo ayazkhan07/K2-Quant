@@ -837,8 +837,10 @@ class AnalysisPageWidget(QWidget):
         if visible:
             if tabs is not None:
                 values = tabs.get_forecast_column_data(column_name)
+                anchor = tabs.get_forecast_column_anchor(column_name)
                 if values:
-                    cw.add_forecast_line(column_name, values)
+                    cw.add_forecast_line(column_name, values,
+                                         anchor_price=anchor)
         else:
             cw.remove_forecast_line(column_name)
 
@@ -1007,9 +1009,11 @@ class AnalysisPageWidget(QWidget):
                     if "column_name" in w:
                         col_name = w["column_name"]
                         vals = w.get("values", [])
+                        anchor = w.get("anchor_price")
                         strategy = w.get("_strategy", "AI")
                         if vals:
-                            tabs.set_forecast_column(strategy, col_name, vals)
+                            tabs.set_forecast_column(strategy, col_name, vals,
+                                                     anchor_price=anchor)
                         k2_logger.info(
                             f"Forecast column '{col_name}' written "
                             f"(strategy: {strategy})", "ANALYSIS")

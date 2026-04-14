@@ -2580,7 +2580,8 @@ class ChartWidget(QWidget):
         idx = hash(column_name) % len(self._FORECAST_PALETTE)
         return self._FORECAST_PALETTE[idx]
 
-    def add_forecast_line(self, column_name: str, values: list):
+    def add_forecast_line(self, column_name: str, values: list,
+                          anchor_price: float = None):
         """Render a single named forecast column as a dashed line on the chart."""
         if self.data is None or len(self.data) == 0:
             return
@@ -2595,23 +2596,26 @@ class ChartWidget(QWidget):
         base_x = len(self.data)
         color = self._forecast_color(column_name)
 
-        cn_lower = column_name.lower()
-        if 'open' in cn_lower:
-            anchor_order = ['Open', 'Close', 'High', 'Low']
-        elif 'high' in cn_lower:
-            anchor_order = ['High', 'Close', 'Open', 'Low']
-        elif 'low' in cn_lower:
-            anchor_order = ['Low', 'Close', 'Open', 'High']
+        if anchor_price is not None:
+            last_val = float(anchor_price)
         else:
-            anchor_order = ['Close', 'Open', 'High', 'Low']
+            cn_lower = column_name.lower()
+            if 'open' in cn_lower:
+                anchor_order = ['Open', 'Close', 'High', 'Low']
+            elif 'high' in cn_lower:
+                anchor_order = ['High', 'Close', 'Open', 'Low']
+            elif 'low' in cn_lower:
+                anchor_order = ['Low', 'Close', 'Open', 'High']
+            else:
+                anchor_order = ['Close', 'Open', 'High', 'Low']
 
-        last_val = None
-        for ohlc_col in anchor_order:
-            if ohlc_col in self.data.columns:
-                col_vals = self.data[ohlc_col].dropna()
-                if len(col_vals) > 0:
-                    last_val = float(col_vals.iloc[-1])
-                    break
+            last_val = None
+            for ohlc_col in anchor_order:
+                if ohlc_col in self.data.columns:
+                    col_vals = self.data[ohlc_col].dropna()
+                    if len(col_vals) > 0:
+                        last_val = float(col_vals.iloc[-1])
+                        break
 
         if last_val is not None:
             x_arr = np.empty(len(y) + 1, dtype=np.float64)

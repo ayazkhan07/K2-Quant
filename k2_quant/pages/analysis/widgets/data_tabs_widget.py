@@ -568,6 +568,7 @@ class DataTabsWidget(QWidget):
         self._strategy_columns: Dict[str, List[str]] = {}
         self._forecast_col_order: List[str] = []
         self._forecast_col_visible: Dict[str, bool] = {}
+        self._forecast_col_anchor: Dict[str, Optional[float]] = {}
 
         self._init_ui()
         self._apply_styling()
@@ -870,6 +871,7 @@ class DataTabsWidget(QWidget):
         self._strategy_columns.clear()
         self._forecast_col_order.clear()
         self._forecast_col_visible.clear()
+        self._forecast_col_anchor.clear()
         self._rebuild_forecast_table()
         self.forecast_info.setText(
             f"{len(self._forecast_timestamps)} future timestamps generated"
@@ -882,11 +884,14 @@ class DataTabsWidget(QWidget):
 
     # ── New named-column forecast API ─────────────────────────────
 
-    def set_forecast_column(self, strategy_name: str, column_name: str, values: list):
+    def set_forecast_column(self, strategy_name: str, column_name: str,
+                            values: list, anchor_price: Optional[float] = None):
         """Add or update a named forecast column under a strategy group."""
         if column_name not in self._forecast_col_order:
             self._forecast_col_order.append(column_name)
         self._forecast_col_visible.setdefault(column_name, False)
+        if anchor_price is not None:
+            self._forecast_col_anchor[column_name] = anchor_price
 
         cols = self._strategy_columns.setdefault(strategy_name, [])
         if column_name not in cols:
@@ -922,6 +927,7 @@ class DataTabsWidget(QWidget):
             if col_name in self._forecast_col_order:
                 self._forecast_col_order.remove(col_name)
             self._forecast_col_visible.pop(col_name, None)
+            self._forecast_col_anchor.pop(col_name, None)
         if cols:
             self._rebuild_forecast_table()
             self.forecast_apply.emit({})
@@ -1046,6 +1052,7 @@ class DataTabsWidget(QWidget):
         self._strategy_columns.clear()
         self._forecast_col_order.clear()
         self._forecast_col_visible.clear()
+        self._forecast_col_anchor.clear()
         self._rebuild_forecast_table()
         self.forecast_apply.emit({})
         k2_logger.info("Forecast values cleared and chart lines removed", "DATA_TABS")
@@ -1069,6 +1076,10 @@ class DataTabsWidget(QWidget):
             item = table.item(r, col_idx)
             if item:
                 item.setText(text)
+
+    def get_forecast_column_anchor(self, column_name: str) -> Optional[float]:
+        """Return the anchor price for a forecast column, or None."""
+        return self._forecast_col_anchor.get(column_name)
 
     def get_forecast_column_data(self, column_name: str) -> Optional[List[Optional[float]]]:
         """Read values from a single named forecast column."""
@@ -1332,6 +1343,7 @@ class DataTabsWidget(QWidget):
         self._strategy_columns.clear()
         self._forecast_col_order.clear()
         self._forecast_col_visible.clear()
+        self._forecast_col_anchor.clear()
         self.forecast_table.setRowCount(0)
         self.forecast_table.setColumnCount(0)
         self.forecast_table.setProperty("_data_cols", None)
@@ -1374,6 +1386,7 @@ class DataTabsWidget(QWidget):
             'strategy_columns': {k: list(v) for k, v in self._strategy_columns.items()},
             'forecast_col_order': list(self._forecast_col_order),
             'forecast_col_visible': dict(self._forecast_col_visible),
+            'forecast_col_anchor': dict(self._forecast_col_anchor),
             'timespan': self._timespan,
             'frequency': self._frequency,
             'market_hours_only': self._market_hours_only,
@@ -1403,6 +1416,7 @@ class DataTabsWidget(QWidget):
             }
             self._forecast_col_order = list(state.get('forecast_col_order', []))
             self._forecast_col_visible = dict(state.get('forecast_col_visible', {}))
+            self._forecast_col_anchor = dict(state.get('forecast_col_anchor', {}))
         else:
             self._strategy_columns.clear()
             self._forecast_col_order.clear()
