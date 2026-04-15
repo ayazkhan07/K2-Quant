@@ -53,7 +53,8 @@ pytz>=2023.3            # Timezone definitions for EST conversion
 # Visualization
 pyqtgraph>=0.13.0       # High-performance plotting for PyQt
 matplotlib>=3.7.0       # Additional plotting capabilities
-# plotly>=5.14.0        # Optional: Interactive charts
+plotly>=5.14.0          # Interactive charts (Plotly + Wolfram-inspired theme)
+PyQt6-WebEngine>=6.6.0  # WebEngine for rendering Plotly charts
 
 # Code execution and security
 RestrictedPython>=6.0   # Safe Python code execution for AI-generated code

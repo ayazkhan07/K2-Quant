@@ -196,6 +196,14 @@ class TabBarWidget(QWidget):
                 return True
         return False
 
+    def restore_analysis_tab(self, tab_id: int):
+        """Restore an analysis tab during session recovery (no signals emitted)."""
+        self.current_analysis_id = max(self.current_analysis_id, tab_id)
+        title = f"Analysis {tab_id}"
+        idx = self.tab_bar.addTab(title)
+        self.tabs[idx] = ('analysis', tab_id, title)
+        k2_logger.ui_operation(f"Analysis tab restored", f"Tab ID: {tab_id}")
+
     def close_all_analysis_tabs_except_default(self):
         """Close all analysis tabs except the default (ID 0)."""
         to_remove = []

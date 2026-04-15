@@ -286,20 +286,34 @@ class LeftPaneWidget(QFrame):
         k2_logger.info(f"Populated {len(indicators)} indicators", "LEFT_PANE")
     
     def clear_all_indicators(self):
-        """Uncheck all indicators"""
+        """Uncheck all indicators without firing toggled signals."""
         for i in range(self.indicator_layout.count()):
             widget = self.indicator_layout.itemAt(i).widget()
             if isinstance(widget, QCheckBox):
+                widget.blockSignals(True)
                 widget.setChecked(False)
+                widget.blockSignals(False)
         self.active_indicators.clear()
     
     def clear_all_strategies(self):
-        """Uncheck all strategies"""
+        """Uncheck all strategies without firing toggled signals."""
         for i in range(self.strategy_layout.count()):
             widget = self.strategy_layout.itemAt(i).widget()
             if isinstance(widget, QCheckBox):
+                widget.blockSignals(True)
                 widget.setChecked(False)
+                widget.blockSignals(False)
         self.active_strategies.clear()
+
+    def restore_strategies(self, names: set):
+        """Re-check the named strategies without firing toggled signals."""
+        for i in range(self.strategy_layout.count()):
+            widget = self.strategy_layout.itemAt(i).widget()
+            if isinstance(widget, QCheckBox) and widget.text() in names:
+                widget.blockSignals(True)
+                widget.setChecked(True)
+                widget.blockSignals(False)
+        self.active_strategies = set(names)
 
     def discard_active_strategy(self, name: str):
         """Remove a name from the active set (e.g. deleted via Thinkspace)."""

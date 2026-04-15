@@ -872,6 +872,7 @@ class DataTabsWidget(QWidget):
         self._forecast_col_order.clear()
         self._forecast_col_visible.clear()
         self._forecast_col_anchor.clear()
+        self.forecast_table.clearContents()
         self._rebuild_forecast_table()
         self.forecast_info.setText(
             f"{len(self._forecast_timestamps)} future timestamps generated"
@@ -1481,6 +1482,10 @@ class DataTabsWidget(QWidget):
         k2_logger.info(
             f"Forecast columns restored: {total_cols} named columns",
             "DATA_TABS")
+
+        for col_name in self._forecast_col_order:
+            if self._forecast_col_visible.get(col_name, False):
+                self.forecast_column_toggled.emit(col_name, True)
 
     # ── Multi-sheet serialization ─────────────────────────────────
 

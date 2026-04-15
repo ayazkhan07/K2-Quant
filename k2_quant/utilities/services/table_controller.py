@@ -27,6 +27,79 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 plt.style.use('dark_background')
 
+try:
+    import plotly.graph_objects as go
+    import plotly.express as px
+    import plotly.io as pio
+    _HAS_PLOTLY = True
+
+    _K2_TEMPLATE = go.layout.Template(
+        layout=go.Layout(
+            paper_bgcolor='#0a0a0a',
+            plot_bgcolor='#0a0a0a',
+            font=dict(
+                family='Inter, Segoe UI, Helvetica Neue, Arial, sans-serif',
+                color='#999999',
+                size=12,
+            ),
+            title=dict(
+                font=dict(size=15, color='#cccccc'),
+                x=0.5,
+                xanchor='center',
+            ),
+            xaxis=dict(
+                gridcolor='rgba(255,255,255,0.05)',
+                gridwidth=1,
+                zerolinecolor='rgba(255,255,255,0.12)',
+                zerolinewidth=1,
+                linecolor='rgba(255,255,255,0.15)',
+                linewidth=1,
+                tickfont=dict(size=11, color='#888888'),
+                title_font=dict(size=12, color='#999999'),
+                title_standoff=10,
+                showgrid=True,
+            ),
+            yaxis=dict(
+                gridcolor='rgba(255,255,255,0.05)',
+                gridwidth=1,
+                zerolinecolor='rgba(255,255,255,0.12)',
+                zerolinewidth=1,
+                linecolor='rgba(255,255,255,0.15)',
+                linewidth=1,
+                tickfont=dict(size=11, color='#888888'),
+                title_font=dict(size=12, color='#999999'),
+                title_standoff=10,
+                showgrid=True,
+            ),
+            colorway=[
+                '#5B8FF9', '#61DDAA', '#F6BD16', '#7262FD',
+                '#78D3F8', '#F6903D', '#9661BC', '#008685',
+            ],
+            margin=dict(l=60, r=24, t=56, b=52),
+            hovermode='x unified',
+            hoverlabel=dict(
+                bgcolor='#1a1a1a',
+                bordercolor='#333333',
+                font=dict(color='#e0e0e0', size=12,
+                          family='Inter, Segoe UI, sans-serif'),
+            ),
+            legend=dict(
+                bgcolor='rgba(10,10,10,0.8)',
+                bordercolor='#333333',
+                borderwidth=1,
+                font=dict(color='#aaaaaa', size=11),
+            ),
+        ),
+        data=dict(
+            scatter=[go.Scatter(line=dict(width=2.0))],
+        ),
+    )
+    pio.templates['k2_dark'] = _K2_TEMPLATE
+    pio.templates.default = 'k2_dark'
+except ImportError:
+    go = px = pio = None
+    _HAS_PLOTLY = False
+
 import pandas as pd
 import numpy as np
 from PyQt6.QtCore import QObject, pyqtSignal
@@ -293,6 +366,42 @@ class TableController(QObject):
             charts: list = []
 
             def _show_chart(title=None, fig=None):
+                if _HAS_PLOTLY and fig is not None and isinstance(fig, go.Figure):
+                    if title:
+                        fig.update_layout(title_text=title)
+                    div_html = fig.to_html(
+                        include_plotlyjs='cdn',
+                        full_html=False,
+                        config={
+                            'displayModeBar': 'hover',
+                            'displaylogo': False,
+                            'modeBarButtonsToRemove': [
+                                'lasso2d', 'select2d'],
+                            'scrollZoom': True,
+                        },
+                    )
+                    full_html = (
+                        '<!DOCTYPE html><html><head>'
+                        '<meta charset="utf-8"><style>'
+                        'html,body{margin:0;padding:0;background:#0a0a0a;'
+                        'overflow:hidden;width:100%;height:100%}'
+                        '</style></head><body>'
+                        + div_html +
+                        '<script>(function(){'
+                        'var gd=document.querySelector(".js-plotly-plot");'
+                        'if(!gd)return;'
+                        'function fit(){'
+                        'Plotly.relayout(gd,'
+                        '{width:window.innerWidth,'
+                        'height:window.innerHeight})}'
+                        'gd.on("plotly_afterplot",fit);'
+                        'window.addEventListener("resize",fit)'
+                        '})()</script></body></html>'
+                    )
+                    charts.append({
+                        'plotly_html': full_html, 'png': ''})
+                    return f"Chart captured ({len(charts)} total)"
+
                 target = fig or plt.gcf()
                 if title:
                     target.suptitle(title)
@@ -304,14 +413,10 @@ class TableController(QObject):
                 buf.seek(0)
                 png_b64 = base64.b64encode(buf.read()).decode('utf-8')
                 buf.close()
-                # Keep figure alive for interactive Qt canvas; detach from
-                # pyplot state so subsequent gcf() calls don't reuse it.
                 if plt.fignum_exists(target.number):
                     plt.figure(target.number)
                     plt.close(target.number)
-                # Re-parent figure so it can be embedded in FigureCanvasQTAgg
-                target.set_canvas(None)
-                charts.append({'png': png_b64, 'figure': target})
+                charts.append({'png': png_b64, 'plotly_html': ''})
                 return f"Chart captured ({len(charts)} total)"
 
             # ── Interactive-widget helpers ──────────────────────────────
@@ -381,6 +486,8 @@ class TableController(QObject):
                 "pd": pd,
                 "np": np,
                 "plt": plt,
+                "go": go,
+                "px": px,
                 "datetime": datetime,
                 "result": None,
                 "show_chart": _show_chart,
@@ -743,24 +850,24 @@ PYTHON NOTES:
 - To return a computed value without modifying the table, assign to 'result' variable.
 
 CHARTING (available inside run_python):
-- 'plt' (matplotlib.pyplot) is available with a dark theme pre-configured.
-- After building a chart, call show_chart() to display it inline in the chat.
-  show_chart(title=None, fig=None) -- captures the current figure as an interactive widget.
-  Do NOT call plt.show() -- it will freeze the application. Always use show_chart().
-- Always call plt.figure() before creating a new chart.
-- You can create any matplotlib visualization: line plots, scatter plots, bar charts,
-  histograms, mathematical function graphs, heatmaps, etc.
-- Always add axis labels, a title, and grid for readability.
+- 'go' (plotly.graph_objects) and 'px' (plotly.express) are available for interactive charts.
+- A refined dark theme is pre-configured and auto-applied to all figures.
+- After building a Plotly figure, call show_chart(fig=fig) to display it in the chat.
+  show_chart(title=None, fig=None) -- captures a Plotly figure as an interactive widget.
+  Do NOT call fig.show() or plt.show() -- they will freeze the application. Always use show_chart().
+- Always use go.Figure() or px.* to create charts. Prefer Plotly over matplotlib.
+- You can create any Plotly visualization: line plots, scatter plots, bar charts,
+  histograms, mathematical function graphs, heatmaps, candlestick charts, etc.
+- Always add axis labels and a title for readability. Grid is auto-configured by the theme.
 - Example for equation plotting:
     x = np.linspace(-10, 10, 200)
     y = 2*x + 5
-    plt.figure()
-    plt.plot(x, y)
-    plt.title('y = 2x + 5')
-    plt.xlabel('x')
-    plt.ylabel('y')
-    plt.grid(True, alpha=0.3)
-    show_chart()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=x, y=y, mode='lines', name='y = 2x + 5'))
+    fig.update_layout(title='y = 2x + 5', xaxis_title='x', yaxis_title='y')
+    show_chart(fig=fig)
+- 'plt' (matplotlib) is still available as a fallback. If using matplotlib,
+  call show_chart() with no args after plt calls. But prefer Plotly.
 
 INTERACTIVE WIDGETS (available inside run_python):
 
@@ -975,10 +1082,11 @@ STRATEGY CODE REQUIREMENTS (save_strategy will REJECT code that fails):
                     "description": (
                         f"Execute Python code on the '{table}' data. The environment "
                         f"is persistent -- variables, 'df', and workspace state survive "
-                        f"between calls. 'pd', 'np', 'datetime', 'plt' are available. "
+                        f"between calls. 'pd', 'np', 'datetime', 'go' (plotly.graph_objects), "
+                        f"'px' (plotly.express), 'plt' are available. "
                         f"Use read_working(sheet=…)/to_working(sheet=…) for workspace I/O. "
                         f"Use list_sheets() to see available sheets. "
-                        f"Use show_chart() after plt calls to display charts inline (never plt.show()). "
+                        f"Use show_chart(fig=fig) after building a Plotly figure to display charts inline. "
                         f"Use show_matrix(data, label='', editable=True, headers=None) to display "
                         f"an interactive editable matrix/vector in the chat. data can be a 2-D list, "
                         f"numpy array, or DataFrame. "

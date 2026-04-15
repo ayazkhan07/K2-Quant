@@ -2,7 +2,7 @@
 Right Pane Component - Conversational AI with Agent Loop
 
 Scroll-based chat layout that supports inline interactive charts
-(matplotlib FigureCanvasQTAgg) alongside text messages.
+(Plotly via QWebEngineView, with matplotlib fallback) alongside text messages.
 
 Save as: k2_quant/pages/analysis/components/right_pane.py
 """
@@ -691,58 +691,66 @@ class RightPaneWidget(QFrame):
     def _insert_charts(self, charts: list):
         for chart_data in charts:
             if isinstance(chart_data, dict):
-                fig = chart_data.get('figure')
+                plotly_html = chart_data.get('plotly_html', '')
                 png = chart_data.get('png', '')
             else:
-                fig = None
+                plotly_html = ''
                 png = chart_data
 
             inserted = False
-            if fig is not None:
+            if plotly_html:
                 try:
-                    widget = self._create_interactive_chart(fig)
+                    widget = self._create_plotly_chart(plotly_html)
                     self._add_widget(widget)
                     inserted = True
                 except Exception as e:
                     k2_logger.error(
-                        f"Interactive chart failed, falling back to PNG: {e}",
+                        f"Plotly chart failed, falling back to PNG: {e}",
                         "AI_CHAT")
 
             if not inserted and png:
                 self._add_static_chart(png)
 
-            self._message_records.append(
-                {'type': 'chart', 'png': png if isinstance(png, str) else ''})
+            self._message_records.append({
+                'type': 'chart',
+                'plotly_html': plotly_html or '',
+                'png': png if isinstance(png, str) else '',
+            })
 
-    def _create_interactive_chart(self, figure):
-        from matplotlib.backends.backend_qtagg import (
-            FigureCanvasQTAgg, NavigationToolbar2QT)
+    def _create_plotly_chart(self, html: str):
+        from PyQt6.QtWebEngineWidgets import QWebEngineView
+        from PyQt6.QtWebEngineCore import QWebEngineSettings
 
         container = QFrame()
         container.setObjectName("chartContainer")
         container.setStyleSheet("""
             #chartContainer {
-                background-color: #1a1a1a;
+                background-color: #0a0a0a;
                 border: 1px solid #2a2a2a;
                 border-radius: 4px;
             }
         """)
         clayout = QVBoxLayout(container)
-        clayout.setContentsMargins(4, 4, 4, 4)
-        clayout.setSpacing(2)
+        clayout.setContentsMargins(0, 0, 0, 0)
+        clayout.setSpacing(0)
 
-        canvas = FigureCanvasQTAgg(figure)
-        canvas.setMinimumHeight(350)
-        canvas.setSizePolicy(
+        webview = QWebEngineView()
+        webview.setFixedHeight(420)
+        webview.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-        toolbar = NavigationToolbar2QT(canvas, container)
-        toolbar.setStyleSheet(
-            "background: #1a1a1a; border: none; color: #ccc;")
+        settings = webview.settings()
+        settings.setAttribute(
+            QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
+        settings.setAttribute(
+            QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls,
+            True)
 
-        clayout.addWidget(toolbar)
-        clayout.addWidget(canvas)
-        container.setMinimumHeight(400)
+        webview.setHtml(html)
+        webview.setStyleSheet("background: #0a0a0a; border: none;")
+
+        clayout.addWidget(webview)
+        container.setFixedHeight(420)
         return container
 
     def _add_static_chart(self, png_b64: str):
@@ -981,6 +989,16 @@ class RightPaneWidget(QFrame):
                 'timestamp': datetime.now().isoformat()
             })
 
+        # Auto-save chat after every AI response
+        if self._active_table and self.save_chat_callback:
+            try:
+                self.save_chat_callback(
+                    self._active_table,
+                    json.dumps(self._message_records),
+                    list(self.conversation_history))
+            except Exception:
+                pass
+
         self.worker = None
 
     def _on_worker_error(self, error_msg: str):
@@ -1073,8 +1091,16 @@ class RightPaneWidget(QFrame):
                 self.chat_layout.addWidget(self._make_step_label(content))
                 self._message_records.append(rec)
             elif rtype == 'chart':
+                plotly_html = rec.get('plotly_html', '')
                 png = rec.get('png', '')
-                if png:
+                if plotly_html:
+                    try:
+                        widget = self._create_plotly_chart(plotly_html)
+                        self.chat_layout.addWidget(widget)
+                    except Exception:
+                        if png:
+                            self._add_static_chart(png)
+                elif png:
                     self._add_static_chart(png)
                 self._message_records.append(rec)
             elif rtype == 'matrix':
@@ -1369,14 +1395,22 @@ class RightPaneWidget(QFrame):
         self._stop_typing_indicator()
         if self.streaming_timer:
             self.streaming_timer.stop()
-        if self._active_table and self.save_chat_callback:
-            try:
-                self.save_chat_callback(
-                    self._active_table,
-                    json.dumps(self._message_records),
-                    list(self.conversation_history))
-            except Exception:
-                pass
+        # Snapshot current state into the store so the loop below covers it
+        if self._active_table:
+            self._chat_store[self._active_table] = {
+                'records': list(self._message_records),
+                'history': list(self.conversation_history),
+            }
+        # Flush every model's chat to DB (not just the active one)
+        if self.save_chat_callback:
+            for table_name, state in self._chat_store.items():
+                try:
+                    self.save_chat_callback(
+                        table_name,
+                        json.dumps(state.get('records', [])),
+                        list(state.get('history', [])))
+                except Exception:
+                    pass
         self._clear_chat_widgets()
         self.conversation_history.clear()
         self._chat_store.clear()

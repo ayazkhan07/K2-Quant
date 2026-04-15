@@ -273,9 +273,20 @@ class AnalysisPageWidget(QWidget):
         """Load model by table name"""
         k2_logger.info(f"Loading model: {table_name}", "ANALYSIS")
         
-        # Persist tab data for the previous model before switching
+        # Persist tab data and active strategies for the previous model
         if self.current_model:
             self.middle_pane.persist_tab_data(self.current_model)
+            import json
+            saved_models_manager.set_model_state(
+                self.current_model,
+                indicators=None,
+                active_strategy=json.dumps(sorted(self.left_pane.active_strategies)),
+                chart_range=None,
+            )
+        
+        # Clear UI before loading new model (signals blocked — no cascading side effects)
+        self.left_pane.clear_all_indicators()
+        self.left_pane.clear_all_strategies()
         
         try:
             from k2_quant.utilities.data.db_manager import db_manager as _db
@@ -320,19 +331,22 @@ class AnalysisPageWidget(QWidget):
                 }
                 self.right_pane.set_data_context(ctx)
                 
-                # Clear any existing indicators/strategies when loading new model
-                self.left_pane.clear_all_indicators()
-                self.left_pane.clear_all_strategies()
-                
-                # Restore model state if available
+                # Restore model state (chart timeframe + strategy checkboxes)
                 try:
+                    import json
                     state = saved_models_manager.get_model_state(table_name)
-                    if state and self.middle_pane.chart_widget:
-                        k2_logger.info(f"Model state available for {table_name}", "ANALYSIS")
-                        cw = self.middle_pane.chart_widget
-                        agg = state.get('aggregation') if isinstance(state, dict) else None
-                        if agg:
-                            cw.change_timeframe(agg)
+                    if state and isinstance(state, dict):
+                        if self.middle_pane.chart_widget:
+                            agg = state.get('aggregation')
+                            if agg:
+                                self.middle_pane.chart_widget.change_timeframe(agg)
+                        raw = state.get('active_strategy') or '[]'
+                        try:
+                            names = set(json.loads(raw))
+                        except (json.JSONDecodeError, TypeError):
+                            names = {raw} if raw else set()
+                        if names:
+                            self.left_pane.restore_strategies(names)
                 except Exception as e:
                     k2_logger.debug(f"No model state available: {e}", "ANALYSIS")
 

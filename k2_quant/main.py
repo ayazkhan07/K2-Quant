@@ -5,6 +5,7 @@ K2 QUANT - Main Application with Tab Navigation
 Integrated application with browser-style tabs for Stock Fetcher and Analysis pages.
 """
 
+import json
 import sys
 from pathlib import Path
 from typing import Dict, Optional
@@ -13,7 +14,7 @@ from typing import Dict, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QStackedWidget
-from PyQt6.QtCore import QObject
+from PyQt6.QtCore import QObject, QSettings, QTimer
 
 from k2_quant.pages.landing.page import LandingPageWidget
 from k2_quant.pages.stock_fetcher.page import StockFetcherWidget
@@ -36,6 +37,7 @@ class MainWindow(QMainWindow):
         
         self.init_ui()
         self.setup_styling()
+        QTimer.singleShot(0, self._restore_session)
         
     def init_ui(self):
         """Initialize the UI with tab bar and stacked widget"""
@@ -145,9 +147,79 @@ class MainWindow(QMainWindow):
             
             k2_logger.ui_operation(f"Analysis tab closed", f"Tab ID: {tab_id}")
 
+    def closeEvent(self, event):
+        """Save session state before the window closes."""
+        self._save_session()
+        super().closeEvent(event)
+
+    def _save_session(self):
+        """Persist open analysis tabs and their loaded models to QSettings."""
+        settings = QSettings("K2Quant", "K2Quant")
+        session_tabs = []
+        for tab_id, widget in self.analysis_tabs.items():
+            session_tabs.append({
+                'tab_id': tab_id,
+                'model': widget.current_model or '',
+            })
+        settings.setValue("session/analysis_tabs", json.dumps(session_tabs))
+
+        current = self.tab_bar.get_current_tab()
+        if current:
+            page_type, tab_id, _title = current
+            settings.setValue("session/active_page_type", page_type)
+            settings.setValue("session/active_tab_id", tab_id)
+
+        k2_logger.info(f"Session saved ({len(session_tabs)} analysis tabs)", "MAIN")
+
+    def _restore_session(self):
+        """Recreate analysis tabs and reload models from a previous session."""
+        settings = QSettings("K2Quant", "K2Quant")
+        raw = settings.value("session/analysis_tabs", "")
+        if not raw:
+            return
+        try:
+            session_tabs = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return
+        if not isinstance(session_tabs, list):
+            return
+
+        for tab_info in session_tabs:
+            tab_id = tab_info.get('tab_id', 0)
+            model = tab_info.get('model', '')
+
+            if tab_id != 0 and tab_id not in self.analysis_tabs:
+                self.tab_bar.restore_analysis_tab(tab_id)
+                new_analysis = AnalysisPageWidget(tab_id=tab_id)
+                self.analysis_tabs[tab_id] = new_analysis
+                self.stacked_widget.addWidget(new_analysis)
+
+            if model and tab_id in self.analysis_tabs:
+                try:
+                    self.analysis_tabs[tab_id].load_model_by_table(model)
+                except Exception as e:
+                    k2_logger.error(
+                        f"Failed to restore model '{model}' on tab {tab_id}: {e}", "MAIN")
+
+        saved_page = settings.value("session/active_page_type", "stock_fetcher")
+        saved_tab = settings.value("session/active_tab_id", 0)
+        try:
+            saved_tab = int(saved_tab)
+        except (TypeError, ValueError):
+            saved_tab = 0
+        self.tab_bar.select_tab(saved_page, saved_tab)
+
+        k2_logger.info(
+            f"Session restored ({len(session_tabs)} analysis tabs)", "MAIN")
+
     def handle_database_cleared(self):
         """Reset analysis views and caches after database deletion."""
         k2_logger.info("Handling database cleared broadcast", "MAIN")
+        # Wipe saved session so stale model references don't restore next launch
+        settings = QSettings("K2Quant", "K2Quant")
+        settings.remove("session/analysis_tabs")
+        settings.remove("session/active_page_type")
+        settings.remove("session/active_tab_id")
         # Reset default analysis tab (ID 0)
         if 0 in self.analysis_tabs:
             widget = self.analysis_tabs[0]
