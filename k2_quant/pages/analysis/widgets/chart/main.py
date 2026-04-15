@@ -1047,9 +1047,12 @@ class ChartWidget(QWidget):
             self.main_plot.addItem(line, ignoreBounds=True)
             self._grid_pool['h'].append(line)
             
+    _MAX_FORECAST_LABELS = 12
+
     def _add_crosshair(self):
         """Add crosshair: V-line snaps to data; shows Date, Time, OHLC at intersections.
-        H-line is fluid (visual aid only)."""
+        H-line is fluid (visual aid only).  Also pre-allocates a pool of
+        reusable labels for forecast line values."""
         self.vLine = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('#666', width=1))
         self.hLine = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen('#666', width=1))
         self.main_plot.addItem(self.vLine, ignoreBounds=True)
@@ -1071,6 +1074,14 @@ class ChartWidget(QWidget):
             label.setFont(font)
             self.main_plot.addItem(label)
             self.crosshair_ohlc_labels[col] = label
+
+        self._forecast_crosshair_labels: List[pg.TextItem] = []
+        for _ in range(self._MAX_FORECAST_LABELS):
+            lbl = pg.TextItem(color='#fff', anchor=(0, 0.5))
+            lbl.setFont(font)
+            lbl.setVisible(False)
+            self.main_plot.addItem(lbl)
+            self._forecast_crosshair_labels.append(lbl)
         
         self.proxy = pg.SignalProxy(
             self.main_plot.scene().sigMouseMoved,
@@ -1937,9 +1948,49 @@ class ChartWidget(QWidget):
             
             self.main_plot.setYRange(y_min, y_max, padding=0)
             
+    def _extrapolate_forecast_date(self, steps_ahead: int):
+        """Return an extrapolated datetime *steps_ahead* bars past the last
+        historical bar, using the current timeframe interval."""
+        if self.data is None or len(self.data) == 0 or not self.date_column:
+            return None
+        last_date = self.data.iloc[-1][self.date_column]
+        if pd.isna(last_date):
+            return None
+        try:
+            last_dt = pd.Timestamp(last_date)
+        except Exception:
+            return None
+        minutes = self._get_timeframe_interval_minutes(self.current_timeframe)
+        return last_dt + timedelta(minutes=minutes * steps_ahead)
+
+    def _sample_forecast_at_x(self, x: int):
+        """Return list of (column_name, y_value, color) for every visible
+        forecast line that has a data point at index *x*."""
+        hits: list = []
+        for name, item in self._forecast_lines.items():
+            if not item.isVisible():
+                continue
+            xd = item.xData
+            yd = item.yData
+            if xd is None or yd is None or len(xd) == 0:
+                continue
+            xd_arr = np.asarray(xd, dtype=np.float64)
+            yd_arr = np.asarray(yd, dtype=np.float64)
+            idx = np.where(np.abs(xd_arr - x) < 0.5)[0]
+            if len(idx) == 0:
+                continue
+            val = float(yd_arr[idx[0]])
+            if not np.isfinite(val):
+                continue
+            color = self._forecast_color(name)
+            hits.append((name, val, color))
+        return hits
+
     def update_crosshair(self, evt):
         """Crosshair: V-line snaps to data; Date/Time at top; OHLC labels at intersections.
-        H-line stays fluid (visual aid only)."""
+        H-line stays fluid (visual aid only).  When hovering over the
+        forecast region (x >= len(data)), shows projected date and
+        forecast line values instead of OHLC."""
         if self._is_panning:
             return
         pos = evt[0]
@@ -1951,55 +2002,105 @@ class ChartWidget(QWidget):
         
         x_raw = mousePoint.x()
         x_snapped = int(round(x_raw))
-        x_snapped = max(0, min(x_snapped, len(self.data) - 1) if self.data is not None else x_snapped)
-        
+
+        forecast_excess = self._forecast_max_x_excess()
+        data_len = len(self.data) if self.data is not None else 0
+        max_x = data_len - 1 + forecast_excess if data_len > 0 else 0
+        x_snapped = max(0, min(x_snapped, max_x))
+
         self.vLine.setPos(x_snapped)
         self.hLine.setPos(mousePoint.y())
-        
-        if self.data is None or not self.date_column or len(self.data) == 0 or not (0 <= x_snapped < len(self.data)):
+
+        in_forecast = data_len > 0 and x_snapped >= data_len and forecast_excess > 0
+
+        if self.data is None or not self.date_column or data_len == 0:
             self._hide_crosshair_labels()
             return
-            
+
         vb = self.main_plot.getViewBox()
         x_range, (y_min, y_max) = vb.viewRange()
-        
-        date_val = self.data.iloc[x_snapped][self.date_column]
-        if pd.isna(date_val):
-            self._hide_crosshair_labels()
-            return
-            
-        date_str = safe_strftime(date_val, '%d-%b-%y', '')
-        time_str = safe_strftime(date_val, '%H:%M:%S', '') if self.current_timeframe in INTRADAY_TIMEFRAMES else ''
-        
         x_label = x_snapped + (x_range[1] - x_range[0]) * 0.008 if (x_range[1] - x_range[0]) > 0 else x_snapped + 0.5
-        
-        self.crosshair_date_label.setText(date_str or '--')
-        self.crosshair_date_label.setPos(x_label, y_max)
-        self.crosshair_date_label.setVisible(True)
-        
-        if time_str:
-            self.crosshair_time_label.setText(time_str)
-            self.crosshair_time_label.setPos(x_label, y_max - (y_max - y_min) * 0.03)
-            self.crosshair_time_label.setVisible(True)
+
+        if not in_forecast:
+            # ── Historical data path (unchanged) ──
+            if not (0 <= x_snapped < data_len):
+                self._hide_crosshair_labels()
+                return
+
+            date_val = self.data.iloc[x_snapped][self.date_column]
+            if pd.isna(date_val):
+                self._hide_crosshair_labels()
+                return
+
+            date_str = safe_strftime(date_val, '%d-%b-%y', '')
+            time_str = safe_strftime(date_val, '%H:%M:%S', '') if self.current_timeframe in INTRADAY_TIMEFRAMES else ''
+
+            self.crosshair_date_label.setText(date_str or '--')
+            self.crosshair_date_label.setPos(x_label, y_max)
+            self.crosshair_date_label.setVisible(True)
+
+            if time_str:
+                self.crosshair_time_label.setText(time_str)
+                self.crosshair_time_label.setPos(x_label, y_max - (y_max - y_min) * 0.03)
+                self.crosshair_time_label.setVisible(True)
+            else:
+                self.crosshair_time_label.setVisible(False)
+
+            for col in ['High', 'Open', 'Close', 'Low']:
+                lbl = self.crosshair_ohlc_labels[col]
+                if col not in self.data.columns or col not in self.active_lines:
+                    lbl.setVisible(False)
+                    continue
+                val_raw = self.data.iloc[x_snapped][col]
+                val_num = pd.to_numeric(val_raw, errors='coerce')
+                if pd.isna(val_num) or not np.isfinite(val_num):
+                    lbl.setVisible(False)
+                    continue
+                price = float(val_num)
+                short = col[0]
+                price_str = f"${price:.3f}" if price < 10 else (f"${price:.2f}" if price < 1000 else f"${price:,.2f}")
+                lbl.setText(f"{short} - {price_str}")
+                lbl.setPos(x_label, price)
+                lbl.setVisible(True)
+
+            for lbl in self._forecast_crosshair_labels:
+                lbl.setVisible(False)
         else:
-            self.crosshair_time_label.setVisible(False)
-        
-        for col in ['High', 'Open', 'Close', 'Low']:
-            lbl = self.crosshair_ohlc_labels[col]
-            if col not in self.data.columns or col not in self.active_lines:
+            # ── Forecast region path ──
+            steps_ahead = x_snapped - data_len + 1
+            proj_dt = self._extrapolate_forecast_date(steps_ahead)
+            if proj_dt is not None:
+                date_str = proj_dt.strftime('%d-%b-%y')
+                time_str = proj_dt.strftime('%H:%M:%S') if self.current_timeframe in INTRADAY_TIMEFRAMES else ''
+            else:
+                date_str = f"Forecast +{steps_ahead}"
+                time_str = ''
+
+            self.crosshair_date_label.setText(date_str)
+            self.crosshair_date_label.setPos(x_label, y_max)
+            self.crosshair_date_label.setVisible(True)
+
+            if time_str:
+                self.crosshair_time_label.setText(time_str)
+                self.crosshair_time_label.setPos(x_label, y_max - (y_max - y_min) * 0.03)
+                self.crosshair_time_label.setVisible(True)
+            else:
+                self.crosshair_time_label.setVisible(False)
+
+            for lbl in self.crosshair_ohlc_labels.values():
                 lbl.setVisible(False)
-                continue
-            val_raw = self.data.iloc[x_snapped][col]
-            val_num = pd.to_numeric(val_raw, errors='coerce')
-            if pd.isna(val_num) or not np.isfinite(val_num):
-                lbl.setVisible(False)
-                continue
-            price = float(val_num)
-            short = col[0]
-            price_str = f"${price:.3f}" if price < 10 else (f"${price:.2f}" if price < 1000 else f"${price:,.2f}")
-            lbl.setText(f"{short} - {price_str}")
-            lbl.setPos(x_label, price)
-            lbl.setVisible(True)
+
+            hits = self._sample_forecast_at_x(x_snapped)
+            for i, lbl in enumerate(self._forecast_crosshair_labels):
+                if i < len(hits):
+                    name, price, color = hits[i]
+                    price_str = f"${price:.3f}" if price < 10 else (f"${price:.2f}" if price < 1000 else f"${price:,.2f}")
+                    lbl.setText(f"{name}: {price_str}")
+                    lbl.setColor(color)
+                    lbl.setPos(x_label, price)
+                    lbl.setVisible(True)
+                else:
+                    lbl.setVisible(False)
     
     def _hide_crosshair_labels(self):
         """Hide crosshair labels when mouse outside chart or no data."""
@@ -2010,6 +2111,8 @@ class ChartWidget(QWidget):
         for lbl in getattr(self, 'crosshair_ohlc_labels', {}).values():
             if lbl is not None:
                 lbl.setVisible(False)
+        for lbl in getattr(self, '_forecast_crosshair_labels', []):
+            lbl.setVisible(False)
             
     def _emit_viewport_changed(self):
         """Emit viewport changed signal and refresh visible data windows."""
@@ -2272,8 +2375,32 @@ class ChartWidget(QWidget):
         """Jump to latest data with Y auto-fit."""
         self._show_last_n_bars(DEFAULT_VISIBLE_BARS)
         
+    def _forecast_y_extremes_in_range(self, x_lo: float, x_hi: float):
+        """Return (y_min, y_max) across all visible forecast lines within
+        the given X range, or None if no forecast data intersects."""
+        global_min = np.inf
+        global_max = -np.inf
+        found = False
+        for item in self._forecast_lines.values():
+            if not item.isVisible():
+                continue
+            xd, yd = item.xData, item.yData
+            if xd is None or yd is None or len(xd) == 0:
+                continue
+            xd_arr = np.asarray(xd, dtype=np.float64)
+            yd_arr = np.asarray(yd, dtype=np.float64)
+            mask = (xd_arr >= x_lo) & (xd_arr <= x_hi) & np.isfinite(yd_arr)
+            if not np.any(mask):
+                continue
+            found = True
+            global_min = min(global_min, float(np.nanmin(yd_arr[mask])))
+            global_max = max(global_max, float(np.nanmax(yd_arr[mask])))
+        return (global_min, global_max) if found else None
+
     def auto_scale_y_for_visible_data(self):
-        """Auto-scale Y for visible data (skipped when user is in manual Y mode)."""
+        """Auto-scale Y for visible data (skipped when user is in manual Y mode).
+        When the viewport extends into the forecast region, forecast line Y
+        values are included in the range calculation."""
         if self.data is None or len(self.data) == 0:
             return
 
@@ -2287,6 +2414,18 @@ class ChartWidget(QWidget):
 
         if x_min < len(self.data) and x_max < len(self.data) and x_min <= x_max:
             self._auto_scale_y_range(x_min, x_max)
+
+        if round(x_range[1]) >= len(self.data) and self._forecast_lines:
+            fc_extremes = self._forecast_y_extremes_in_range(x_range[0], x_range[1])
+            if fc_extremes is not None:
+                cur_y = vb.viewRange()[1]
+                combined_min = min(cur_y[0], fc_extremes[0])
+                combined_max = max(cur_y[1], fc_extremes[1])
+                padding = (combined_max - combined_min) * 0.1
+                combined_min = max(0, combined_min - padding)
+                combined_max = combined_max + padding
+                if combined_min < cur_y[0] or combined_max > cur_y[1]:
+                    self.main_plot.setYRange(combined_min, combined_max, padding=0)
             
     def reset_zoom(self):
         """Reset to default view with Y auto-fit."""
