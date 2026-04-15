@@ -692,6 +692,28 @@ class DatabaseManager:
                     return (result[0], result[1])
                 return (None, None)
 
+    def get_last_bar(self, table_name: str) -> Optional[Tuple]:
+        """Return (market_date, market_time) of the chronologically last row, or None."""
+        with self.get_connection() as conn:
+            with self.get_cursor(conn) as cur:
+                has_split = self._check_column_exists(table_name, 'market_date')
+                if has_split:
+                    cur.execute(f"""
+                        SELECT market_date, market_time
+                        FROM {table_name}
+                        ORDER BY timestamp DESC
+                        LIMIT 1
+                    """)
+                else:
+                    cur.execute(f"""
+                        SELECT DATE(date_time_market), CAST(date_time_market AS TIME)
+                        FROM {table_name}
+                        ORDER BY timestamp DESC
+                        LIMIT 1
+                    """)
+                row = cur.fetchone()
+                return row if row else None
+
     def get_table_statistics(self, table_name: str) -> Dict:
         """Get statistics for a table including record count and size"""
         try:

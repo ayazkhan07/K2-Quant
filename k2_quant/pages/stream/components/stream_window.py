@@ -3,20 +3,23 @@ Stream Window Component — content widget for each MDI sub-window.
 
 Layout (top-to-bottom):
   60% — Chart (pyqtgraph)
-  40% — Tabbed: THINKSPACE | OUTPUTS | FORECAST DATA
+  40% — Tabbed: THINKSPACE | OUTPUTS | FORECAST DATA | ACTUAL DATA
 
-Each window is fully isolated: its own chart, AI session, outputs, and forecast.
+Each window is fully isolated: its own chart, AI session, outputs,
+forecast, and live-streaming actual data pipeline.
 """
 
 import json
 import re
+from datetime import datetime, date as dt_date, time as dt_time
 from typing import Dict, Optional, Any, List
 
 import pandas as pd
 import numpy as np
 
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QSplitter, QTabWidget,
+    QWidget, QVBoxLayout, QSplitter, QTabWidget, QMessageBox,
+    QTableWidget, QTableWidgetItem, QHeaderView,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 
@@ -33,6 +36,13 @@ from k2_quant.pages.analysis.widgets.chart import ChartWidget
 from k2_quant.pages.analysis.widgets.data_tabs_widget import DataTabsWidget
 from k2_quant.pages.analysis.components.right_pane import RightPaneWidget
 from k2_quant.pages.analysis.components.outputs_panel import OutputsPanel
+from k2_quant.pages.stream.widgets.actual_data_widget import ActualDataWidget
+
+from k2_quant.utilities.helpers.market_hours import is_market_open, market_status
+from k2_quant.utilities.services.polygon_websocket import polygon_ws_manager
+from k2_quant.utilities.services.bar_aggregator import BarAggregator
+from k2_quant.utilities.services.stream_reconciler import StreamReconciler
+from k2_quant.utilities.data.actual_data_manager import actual_data_manager
 
 
 _INTRADAY_TIMESPANS = {'minute', 'min', 'hour'}
@@ -48,8 +58,10 @@ def _should_filter_market_hours(metadata: dict) -> bool:
 class StreamWindowWidget(QWidget):
     """Self-contained window content for one model inside the Stream MDI area."""
 
-    closed = pyqtSignal(str)  # table_name — emitted when window is closing
-    focused = pyqtSignal(str)  # table_name — emitted on focus/activation
+    closed = pyqtSignal(str)
+    focused = pyqtSignal(str)
+    stream_status_changed = pyqtSignal(str)
+    stream_rejected = pyqtSignal()  # title bar should reset its toggle
 
     def __init__(self, table_name: str, parent=None):
         super().__init__(parent)
@@ -58,6 +70,11 @@ class StreamWindowWidget(QWidget):
         self.current_metadata: Dict[str, Any] = {}
         self.applied_indicators: Dict[str, Dict] = {}
         self.applied_strategies: set = set()
+
+        self._is_streaming = False
+        self._aggregator: Optional[BarAggregator] = None
+        self._reconciler: Optional[StreamReconciler] = None
+        self._actual_lines: Dict[str, Any] = {}
 
         self._init_ui()
         self._load_model()
@@ -89,14 +106,44 @@ class StreamWindowWidget(QWidget):
 
         self.outputs_panel = OutputsPanel()
 
+        # MODEL DATA — standalone table, no reparenting
+        self.model_data_table = QTableWidget()
+        self.model_data_table.setAlternatingRowColors(True)
+        self.model_data_table.horizontalHeader().setStretchLastSection(False)
+        self.model_data_table.setSortingEnabled(True)
+        self.model_data_table.verticalHeader().setVisible(False)
+        self.model_data_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.model_data_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.model_data_table.setSelectionMode(QTableWidget.SelectionMode.ContiguousSelection)
+        self.model_data_table.setVerticalScrollMode(QTableWidget.ScrollMode.ScrollPerPixel)
+        self.model_data_table.setHorizontalScrollMode(QTableWidget.ScrollMode.ScrollPerPixel)
+        self.model_data_table.setStyleSheet("""
+            QTableWidget {
+                background-color: #0a0a0a; alternate-background-color: #0f0f0f;
+                color: #c8c8c8; gridline-color: #1a1a1a; border: none;
+                font-size: 11px; font-family: 'Consolas', 'Courier New', monospace;
+            }
+            QTableWidget::item { padding: 2px 6px; }
+            QTableWidget::item:selected { background-color: #1a2a3a; color: #fff; }
+            QHeaderView::section {
+                background-color: #111; color: #aaa; border: none;
+                border-bottom: 1px solid #222; padding: 4px 6px;
+                font-size: 11px; font-weight: 600;
+            }
+        """)
+
+        # FORECAST DATA — DataTabsWidget with inner bar hidden, forced to forecast tab
         self.data_tabs = DataTabsWidget()
-        # Show only the Forecast Data content — hide the internal sub-tab bar
         self.data_tabs.tab_widget.tabBar().setVisible(False)
         self.data_tabs.tab_widget.setCurrentIndex(1)
 
+        self.actual_data_widget = ActualDataWidget()
+
         self.bottom_tabs.addTab(self.thinkspace, "THINKSPACE")
         self.bottom_tabs.addTab(self.outputs_panel, "OUTPUTS")
+        self.bottom_tabs.addTab(self.model_data_table, "MODEL DATA")
         self.bottom_tabs.addTab(self.data_tabs, "FORECAST DATA")
+        self.bottom_tabs.addTab(self.actual_data_widget, "ACTUAL DATA")
 
         self.bottom_tabs.setStyleSheet("""
             #streamBottomTabs { background: #0a0a0a; border: none; }
@@ -189,7 +236,7 @@ class StreamWindowWidget(QWidget):
             k2_logger.error(f"Failed to load model in stream window: {e}", "STREAM")
 
     def _load_data_tabs(self, rows, total_count):
-        """Feed data into the forecast DataTabsWidget, mirroring middle_pane logic."""
+        """Feed data into Model Data + Forecast tabs."""
         has_rn = self.current_metadata.get('has_row_number', False)
         if has_rn:
             columns = ['#', 'Date', 'Time', 'Open', 'High', 'Low', 'Close',
@@ -200,6 +247,8 @@ class StreamWindowWidget(QWidget):
                         'Volume', 'VWAP', 'Open_%', 'High_%', 'Low_%',
                         'Close_%', 'Elasticity', 'Close-Open_%']
         df = pd.DataFrame(rows, columns=columns[:len(rows[0])] if rows else columns[:8])
+
+        self._populate_model_data_table(df)
 
         self.data_tabs.set_model_context(self.table_name)
 
@@ -239,6 +288,63 @@ class StreamWindowWidget(QWidget):
                 self.applied_strategies = names
         except Exception as e:
             k2_logger.debug(f"No model state available: {e}", "STREAM")
+
+    def _populate_model_data_table(self, df: pd.DataFrame):
+        """Fill the standalone MODEL DATA table with the model's OHLCV rows."""
+        if df is None or df.empty:
+            return
+        table = self.model_data_table
+        table.setSortingEnabled(False)
+        table.setRowCount(len(df))
+        table.setColumnCount(len(df.columns))
+
+        headers = []
+        for col in df.columns:
+            cs = str(col)
+            headers.append(
+                cs.capitalize() if cs.lower() in (
+                    'open', 'high', 'low', 'close', 'volume', 'vwap', 'date', 'time')
+                else cs)
+        table.setHorizontalHeaderLabels(headers)
+
+        for r in range(len(df)):
+            for c in range(len(df.columns)):
+                value = df.iloc[r, c]
+                col_lower = str(df.columns[c]).lower()
+                if pd.isna(value):
+                    text = ""
+                elif col_lower in ('date',):
+                    text = str(value)
+                elif col_lower in ('time',):
+                    text = str(value)[:8]
+                elif col_lower == '#':
+                    text = str(int(value)) if value is not None else ""
+                elif col_lower == 'volume':
+                    try:
+                        text = f"{int(value):,}"
+                    except (ValueError, TypeError):
+                        text = str(value)
+                else:
+                    try:
+                        text = f"{float(value):.2f}"
+                    except (ValueError, TypeError):
+                        text = str(value)
+
+                item = QTableWidgetItem(text)
+                if col_lower in ('#', 'date', 'time'):
+                    item.setTextAlignment(
+                        Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+                else:
+                    item.setTextAlignment(
+                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                table.setItem(r, c, item)
+
+        table.resizeColumnsToContents()
+        for i in range(table.columnCount()):
+            if table.columnWidth(i) < 80:
+                table.setColumnWidth(i, 80)
+        table.setSortingEnabled(True)
 
     # ── Indicator support ─────────────────────────────────────────
 
@@ -629,6 +735,237 @@ class StreamWindowWidget(QWidget):
     def _load_chat(self, table_name: str) -> Optional[Dict]:
         return saved_models_manager.get_chat_history(table_name)
 
+    # ── Live streaming pipeline ──────────────────────────────────
+
+    def toggle_streaming(self, start: bool):
+        """Called by the title-bar toggle button."""
+        if start:
+            self._start_streaming()
+        else:
+            self._stop_streaming()
+
+    def _start_streaming(self):
+        mkt_hours = self.current_metadata.get('market_hours_only', False)
+        if mkt_hours and not is_market_open():
+            status = market_status()
+            QMessageBox.information(
+                self, "Market Closed",
+                f"{status}\n\nLive streaming is only available during market hours.",
+            )
+            self.stream_status_changed.emit(status)
+            self._is_streaming = False
+            self.stream_rejected.emit()
+            return
+
+        symbol = self.current_metadata.get('symbol', '').upper()
+        if not symbol or symbol == 'UNKNOWN':
+            self.stream_status_changed.emit("No symbol")
+            self.stream_rejected.emit()
+            return
+
+        timespan = self.current_metadata.get('timespan', 'minute')
+        freq_str = self.current_metadata.get('frequency', '1')
+        frequency = int(''.join(c for c in str(freq_str) if c.isdigit()) or '1')
+
+        actual_data_manager.ensure_table(self.table_name)
+
+        existing_bars = actual_data_manager.get_all_bars(self.table_name)
+        if existing_bars:
+            self.actual_data_widget.load_bars(existing_bars)
+
+        self._aggregator = BarAggregator(
+            symbol=symbol, frequency=frequency, timespan=timespan
+        )
+        self._aggregator.bar_updated.connect(self._on_bar_updated)
+        self._aggregator.bar_completed.connect(self._on_bar_completed)
+
+        self._reconciler = StreamReconciler()
+        self._reconciler.reconciliation_progress.connect(self._on_reconcile_progress)
+        self._reconciler.reconciliation_complete.connect(self._on_reconcile_complete)
+        self._reconciler.reconciliation_error.connect(self._on_reconcile_error)
+
+        last_actual = actual_data_manager.get_last_bar(self.table_name)
+        if last_actual:
+            anchor_date = last_actual["date"]
+            anchor_time = last_actual["time"]
+        else:
+            from k2_quant.utilities.data.db_manager import db_manager as _db
+            last_model_bar = _db.get_last_bar(self.table_name)
+            if last_model_bar:
+                anchor_date = last_model_bar[0]
+                anchor_time = last_model_bar[1]
+            else:
+                anchor_date = dt_date.today()
+                anchor_time = dt_time(9, 30)
+
+        if isinstance(anchor_date, str):
+            anchor_date = datetime.strptime(anchor_date, "%Y-%m-%d").date()
+        if isinstance(anchor_time, str):
+            anchor_time = datetime.strptime(anchor_time[:8], "%H:%M:%S").time()
+
+        self._is_streaming = True
+        self.stream_status_changed.emit("Reconciling …")
+
+        self._reconciler.reconcile(
+            symbol=symbol,
+            timespan=timespan,
+            frequency=frequency,
+            last_bar_date=anchor_date,
+            last_bar_time=anchor_time,
+            market_hours_only=self.current_metadata.get('market_hours_only', False),
+        )
+
+    def _stop_streaming(self):
+        self._is_streaming = False
+        symbol = self.current_metadata.get('symbol', '').upper()
+
+        if self._aggregator:
+            self._aggregator.flush()
+            try:
+                self._aggregator.bar_updated.disconnect(self._on_bar_updated)
+                self._aggregator.bar_completed.disconnect(self._on_bar_completed)
+            except TypeError:
+                pass
+            self._aggregator = None
+
+        try:
+            polygon_ws_manager.bar_received.disconnect(self._on_ws_bar)
+        except TypeError:
+            pass
+        if symbol:
+            polygon_ws_manager.unsubscribe(symbol)
+
+        self.stream_status_changed.emit("Stopped")
+        k2_logger.info(f"Streaming stopped: {self.table_name}", "STREAM")
+
+    def _on_reconcile_progress(self, done: int, total: int):
+        self.stream_status_changed.emit(f"Backfilling {done}/{total} …")
+
+    def _on_reconcile_complete(self, bars: list):
+        if bars:
+            actual_data_manager.insert_bars(self.table_name, bars)
+            all_bars = actual_data_manager.get_all_bars(self.table_name)
+            self.actual_data_widget.load_bars(all_bars)
+            self._update_chart_actual_series()
+
+        if self._is_streaming:
+            symbol = self.current_metadata.get('symbol', '').upper()
+            polygon_ws_manager.bar_received.connect(self._on_ws_bar)
+            polygon_ws_manager.subscribe(symbol)
+            polygon_ws_manager.start()
+            self.stream_status_changed.emit("● Live")
+
+        k2_logger.info(
+            f"Reconciliation done for {self.table_name}: {len(bars)} bars backfilled",
+            "STREAM",
+        )
+
+    def _on_reconcile_error(self, msg: str):
+        self.stream_status_changed.emit(f"Error: {msg}")
+        k2_logger.error(f"Reconciliation error: {msg}", "STREAM")
+        if self._is_streaming:
+            symbol = self.current_metadata.get('symbol', '').upper()
+            polygon_ws_manager.bar_received.connect(self._on_ws_bar)
+            polygon_ws_manager.subscribe(symbol)
+            polygon_ws_manager.start()
+            self.stream_status_changed.emit("● Live (backfill failed)")
+
+    def _on_ws_bar(self, ws_bar: dict):
+        """Route raw Polygon WS bar to this window's aggregator."""
+        sym = (ws_bar.get("sym") or "").upper()
+        expected = self.current_metadata.get('symbol', '').upper()
+        if sym != expected:
+            return
+        if self._aggregator:
+            self._aggregator.ingest(ws_bar)
+
+    def _on_bar_updated(self, bar: dict):
+        """Partial / forming bar — update UI in real-time."""
+        self.actual_data_widget.update_forming_bar(bar)
+        self._update_chart_forming_candle(bar)
+
+    def _on_bar_completed(self, bar: dict):
+        """Fully aggregated bar — persist and append to table + chart."""
+        dt_now = datetime.now()
+        import pytz
+        et = pytz.timezone("US/Eastern")
+        market_dt = datetime.now(et).replace(tzinfo=None)
+
+        bar["date"] = market_dt.date()
+        bar["time"] = market_dt.time()
+        bar["timestamp_ms"] = bar.get("start_ts", int(market_dt.timestamp() * 1000))
+
+        actual_data_manager.insert_bar(self.table_name, bar)
+        self.actual_data_widget.append_completed_bar(bar)
+        self._update_chart_actual_series()
+
+    def _update_chart_actual_series(self):
+        """Refresh the actual-data overlay lines on the chart."""
+        import pyqtgraph as pg
+
+        bars = actual_data_manager.get_all_bars(self.table_name)
+        if not bars or self.chart_widget.data is None or len(self.chart_widget.data) == 0:
+            return
+
+        base_x = len(self.chart_widget.data)
+        n = len(bars)
+
+        ohlc_map = {
+            "actual_close": (5, "#00e676"),  # green
+        }
+
+        for key, (col_idx, color) in ohlc_map.items():
+            old_item = self._actual_lines.pop(key, None)
+            if old_item and old_item.scene():
+                self.chart_widget.main_plot.removeItem(old_item)
+
+            y_vals = np.array(
+                [float(b[col_idx]) if b[col_idx] is not None else np.nan for b in bars],
+                dtype=np.float64,
+            )
+            x_vals = np.arange(base_x, base_x + n, dtype=np.float64)
+
+            if 'Close' in self.chart_widget.data.columns:
+                last_close = self.chart_widget.data['Close'].dropna()
+                if len(last_close) > 0:
+                    anchor_y = float(last_close.iloc[-1])
+                    x_vals = np.insert(x_vals, 0, base_x - 1)
+                    y_vals = np.insert(y_vals, 0, anchor_y)
+
+            plot_item = pg.PlotDataItem(
+                x=x_vals, y=y_vals,
+                pen=pg.mkPen(color=color, width=2),
+                connect='finite',
+            )
+            self.chart_widget.main_plot.addItem(plot_item)
+            self._actual_lines[key] = plot_item
+
+    def _update_chart_forming_candle(self, bar: dict):
+        """Update a transient marker for the in-progress bar."""
+        import pyqtgraph as pg
+
+        if self.chart_widget.data is None or len(self.chart_widget.data) == 0:
+            return
+
+        bars = actual_data_manager.get_all_bars(self.table_name)
+        base_x = len(self.chart_widget.data) + len(bars)
+
+        old = self._actual_lines.pop("_forming", None)
+        if old and old.scene():
+            self.chart_widget.main_plot.removeItem(old)
+
+        close_val = bar.get("close")
+        if close_val is None:
+            return
+
+        dot = pg.ScatterPlotItem(
+            x=[float(base_x)], y=[float(close_val)],
+            size=8, brush=pg.mkBrush("#00e676"), pen=pg.mkPen(None),
+            symbol='o',
+        )
+        self.chart_widget.main_plot.addItem(dot)
+        self._actual_lines["_forming"] = dot
+
     # ── Persistence helpers ───────────────────────────────────────
 
     def _persist_tab_data(self):
@@ -683,6 +1020,19 @@ class StreamWindowWidget(QWidget):
     def cleanup(self):
         """Release resources."""
         try:
+            if self._is_streaming:
+                try:
+                    self._stop_streaming()
+                except Exception:
+                    pass
+            if self._reconciler:
+                self._reconciler.cancel()
+
+            for key, item in self._actual_lines.items():
+                if item and item.scene():
+                    self.chart_widget.main_plot.removeItem(item)
+            self._actual_lines.clear()
+
             self.persist_state()
             self.thinkspace.cleanup()
             if hasattr(self.chart_widget, 'cleanup'):

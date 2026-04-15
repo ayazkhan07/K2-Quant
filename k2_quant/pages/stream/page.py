@@ -138,24 +138,46 @@ class StreamTitleBar(QWidget):
     """Custom title bar for stream MDI sub-windows.
 
     Black background, right-aligned white model name,
-    red square close button, white square maximize/restore button.
+    stream toggle button, red square close button, white square maximize/restore button.
     Supports click-and-drag to move the parent QMdiSubWindow.
     """
 
     close_requested = pyqtSignal()
     maximize_requested = pyqtSignal()
+    stream_toggled = pyqtSignal(bool)  # True = start, False = stop
 
     def __init__(self, title: str, mdi_subwindow: QMdiSubWindow = None, parent=None):
         super().__init__(parent)
         self._mdi_sub = mdi_subwindow
         self._drag_pos = None
+        self._streaming = False
         self.setFixedHeight(28)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
 
         layout = QHBoxLayout()
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(4, 0, 0, 0)
         layout.setSpacing(4)
         self.setLayout(layout)
+
+        # Stream toggle button
+        self._stream_btn = QPushButton("▶ Stream")
+        self._stream_btn.setFixedHeight(20)
+        self._stream_btn.setCursor(Qt.CursorShape.ArrowCursor)
+        self._stream_btn.setStyleSheet(
+            "QPushButton { background: #1a2a1a; color: #4a4; border: 1px solid #2a3a2a; "
+            "border-radius: 3px; padding: 0 8px; font-size: 10px; font-weight: 600; }"
+            "QPushButton:hover { background: #2a3a2a; color: #6c6; }"
+        )
+        self._stream_btn.setToolTip("Start live data streaming")
+        self._stream_btn.clicked.connect(self._on_stream_clicked)
+        layout.addWidget(self._stream_btn)
+
+        # Stream status indicator
+        self._stream_status = QLabel("")
+        self._stream_status.setStyleSheet(
+            "color: #666; font-size: 10px; background: transparent;"
+        )
+        layout.addWidget(self._stream_status)
 
         layout.addStretch()
 
@@ -189,6 +211,36 @@ class StreamTitleBar(QWidget):
         layout.addWidget(self._close_btn)
 
         self.setStyleSheet("StreamTitleBar { background-color: #000000; }")
+
+    def _on_stream_clicked(self):
+        self._streaming = not self._streaming
+        self.stream_toggled.emit(self._streaming)
+        self._update_stream_appearance()
+
+    def _update_stream_appearance(self):
+        if self._streaming:
+            self._stream_btn.setText("■ Stop")
+            self._stream_btn.setStyleSheet(
+                "QPushButton { background: #2a1a1a; color: #f44; border: 1px solid #3a2a2a; "
+                "border-radius: 3px; padding: 0 8px; font-size: 10px; font-weight: 600; }"
+                "QPushButton:hover { background: #3a2a2a; color: #f66; }"
+            )
+            self._stream_btn.setToolTip("Stop live data streaming")
+        else:
+            self._stream_btn.setText("▶ Stream")
+            self._stream_btn.setStyleSheet(
+                "QPushButton { background: #1a2a1a; color: #4a4; border: 1px solid #2a3a2a; "
+                "border-radius: 3px; padding: 0 8px; font-size: 10px; font-weight: 600; }"
+                "QPushButton:hover { background: #2a3a2a; color: #6c6; }"
+            )
+            self._stream_btn.setToolTip("Start live data streaming")
+
+    def set_stream_status(self, text: str):
+        self._stream_status.setText(text)
+
+    def set_streaming(self, streaming: bool):
+        self._streaming = streaming
+        self._update_stream_appearance()
 
     def set_mdi_subwindow(self, sub: QMdiSubWindow):
         self._mdi_sub = sub
@@ -403,9 +455,13 @@ class StreamPageWidget(QWidget):
 
         title_bar.close_requested.connect(lambda tn=table_name: self._request_close(tn))
         title_bar.maximize_requested.connect(lambda s=sub: self._toggle_maximize(s))
+        title_bar.stream_toggled.connect(content.toggle_streaming)
+        content.stream_status_changed.connect(title_bar.set_stream_status)
+        content.stream_rejected.connect(lambda tb=title_bar: tb.set_streaming(False))
 
-        # Store the actual content widget on the sub for easy retrieval
+        # Store the actual content widget and title bar on the sub for easy retrieval
         sub._stream_content = content
+        sub._title_bar = title_bar
 
         self.mdi_area.addSubWindow(sub)
         sub.show()
