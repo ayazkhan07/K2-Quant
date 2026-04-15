@@ -90,6 +90,9 @@ class StreamWindowWidget(QWidget):
         self.outputs_panel = OutputsPanel()
 
         self.data_tabs = DataTabsWidget()
+        # Show only the Forecast Data content — hide the internal sub-tab bar
+        self.data_tabs.tab_widget.tabBar().setVisible(False)
+        self.data_tabs.tab_widget.setCurrentIndex(1)
 
         self.bottom_tabs.addTab(self.thinkspace, "THINKSPACE")
         self.bottom_tabs.addTab(self.outputs_panel, "OUTPUTS")
@@ -688,6 +691,10 @@ class StreamWindowWidget(QWidget):
             k2_logger.error(f"Stream window cleanup error: {e}", "STREAM")
 
     def apply_styling(self):
+        self.setObjectName("streamWindowContent")
         self.setStyleSheet("""
-            QWidget { background-color: #0a0a0a; color: #ffffff; }
+            #streamWindowContent {
+                background-color: #0a0a0a;
+                color: #ffffff;
+            }
         """)

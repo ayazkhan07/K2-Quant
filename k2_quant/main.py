@@ -229,6 +229,16 @@ class MainWindow(QMainWindow):
                 analysis_count = len(session_tabs)
 
         # --- Restore stream tabs ---
+        # One-time migration: wipe stale stream sessions saved before the title-bar fix
+        if not settings.value("session/_stream_titlebar_migrated"):
+            settings.remove("session/stream_tabs")
+            settings.setValue("session/_stream_titlebar_migrated", True)
+            if 0 in self.stream_tabs:
+                try:
+                    self.stream_tabs[0].reset_after_database_cleared()
+                    self.stream_tabs[0]._load_left_pane_data()
+                except Exception:
+                    pass
         raw_stream = settings.value("session/stream_tabs", "")
         stream_count = 0
         if raw_stream:

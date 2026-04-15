@@ -19,10 +19,10 @@ from typing import Dict, Optional
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QLabel,
-    QMdiArea, QMdiSubWindow, QMessageBox,
+    QMdiArea, QMdiSubWindow, QMessageBox, QPushButton,
 )
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QFont
+from PyQt6.QtCore import Qt, pyqtSignal, QRect, QPoint, QSize
+from PyQt6.QtGui import QFont, QCursor
 
 from k2_quant.utilities.logger import k2_logger
 from k2_quant.utilities.data.saved_models_manager import saved_models_manager
@@ -30,6 +30,203 @@ from k2_quant.utilities.services.strategy_service import strategy_service
 
 from k2_quant.pages.analysis.components.left_pane import LeftPaneWidget
 from k2_quant.pages.stream.components.stream_window import StreamWindowWidget
+
+
+_EDGE = 6  # pixel margin for resize detection
+
+
+class ResizableSubWindow(QMdiSubWindow):
+    """Frameless QMdiSubWindow with edge/corner resize handles."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._resize_edge = None
+        self._resize_origin = None
+        self._resize_geo = None
+        self.setMouseTracking(True)
+        self.setMinimumSize(200, 150)
+
+    def _hit_edge(self, pos: QPoint) -> str:
+        """Return edge/corner identifier based on local position."""
+        r = self.rect()
+        e = _EDGE
+        left = pos.x() < e
+        right = pos.x() > r.width() - e
+        top = pos.y() < e
+        bottom = pos.y() > r.height() - e
+        if top and left:
+            return 'tl'
+        if top and right:
+            return 'tr'
+        if bottom and left:
+            return 'bl'
+        if bottom and right:
+            return 'br'
+        if left:
+            return 'l'
+        if right:
+            return 'r'
+        if top:
+            return 't'
+        if bottom:
+            return 'b'
+        return ''
+
+    _CURSOR_MAP = {
+        'l': Qt.CursorShape.SizeHorCursor,
+        'r': Qt.CursorShape.SizeHorCursor,
+        't': Qt.CursorShape.SizeVerCursor,
+        'b': Qt.CursorShape.SizeVerCursor,
+        'tl': Qt.CursorShape.SizeFDiagCursor,
+        'br': Qt.CursorShape.SizeFDiagCursor,
+        'tr': Qt.CursorShape.SizeBDiagCursor,
+        'bl': Qt.CursorShape.SizeBDiagCursor,
+    }
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            edge = self._hit_edge(event.position().toPoint())
+            if edge:
+                self._resize_edge = edge
+                self._resize_origin = event.globalPosition().toPoint()
+                self._resize_geo = self.geometry()
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._resize_edge and self._resize_origin:
+            delta = event.globalPosition().toPoint() - self._resize_origin
+            geo = QRect(self._resize_geo)
+            mn = self.minimumSize()
+            e = self._resize_edge
+
+            if 'r' in e:
+                geo.setRight(geo.right() + delta.x())
+            if 'b' in e:
+                geo.setBottom(geo.bottom() + delta.y())
+            if 'l' in e:
+                geo.setLeft(geo.left() + delta.x())
+            if 't' in e:
+                geo.setTop(geo.top() + delta.y())
+
+            if geo.width() >= mn.width() and geo.height() >= mn.height():
+                self.setGeometry(geo)
+            event.accept()
+            return
+
+        edge = self._hit_edge(event.position().toPoint())
+        cursor = self._CURSOR_MAP.get(edge)
+        if cursor:
+            self.setCursor(cursor)
+        else:
+            self.unsetCursor()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._resize_edge:
+            self._resize_edge = None
+            self._resize_origin = None
+            self._resize_geo = None
+            self.unsetCursor()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
+class StreamTitleBar(QWidget):
+    """Custom title bar for stream MDI sub-windows.
+
+    Black background, right-aligned white model name,
+    red square close button, white square maximize/restore button.
+    Supports click-and-drag to move the parent QMdiSubWindow.
+    """
+
+    close_requested = pyqtSignal()
+    maximize_requested = pyqtSignal()
+
+    def __init__(self, title: str, mdi_subwindow: QMdiSubWindow = None, parent=None):
+        super().__init__(parent)
+        self._mdi_sub = mdi_subwindow
+        self._drag_pos = None
+        self.setFixedHeight(28)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        self.setLayout(layout)
+
+        layout.addStretch()
+
+        self._title_label = QLabel(title)
+        self._title_label.setStyleSheet(
+            "color: #ffffff; font-size: 12px; font-weight: 600; "
+            "letter-spacing: 1px; background: transparent; padding-right: 8px;"
+        )
+        layout.addWidget(self._title_label)
+
+        self._max_btn = QPushButton()
+        self._max_btn.setFixedSize(18, 18)
+        self._max_btn.setCursor(Qt.CursorShape.ArrowCursor)
+        self._max_btn.setStyleSheet(
+            "QPushButton { background-color: #ffffff; border: none; }"
+            "QPushButton:hover { background-color: #cccccc; }"
+        )
+        self._max_btn.setToolTip("Maximize / Restore")
+        self._max_btn.clicked.connect(self.maximize_requested.emit)
+        layout.addWidget(self._max_btn)
+
+        self._close_btn = QPushButton()
+        self._close_btn.setFixedSize(18, 18)
+        self._close_btn.setCursor(Qt.CursorShape.ArrowCursor)
+        self._close_btn.setStyleSheet(
+            "QPushButton { background-color: #ff4444; border: none; }"
+            "QPushButton:hover { background-color: #cc0000; }"
+        )
+        self._close_btn.setToolTip("Close")
+        self._close_btn.clicked.connect(self.close_requested.emit)
+        layout.addWidget(self._close_btn)
+
+        self.setStyleSheet("StreamTitleBar { background-color: #000000; }")
+
+    def set_mdi_subwindow(self, sub: QMdiSubWindow):
+        self._mdi_sub = sub
+
+    def set_title(self, title: str):
+        self._title_label.setText(title)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._mdi_sub:
+            self._drag_pos = event.globalPosition().toPoint()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_pos is not None and self._mdi_sub:
+            delta = event.globalPosition().toPoint() - self._drag_pos
+            self._mdi_sub.move(self._mdi_sub.pos() + delta)
+            self._drag_pos = event.globalPosition().toPoint()
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_pos = None
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.maximize_requested.emit()
+            event.accept()
+        else:
+            super().mouseDoubleClickEvent(event)
 
 
 class StreamPageWidget(QWidget):
@@ -76,10 +273,9 @@ class StreamPageWidget(QWidget):
         self.mdi_area.setBackground(Qt.GlobalColor.black)
         self.mdi_area.setStyleSheet("""
             QMdiArea { background: #0a0a0a; border: none; }
-            QMdiSubWindow { background: #0f0f0f; border: 1px solid #2a2a2a; }
-            QMdiSubWindow::title {
-                background: #1a1a1a; color: #ccc;
-                padding: 4px 8px; font-size: 12px;
+            QMdiSubWindow {
+                background: #0f0f0f;
+                border: 1px solid #2a2a2a;
             }
         """)
         self.mdi_area.subWindowActivated.connect(self._on_subwindow_activated)
@@ -177,23 +373,39 @@ class StreamPageWidget(QWidget):
         content = StreamWindowWidget(table_name)
         content.apply_styling()
 
-        sub = QMdiSubWindow()
-        sub.setWidget(content)
-        sub.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
-
         display_name = table_name
         parts = table_name.split('_')
         if len(parts) > 1:
             display_name = parts[1].upper()
 
+        # Wrap content in a container: custom title bar + stream window
+        container = QWidget()
+        container_layout = QVBoxLayout()
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(0)
+        container.setLayout(container_layout)
+
+        sub = ResizableSubWindow()
+
+        title_bar = StreamTitleBar(display_name, mdi_subwindow=sub)
+        container_layout.addWidget(title_bar)
+        container_layout.addWidget(content)
+
+        sub.setWidget(container)
+        sub.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
         sub.setWindowTitle(display_name)
 
-        # Remove minimize button, keep maximize + close
-        sub.setWindowFlags(
-            Qt.WindowType.SubWindow
-            | Qt.WindowType.WindowMaximizeButtonHint
-            | Qt.WindowType.WindowCloseButtonHint
-        )
+        # Hide the native title bar
+        empty_bar = QWidget()
+        empty_bar.setFixedHeight(0)
+        sub.layout().insertWidget(0, empty_bar)
+        sub.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+
+        title_bar.close_requested.connect(lambda tn=table_name: self._request_close(tn))
+        title_bar.maximize_requested.connect(lambda s=sub: self._toggle_maximize(s))
+
+        # Store the actual content widget on the sub for easy retrieval
+        sub._stream_content = content
 
         self.mdi_area.addSubWindow(sub)
         sub.show()
@@ -232,12 +444,32 @@ class StreamPageWidget(QWidget):
 
         return super().eventFilter(obj, event)
 
+    def _request_close(self, table_name: str):
+        """Close button clicked on custom title bar — show confirmation."""
+        reply = QMessageBox.question(
+            self, "Close Window",
+            f"Close the window for {table_name}?\n\n"
+            "All unsaved state for this window will be lost.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._close_window(table_name)
+
+    def _toggle_maximize(self, sub: QMdiSubWindow):
+        """Maximize button clicked — toggle between maximized and tiled."""
+        if sub.isMaximized():
+            sub.showNormal()
+            self.mdi_area.tileSubWindows()
+        else:
+            sub.showMaximized()
+
     def _close_window(self, table_name: str, from_event: bool = False):
         sub = self._windows.pop(table_name, None)
         if sub is None:
             return
 
-        content: StreamWindowWidget = sub.widget()
+        content: StreamWindowWidget = self._content_of(sub)
         if content:
             content.cleanup()
 
@@ -281,7 +513,7 @@ class StreamPageWidget(QWidget):
         sub = self._windows.get(table_name)
         if sub is None:
             return
-        content: StreamWindowWidget = sub.widget()
+        content: StreamWindowWidget = self._content_of(sub)
         if content is None:
             return
 
@@ -315,9 +547,14 @@ class StreamPageWidget(QWidget):
 
     # ── Strategy / indicator routing to active window ─────────────
 
+    @staticmethod
+    def _content_of(sub: QMdiSubWindow) -> Optional['StreamWindowWidget']:
+        """Get the StreamWindowWidget from a sub-window (may be wrapped in a container)."""
+        return getattr(sub, '_stream_content', None) or sub.widget()
+
     def _get_active_content(self) -> Optional[StreamWindowWidget]:
         if self._active_table and self._active_table in self._windows:
-            return self._windows[self._active_table].widget()
+            return self._content_of(self._windows[self._active_table])
         return None
 
     def _on_indicator_toggled(self, indicator_name: str, enabled: bool):
@@ -352,7 +589,7 @@ class StreamPageWidget(QWidget):
             k2_logger.error(f"Strategy delete failed for {name!r}", "STREAM")
 
         for table_name, sub in list(self._windows.items()):
-            content: StreamWindowWidget = sub.widget()
+            content: StreamWindowWidget = self._content_of(sub)
             if content:
                 content.remove_strategy(name)
                 content.applied_strategies.discard(name)
@@ -413,7 +650,7 @@ class StreamPageWidget(QWidget):
         for table_name in list(self._windows.keys()):
             sub = self._windows.get(table_name)
             if sub:
-                content: StreamWindowWidget = sub.widget()
+                content: StreamWindowWidget = self._content_of(sub)
                 if content:
                     content.cleanup()
 
@@ -423,7 +660,7 @@ class StreamPageWidget(QWidget):
     def reset_after_database_cleared(self):
         for table_name in list(self._windows.keys()):
             sub = self._windows.pop(table_name)
-            content: StreamWindowWidget = sub.widget()
+            content: StreamWindowWidget = self._content_of(sub)
             if content:
                 content.cleanup()
             sub.removeEventFilter(self)
@@ -442,16 +679,20 @@ class StreamPageWidget(QWidget):
 
     def _setup_styling(self):
         self.setStyleSheet("""
-            QWidget {
-                background-color: #0a0a0a;
-                color: #ffffff;
-            }
             #streamHeader {
                 background-color: #0f0f0f;
                 border-bottom: 1px solid #1a1a1a;
             }
+            #streamHeader QLabel {
+                color: #999;
+                background: transparent;
+            }
             #streamStatusBar {
                 background-color: #0f0f0f;
                 border-top: 1px solid #1a1a1a;
+            }
+            #streamStatusBar QLabel {
+                color: #666;
+                background: transparent;
             }
         """)
