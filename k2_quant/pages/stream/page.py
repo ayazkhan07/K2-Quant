@@ -1,0 +1,457 @@
+"""
+K2 Quant Stream Page — Multi-window model viewer.
+
+Layout:
+  Fixed left pane (Saved Models, Strategies, Technical Indicators)
+  QMdiArea filling the rest — each model opens in a tiled sub-window.
+
+Behavioral rules:
+  * One window per model (re-click raises existing).
+  * Strategies / TI apply only to the focused window.
+  * Left pane checkboxes sync to the focused window's state.
+  * Auto-tile on every open / close.
+  * Close requires confirmation.
+  * Session state persists across restart.
+"""
+
+import json
+from typing import Dict, Optional
+
+from PyQt6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QLabel,
+    QMdiArea, QMdiSubWindow, QMessageBox,
+)
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QFont
+
+from k2_quant.utilities.logger import k2_logger
+from k2_quant.utilities.data.saved_models_manager import saved_models_manager
+from k2_quant.utilities.services.strategy_service import strategy_service
+
+from k2_quant.pages.analysis.components.left_pane import LeftPaneWidget
+from k2_quant.pages.stream.components.stream_window import StreamWindowWidget
+
+
+class StreamPageWidget(QWidget):
+    """Stream page — left pane + MDI area with floating model windows."""
+
+    back_to_stock_fetcher = pyqtSignal()
+
+    def __init__(self, tab_id: int = 0, parent=None):
+        super().__init__(parent)
+        self.tab_id = tab_id
+
+        # {table_name: QMdiSubWindow}
+        self._windows: Dict[str, QMdiSubWindow] = {}
+        self._active_table: Optional[str] = None
+
+        self._init_ui()
+        self._setup_styling()
+        self._load_left_pane_data()
+
+        k2_logger.info(f"Stream page initialized (Tab ID: {tab_id})", "STREAM")
+
+    # ── UI construction ───────────────────────────────────────────
+
+    def _init_ui(self):
+        root = QVBoxLayout()
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        self.setLayout(root)
+
+        # Header
+        self._create_header(root)
+
+        # Body: left pane + MDI area
+        body = QSplitter(Qt.Orientation.Horizontal)
+        body.setHandleWidth(1)
+        body.setStyleSheet("QSplitter::handle { background-color: #1a1a1a; }")
+
+        self.left_pane = LeftPaneWidget()
+        body.addWidget(self.left_pane)
+
+        self.mdi_area = QMdiArea()
+        self.mdi_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.mdi_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.mdi_area.setBackground(Qt.GlobalColor.black)
+        self.mdi_area.setStyleSheet("""
+            QMdiArea { background: #0a0a0a; border: none; }
+            QMdiSubWindow { background: #0f0f0f; border: 1px solid #2a2a2a; }
+            QMdiSubWindow::title {
+                background: #1a1a1a; color: #ccc;
+                padding: 4px 8px; font-size: 12px;
+            }
+        """)
+        self.mdi_area.subWindowActivated.connect(self._on_subwindow_activated)
+        body.addWidget(self.mdi_area)
+
+        body.setStretchFactor(0, 0)
+        body.setStretchFactor(1, 1)
+        body.setSizes([280, 1100])
+
+        root.addWidget(body)
+
+        # Status bar
+        self._status_widget = self._create_status_bar()
+        root.addWidget(self._status_widget)
+
+        # Wire left pane signals
+        self.left_pane.model_selected.connect(self._on_model_selected)
+        self.left_pane.strategy_toggled.connect(self._on_strategy_toggled)
+        self.left_pane.strategy_deleted.connect(self._on_strategy_deleted)
+        self.left_pane.indicator_toggled.connect(self._on_indicator_toggled)
+
+    def _create_header(self, parent_layout):
+        header = QWidget()
+        header.setFixedHeight(40)
+        header.setObjectName("streamHeader")
+        hl = QHBoxLayout()
+        hl.setContentsMargins(20, 0, 20, 0)
+        header.setLayout(hl)
+
+        title = QLabel(f"K2 QUANT - STREAM (Tab {self.tab_id})")
+        title.setFont(QFont("Arial", 14))
+        title.setStyleSheet("color: #999; letter-spacing: 1px;")
+        hl.addWidget(title)
+        hl.addStretch()
+
+        parent_layout.addWidget(header)
+
+    def _create_status_bar(self) -> QWidget:
+        widget = QWidget()
+        widget.setFixedHeight(32)
+        widget.setObjectName("streamStatusBar")
+        layout = QHBoxLayout()
+        layout.setContentsMargins(10, 0, 10, 0)
+        widget.setLayout(layout)
+
+        indicator = QLabel("●")
+        indicator.setStyleSheet("color: #4a4; font-size: 8px;")
+        layout.addWidget(indicator)
+
+        self._model_label = QLabel("No windows open")
+        self._model_label.setStyleSheet("color: #666; font-size: 11px;")
+        layout.addWidget(self._model_label)
+
+        layout.addStretch()
+
+        self._status_label = QLabel("Ready")
+        self._status_label.setStyleSheet("color: #666; font-size: 11px;")
+        layout.addWidget(self._status_label)
+
+        return widget
+
+    # ── Left pane data ────────────────────────────────────────────
+
+    def _load_left_pane_data(self):
+        try:
+            models = saved_models_manager.get_saved_models()
+            self.left_pane.populate_models(models)
+            try:
+                strategies = strategy_service.get_all_strategies()
+                self.left_pane.populate_strategies(strategies)
+            except Exception:
+                self.left_pane.populate_strategies([])
+        except Exception as e:
+            k2_logger.error(f"Stream left pane load failed: {e}", "STREAM")
+
+    def refresh_models(self):
+        self.left_pane.refresh_models()
+
+    def load_saved_models(self):
+        self.left_pane.refresh_models()
+
+    # ── Model selection → window management ───────────────────────
+
+    def _on_model_selected(self, table_name: str):
+        if table_name in self._windows:
+            sub = self._windows[table_name]
+            self.mdi_area.setActiveSubWindow(sub)
+            sub.showNormal()
+            self._sync_left_pane(table_name)
+            return
+
+        self._open_window(table_name)
+
+    def _open_window(self, table_name: str):
+        content = StreamWindowWidget(table_name)
+        content.apply_styling()
+
+        sub = QMdiSubWindow()
+        sub.setWidget(content)
+        sub.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+
+        display_name = table_name
+        parts = table_name.split('_')
+        if len(parts) > 1:
+            display_name = parts[1].upper()
+
+        sub.setWindowTitle(display_name)
+
+        # Remove minimize button, keep maximize + close
+        sub.setWindowFlags(
+            Qt.WindowType.SubWindow
+            | Qt.WindowType.WindowMaximizeButtonHint
+            | Qt.WindowType.WindowCloseButtonHint
+        )
+
+        self.mdi_area.addSubWindow(sub)
+        sub.show()
+
+        self._windows[table_name] = sub
+
+        sub.installEventFilter(self)
+
+        self.mdi_area.tileSubWindows()
+
+        self._active_table = table_name
+        self._sync_left_pane(table_name)
+        self._update_status()
+
+        k2_logger.info(f"Stream window opened: {table_name}", "STREAM")
+
+    def eventFilter(self, obj, event):
+        """Intercept sub-window close to ask for confirmation."""
+        if isinstance(obj, QMdiSubWindow) and event.type() == event.Type.Close:
+            table_name = self._table_name_for_sub(obj)
+            if table_name:
+                reply = QMessageBox.question(
+                    self, "Close Window",
+                    f"Close the window for {table_name}?\n\n"
+                    "All unsaved state for this window will be lost.",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    event.ignore()
+                    return True
+
+                self._close_window(table_name, from_event=True)
+                event.ignore()
+                return True
+
+        return super().eventFilter(obj, event)
+
+    def _close_window(self, table_name: str, from_event: bool = False):
+        sub = self._windows.pop(table_name, None)
+        if sub is None:
+            return
+
+        content: StreamWindowWidget = sub.widget()
+        if content:
+            content.cleanup()
+
+        sub.removeEventFilter(self)
+        self.mdi_area.removeSubWindow(sub)
+        sub.deleteLater()
+
+        self.mdi_area.tileSubWindows()
+
+        if self._active_table == table_name:
+            active = self.mdi_area.activeSubWindow()
+            self._active_table = self._table_name_for_sub(active) if active else None
+            if self._active_table:
+                self._sync_left_pane(self._active_table)
+            else:
+                self.left_pane.clear_all_indicators()
+                self.left_pane.clear_all_strategies()
+
+        self._update_status()
+        k2_logger.info(f"Stream window closed: {table_name}", "STREAM")
+
+    def _table_name_for_sub(self, sub: Optional[QMdiSubWindow]) -> Optional[str]:
+        if sub is None:
+            return None
+        for tname, s in self._windows.items():
+            if s is sub:
+                return tname
+        return None
+
+    # ── Focus tracking & left pane sync ───────────────────────────
+
+    def _on_subwindow_activated(self, sub: Optional[QMdiSubWindow]):
+        table_name = self._table_name_for_sub(sub)
+        if table_name and table_name != self._active_table:
+            self._active_table = table_name
+            self._sync_left_pane(table_name)
+            self._update_status()
+
+    def _sync_left_pane(self, table_name: str):
+        """Update strategy/indicator checkboxes to reflect the focused window's state."""
+        sub = self._windows.get(table_name)
+        if sub is None:
+            return
+        content: StreamWindowWidget = sub.widget()
+        if content is None:
+            return
+
+        # Sync indicators
+        self.left_pane.clear_all_indicators()
+        active_inds = content.get_applied_indicators()
+        for i in range(self.left_pane.indicator_layout.count()):
+            widget = self.left_pane.indicator_layout.itemAt(i).widget()
+            if widget is None:
+                continue
+            from PyQt6.QtWidgets import QCheckBox
+            if isinstance(widget, QCheckBox) and widget.text() in active_inds:
+                widget.blockSignals(True)
+                widget.setChecked(True)
+                widget.blockSignals(False)
+                self.left_pane.active_indicators.add(widget.text())
+
+        # Sync strategies
+        self.left_pane.clear_all_strategies()
+        active_strats = content.get_applied_strategies()
+        for i in range(self.left_pane.strategy_layout.count()):
+            widget = self.left_pane.strategy_layout.itemAt(i).widget()
+            if widget is None:
+                continue
+            from PyQt6.QtWidgets import QCheckBox
+            if isinstance(widget, QCheckBox) and widget.text() in active_strats:
+                widget.blockSignals(True)
+                widget.setChecked(True)
+                widget.blockSignals(False)
+                self.left_pane.active_strategies.add(widget.text())
+
+    # ── Strategy / indicator routing to active window ─────────────
+
+    def _get_active_content(self) -> Optional[StreamWindowWidget]:
+        if self._active_table and self._active_table in self._windows:
+            return self._windows[self._active_table].widget()
+        return None
+
+    def _on_indicator_toggled(self, indicator_name: str, enabled: bool):
+        content = self._get_active_content()
+        if content is None:
+            k2_logger.warning("No active stream window for indicator toggle", "STREAM")
+            return
+
+        if enabled:
+            params = StreamWindowWidget.extract_default_indicator_params(indicator_name)
+            content.apply_indicator(indicator_name, params)
+        else:
+            content.remove_indicator(indicator_name)
+
+    def _on_strategy_toggled(self, strategy_name: str, enabled: bool):
+        content = self._get_active_content()
+        if content is None:
+            k2_logger.warning("No active stream window for strategy toggle", "STREAM")
+            return
+
+        if enabled:
+            content.apply_strategy(strategy_name)
+        else:
+            content.remove_strategy(strategy_name)
+
+    def _on_strategy_deleted(self, name: str):
+        name = (name or "").strip()
+        if not name:
+            return
+        ok = strategy_service.delete_strategy(name)
+        if not ok:
+            k2_logger.error(f"Strategy delete failed for {name!r}", "STREAM")
+
+        for table_name, sub in list(self._windows.items()):
+            content: StreamWindowWidget = sub.widget()
+            if content:
+                content.remove_strategy(name)
+                content.applied_strategies.discard(name)
+                content.outputs_panel.handle_strategy_deleted(name)
+
+        self._load_left_pane_data()
+
+    def _update_status(self):
+        n = len(self._windows)
+        if n == 0:
+            self._model_label.setText("No windows open")
+        elif self._active_table:
+            self._model_label.setText(
+                f"Active: {self._active_table} | {n} window{'s' if n != 1 else ''}")
+        else:
+            self._model_label.setText(f"{n} window{'s' if n != 1 else ''}")
+
+    # ── Session persistence ───────────────────────────────────────
+
+    def get_session_state(self) -> dict:
+        """Return serializable state for QSettings persistence."""
+        windows = []
+        for table_name, sub in self._windows.items():
+            geo = sub.geometry()
+            windows.append({
+                'table_name': table_name,
+                'x': geo.x(), 'y': geo.y(),
+                'w': geo.width(), 'h': geo.height(),
+                'maximized': sub.isMaximized(),
+            })
+        return {
+            'tab_id': self.tab_id,
+            'windows': windows,
+            'active': self._active_table or '',
+        }
+
+    def restore_session_state(self, state: dict):
+        """Recreate windows from a saved session."""
+        for win_info in state.get('windows', []):
+            table_name = win_info.get('table_name')
+            if not table_name:
+                continue
+            self._open_window(table_name)
+            sub = self._windows.get(table_name)
+            if sub and win_info.get('maximized'):
+                sub.showMaximized()
+
+        active = state.get('active', '')
+        if active and active in self._windows:
+            self.mdi_area.setActiveSubWindow(self._windows[active])
+            self._active_table = active
+            self._sync_left_pane(active)
+
+    # ── Lifecycle ─────────────────────────────────────────────────
+
+    def cleanup(self):
+        """Persist all windows and release resources."""
+        for table_name in list(self._windows.keys()):
+            sub = self._windows.get(table_name)
+            if sub:
+                content: StreamWindowWidget = sub.widget()
+                if content:
+                    content.cleanup()
+
+        self._windows.clear()
+        k2_logger.info(f"Stream page cleaned up (Tab ID: {self.tab_id})", "STREAM")
+
+    def reset_after_database_cleared(self):
+        for table_name in list(self._windows.keys()):
+            sub = self._windows.pop(table_name)
+            content: StreamWindowWidget = sub.widget()
+            if content:
+                content.cleanup()
+            sub.removeEventFilter(self)
+            self.mdi_area.removeSubWindow(sub)
+            sub.deleteLater()
+
+        self._active_table = None
+        self.left_pane.populate_models([])
+        self.left_pane.clear_all_indicators()
+        self.left_pane.clear_all_strategies()
+        self._model_label.setText("No windows open")
+        self._status_label.setText("Ready")
+        k2_logger.info(f"Stream tab {self.tab_id} reset after DB clear", "STREAM")
+
+    # ── Styling ───────────────────────────────────────────────────
+
+    def _setup_styling(self):
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #0a0a0a;
+                color: #ffffff;
+            }
+            #streamHeader {
+                background-color: #0f0f0f;
+                border-bottom: 1px solid #1a1a1a;
+            }
+            #streamStatusBar {
+                background-color: #0f0f0f;
+                border-top: 1px solid #1a1a1a;
+            }
+        """)

@@ -25,7 +25,8 @@ class TabBarWidget(QWidget):
         super().__init__(parent)
         self.tabs = {}  # {tab_index: (page_type, tab_id, title)}
         self.current_analysis_id = 0
-        self.permanent_tabs = ['stock_fetcher', 'analysis_0']  # Can't be closed
+        self.current_stream_id = 0
+        self.permanent_tabs = ['stock_fetcher_0', 'analysis_0', 'stream_0']  # Can't be closed
         
         self.init_ui()
         self.setup_permanent_tabs()
@@ -94,7 +95,7 @@ class TabBarWidget(QWidget):
         # Add new tab button
         self.new_tab_btn = QPushButton("+")
         self.new_tab_btn.setFixedSize(30, 30)
-        self.new_tab_btn.clicked.connect(self.add_new_analysis_tab)
+        self.new_tab_btn.clicked.connect(self._on_new_tab_clicked)
         self.new_tab_btn.setStyleSheet("""
             QPushButton {
                 background-color: #1a1a1a;
@@ -118,12 +119,17 @@ class TabBarWidget(QWidget):
         # Stock Fetcher tab
         idx = self.tab_bar.addTab("Stock Fetcher")
         self.tabs[idx] = ('stock_fetcher', 0, "Stock Fetcher")
-        self.tab_bar.setTabButton(idx, QTabBar.ButtonPosition.RightSide, None)  # No close button
+        self.tab_bar.setTabButton(idx, QTabBar.ButtonPosition.RightSide, None)
         
         # Default Analysis tab
         idx = self.tab_bar.addTab("Analysis")
         self.tabs[idx] = ('analysis', 0, "Analysis")
-        self.tab_bar.setTabButton(idx, QTabBar.ButtonPosition.RightSide, None)  # No close button
+        self.tab_bar.setTabButton(idx, QTabBar.ButtonPosition.RightSide, None)
+        
+        # Default Stream tab
+        idx = self.tab_bar.addTab("Stream")
+        self.tabs[idx] = ('stream', 0, "Stream")
+        self.tab_bar.setTabButton(idx, QTabBar.ButtonPosition.RightSide, None)
         
         # Select Stock Fetcher by default
         self.tab_bar.setCurrentIndex(0)
@@ -138,12 +144,33 @@ class TabBarWidget(QWidget):
         idx = self.tab_bar.addTab(title)
         self.tabs[idx] = ('analysis', tab_id, title)
         
-        # Make it closeable (default behavior)
         self.tab_bar.setCurrentIndex(idx)
         
         k2_logger.ui_operation(f"New analysis tab created", f"Tab ID: {tab_id}")
         self.new_tab_requested.emit('analysis')
+
+    def add_new_stream_tab(self):
+        """Add a new Stream tab instance"""
+        self.current_stream_id += 1
+        tab_id = self.current_stream_id
+        title = f"Stream {tab_id}"
+        
+        idx = self.tab_bar.addTab(title)
+        self.tabs[idx] = ('stream', tab_id, title)
+        
+        self.tab_bar.setCurrentIndex(idx)
+        
+        k2_logger.ui_operation(f"New stream tab created", f"Tab ID: {tab_id}")
+        self.new_tab_requested.emit('stream')
     
+    def _on_new_tab_clicked(self):
+        """Add a new tab based on the currently active page type."""
+        current = self.get_current_tab()
+        if current and current[0] == 'stream':
+            self.add_new_stream_tab()
+        else:
+            self.add_new_analysis_tab()
+
     def on_tab_changed(self, index):
         """Handle tab selection change"""
         if index in self.tabs:
@@ -157,8 +184,8 @@ class TabBarWidget(QWidget):
             page_type, tab_id, title = self.tabs[index]
             
             # Check if it's a permanent tab
-            tab_key = f"{page_type}_{tab_id}" if page_type == 'analysis' and tab_id == 0 else page_type
-            if tab_key in self.permanent_tabs or (page_type == 'analysis' and tab_id == 0):
+            tab_key = f"{page_type}_{tab_id}"
+            if tab_key in self.permanent_tabs:
                 k2_logger.warning(f"Cannot close permanent tab: {title}", "TAB_BAR")
                 return
             
@@ -204,6 +231,14 @@ class TabBarWidget(QWidget):
         self.tabs[idx] = ('analysis', tab_id, title)
         k2_logger.ui_operation(f"Analysis tab restored", f"Tab ID: {tab_id}")
 
+    def restore_stream_tab(self, tab_id: int):
+        """Restore a stream tab during session recovery (no signals emitted)."""
+        self.current_stream_id = max(self.current_stream_id, tab_id)
+        title = f"Stream {tab_id}"
+        idx = self.tab_bar.addTab(title)
+        self.tabs[idx] = ('stream', tab_id, title)
+        k2_logger.ui_operation(f"Stream tab restored", f"Tab ID: {tab_id}")
+
     def close_all_analysis_tabs_except_default(self):
         """Close all analysis tabs except the default (ID 0)."""
         to_remove = []
@@ -225,3 +260,22 @@ class TabBarWidget(QWidget):
                 new_tabs[i] = self.tabs[i]
         self.tabs = new_tabs
         k2_logger.ui_operation("Closed all analysis tabs except default", "TAB_BAR")
+
+    def close_all_stream_tabs_except_default(self):
+        """Close all stream tabs except the default (ID 0)."""
+        to_remove = []
+        for idx, (p_type, t_id, _) in list(self.tabs.items()):
+            if p_type == 'stream' and t_id != 0:
+                to_remove.append(idx)
+        for idx in sorted(to_remove, reverse=True):
+            self.tab_bar.removeTab(idx)
+            try:
+                del self.tabs[idx]
+            except KeyError:
+                pass
+        new_tabs = {}
+        for i in range(self.tab_bar.count()):
+            if i in self.tabs:
+                new_tabs[i] = self.tabs[i]
+        self.tabs = new_tabs
+        k2_logger.ui_operation("Closed all stream tabs except default", "TAB_BAR")

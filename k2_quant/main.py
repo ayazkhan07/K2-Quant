@@ -19,6 +19,7 @@ from PyQt6.QtCore import QObject, QSettings, QTimer
 from k2_quant.pages.landing.page import LandingPageWidget
 from k2_quant.pages.stock_fetcher.page import StockFetcherWidget
 from k2_quant.pages.analysis.page import AnalysisPageWidget
+from k2_quant.pages.stream.page import StreamPageWidget
 from k2_quant.components.tab_bar import TabBarWidget
 
 from k2_quant.utilities.logger import k2_logger
@@ -32,8 +33,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("K2 QUANT - Stock Price Projection System")
         self.setGeometry(100, 100, 1400, 900)
         
-        # Track Analysis tab instances
+        # Track Analysis and Stream tab instances
         self.analysis_tabs = {}  # {tab_id: widget}
+        self.stream_tabs = {}   # {tab_id: widget}
         
         self.init_ui()
         self.setup_styling()
@@ -77,6 +79,11 @@ class MainWindow(QMainWindow):
         self.analysis_tabs[0] = self.default_analysis
         self.stacked_widget.addWidget(self.default_analysis)
         
+        # Create default Stream page (tab_id=0)
+        self.default_stream = StreamPageWidget(tab_id=0)
+        self.stream_tabs[0] = self.default_stream
+        self.stacked_widget.addWidget(self.default_stream)
+        
         # Show Stock Fetcher by default
         self.stacked_widget.setCurrentWidget(self.stock_fetcher)
     
@@ -87,15 +94,24 @@ class MainWindow(QMainWindow):
         # Refresh all Analysis tabs
         for tab_id, widget in self.analysis_tabs.items():
             try:
-                # Call refresh method if it exists
                 if hasattr(widget, 'refresh_models'):
                     widget.refresh_models()
                 elif hasattr(widget, 'load_saved_models'):
                     widget.load_saved_models()
-                    
                 k2_logger.info(f"Refreshed Analysis tab {tab_id}", "MAIN")
             except Exception as e:
                 k2_logger.error(f"Failed to refresh Analysis tab {tab_id}: {str(e)}", "MAIN")
+        
+        # Refresh all Stream tabs
+        for tab_id, widget in self.stream_tabs.items():
+            try:
+                if hasattr(widget, 'refresh_models'):
+                    widget.refresh_models()
+                elif hasattr(widget, 'load_saved_models'):
+                    widget.load_saved_models()
+                k2_logger.info(f"Refreshed Stream tab {tab_id}", "MAIN")
+            except Exception as e:
+                k2_logger.error(f"Failed to refresh Stream tab {tab_id}: {str(e)}", "MAIN")
     
     def on_tab_changed(self, page_type: str, tab_id: int):
         """Handle tab selection change"""
@@ -108,44 +124,45 @@ class MainWindow(QMainWindow):
                 self.stacked_widget.setCurrentWidget(self.analysis_tabs[tab_id])
             else:
                 k2_logger.error(f"Analysis tab {tab_id} not found", "MAIN")
+        elif page_type == 'stream':
+            if tab_id in self.stream_tabs:
+                self.stacked_widget.setCurrentWidget(self.stream_tabs[tab_id])
+            else:
+                k2_logger.error(f"Stream tab {tab_id} not found", "MAIN")
     
     def on_new_tab_requested(self, page_type: str):
         """Handle new tab request"""
         if page_type == 'analysis':
-            # Get the next tab ID from tab bar
             tab_id = self.tab_bar.current_analysis_id
-            
-            # Create new Analysis instance
             new_analysis = AnalysisPageWidget(tab_id=tab_id)
             self.analysis_tabs[tab_id] = new_analysis
-            
-            # Add to stacked widget
             self.stacked_widget.addWidget(new_analysis)
-            
-            # Switch to new tab
             self.stacked_widget.setCurrentWidget(new_analysis)
-            
             k2_logger.ui_operation(f"New Analysis tab created", f"Tab ID: {tab_id}")
+        elif page_type == 'stream':
+            tab_id = self.tab_bar.current_stream_id
+            new_stream = StreamPageWidget(tab_id=tab_id)
+            self.stream_tabs[tab_id] = new_stream
+            self.stacked_widget.addWidget(new_stream)
+            self.stacked_widget.setCurrentWidget(new_stream)
+            k2_logger.ui_operation(f"New Stream tab created", f"Tab ID: {tab_id}")
     
     def on_tab_closed(self, page_type: str, tab_id: int):
         """Handle tab close"""
         if page_type == 'analysis' and tab_id in self.analysis_tabs:
-            # Get the widget
             widget = self.analysis_tabs[tab_id]
-            
-            # Clean up
             widget.cleanup()
-            
-            # Remove from stacked widget
             self.stacked_widget.removeWidget(widget)
-            
-            # Delete from tracking
             del self.analysis_tabs[tab_id]
-            
-            # Delete widget
             widget.deleteLater()
-            
             k2_logger.ui_operation(f"Analysis tab closed", f"Tab ID: {tab_id}")
+        elif page_type == 'stream' and tab_id in self.stream_tabs:
+            widget = self.stream_tabs[tab_id]
+            widget.cleanup()
+            self.stacked_widget.removeWidget(widget)
+            del self.stream_tabs[tab_id]
+            widget.deleteLater()
+            k2_logger.ui_operation(f"Stream tab closed", f"Tab ID: {tab_id}")
 
     def closeEvent(self, event):
         """Save session state before the window closes."""
@@ -153,8 +170,10 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _save_session(self):
-        """Persist open analysis tabs and their loaded models to QSettings."""
+        """Persist open analysis and stream tabs to QSettings."""
         settings = QSettings("K2Quant", "K2Quant")
+
+        # Analysis tabs
         session_tabs = []
         for tab_id, widget in self.analysis_tabs.items():
             session_tabs.append({
@@ -163,43 +182,75 @@ class MainWindow(QMainWindow):
             })
         settings.setValue("session/analysis_tabs", json.dumps(session_tabs))
 
+        # Stream tabs
+        stream_sessions = []
+        for tab_id, widget in self.stream_tabs.items():
+            stream_sessions.append(widget.get_session_state())
+        settings.setValue("session/stream_tabs", json.dumps(stream_sessions))
+
         current = self.tab_bar.get_current_tab()
         if current:
             page_type, tab_id, _title = current
             settings.setValue("session/active_page_type", page_type)
             settings.setValue("session/active_tab_id", tab_id)
 
-        k2_logger.info(f"Session saved ({len(session_tabs)} analysis tabs)", "MAIN")
+        k2_logger.info(
+            f"Session saved ({len(session_tabs)} analysis, "
+            f"{len(stream_sessions)} stream tabs)", "MAIN")
 
     def _restore_session(self):
-        """Recreate analysis tabs and reload models from a previous session."""
+        """Recreate analysis and stream tabs from a previous session."""
         settings = QSettings("K2Quant", "K2Quant")
+
+        # --- Restore analysis tabs ---
         raw = settings.value("session/analysis_tabs", "")
-        if not raw:
-            return
-        try:
-            session_tabs = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            return
-        if not isinstance(session_tabs, list):
-            return
+        analysis_count = 0
+        if raw:
+            try:
+                session_tabs = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                session_tabs = []
+            if isinstance(session_tabs, list):
+                for tab_info in session_tabs:
+                    tab_id = tab_info.get('tab_id', 0)
+                    model = tab_info.get('model', '')
+                    if tab_id != 0 and tab_id not in self.analysis_tabs:
+                        self.tab_bar.restore_analysis_tab(tab_id)
+                        new_analysis = AnalysisPageWidget(tab_id=tab_id)
+                        self.analysis_tabs[tab_id] = new_analysis
+                        self.stacked_widget.addWidget(new_analysis)
+                    if model and tab_id in self.analysis_tabs:
+                        try:
+                            self.analysis_tabs[tab_id].load_model_by_table(model)
+                        except Exception as e:
+                            k2_logger.error(
+                                f"Failed to restore model '{model}' on tab {tab_id}: {e}",
+                                "MAIN")
+                analysis_count = len(session_tabs)
 
-        for tab_info in session_tabs:
-            tab_id = tab_info.get('tab_id', 0)
-            model = tab_info.get('model', '')
-
-            if tab_id != 0 and tab_id not in self.analysis_tabs:
-                self.tab_bar.restore_analysis_tab(tab_id)
-                new_analysis = AnalysisPageWidget(tab_id=tab_id)
-                self.analysis_tabs[tab_id] = new_analysis
-                self.stacked_widget.addWidget(new_analysis)
-
-            if model and tab_id in self.analysis_tabs:
-                try:
-                    self.analysis_tabs[tab_id].load_model_by_table(model)
-                except Exception as e:
-                    k2_logger.error(
-                        f"Failed to restore model '{model}' on tab {tab_id}: {e}", "MAIN")
+        # --- Restore stream tabs ---
+        raw_stream = settings.value("session/stream_tabs", "")
+        stream_count = 0
+        if raw_stream:
+            try:
+                stream_sessions = json.loads(raw_stream)
+            except (json.JSONDecodeError, TypeError):
+                stream_sessions = []
+            if isinstance(stream_sessions, list):
+                for state in stream_sessions:
+                    tab_id = state.get('tab_id', 0)
+                    if tab_id != 0 and tab_id not in self.stream_tabs:
+                        self.tab_bar.restore_stream_tab(tab_id)
+                        new_stream = StreamPageWidget(tab_id=tab_id)
+                        self.stream_tabs[tab_id] = new_stream
+                        self.stacked_widget.addWidget(new_stream)
+                    if tab_id in self.stream_tabs:
+                        try:
+                            self.stream_tabs[tab_id].restore_session_state(state)
+                        except Exception as e:
+                            k2_logger.error(
+                                f"Failed to restore stream tab {tab_id}: {e}", "MAIN")
+                stream_count = len(stream_sessions)
 
         saved_page = settings.value("session/active_page_type", "stock_fetcher")
         saved_tab = settings.value("session/active_tab_id", 0)
@@ -210,16 +261,18 @@ class MainWindow(QMainWindow):
         self.tab_bar.select_tab(saved_page, saved_tab)
 
         k2_logger.info(
-            f"Session restored ({len(session_tabs)} analysis tabs)", "MAIN")
+            f"Session restored ({analysis_count} analysis, "
+            f"{stream_count} stream tabs)", "MAIN")
 
     def handle_database_cleared(self):
-        """Reset analysis views and caches after database deletion."""
+        """Reset analysis and stream views and caches after database deletion."""
         k2_logger.info("Handling database cleared broadcast", "MAIN")
-        # Wipe saved session so stale model references don't restore next launch
         settings = QSettings("K2Quant", "K2Quant")
         settings.remove("session/analysis_tabs")
+        settings.remove("session/stream_tabs")
         settings.remove("session/active_page_type")
         settings.remove("session/active_tab_id")
+
         # Reset default analysis tab (ID 0)
         if 0 in self.analysis_tabs:
             widget = self.analysis_tabs[0]
@@ -228,25 +281,49 @@ class MainWindow(QMainWindow):
                     widget.reset_after_database_cleared()
                 except Exception as e:
                     k2_logger.error(f"Failed to reset default analysis tab: {str(e)}", "MAIN")
-        # Close all other analysis tabs
-        to_close = [tid for tid in self.analysis_tabs.keys() if tid != 0]
-        for tid in to_close:
+
+        # Close extra analysis tabs
+        for tid in [t for t in self.analysis_tabs if t != 0]:
             try:
                 widget = self.analysis_tabs[tid]
                 widget.cleanup()
                 self.stacked_widget.removeWidget(widget)
                 widget.deleteLater()
                 del self.analysis_tabs[tid]
-                k2_logger.ui_operation("Closed analysis tab after DB clear", f"Tab ID: {tid}")
             except Exception as e:
                 k2_logger.error(f"Failed closing analysis tab {tid}: {str(e)}", "MAIN")
-        # Ask tab bar to drop extra analysis tabs
         try:
             if hasattr(self.tab_bar, 'close_all_analysis_tabs_except_default'):
                 self.tab_bar.close_all_analysis_tabs_except_default()
         except Exception:
             pass
-        # Clear any model caches
+
+        # Reset default stream tab (ID 0)
+        if 0 in self.stream_tabs:
+            widget = self.stream_tabs[0]
+            if hasattr(widget, 'reset_after_database_cleared'):
+                try:
+                    widget.reset_after_database_cleared()
+                except Exception as e:
+                    k2_logger.error(f"Failed to reset default stream tab: {str(e)}", "MAIN")
+
+        # Close extra stream tabs
+        for tid in [t for t in self.stream_tabs if t != 0]:
+            try:
+                widget = self.stream_tabs[tid]
+                widget.cleanup()
+                self.stacked_widget.removeWidget(widget)
+                widget.deleteLater()
+                del self.stream_tabs[tid]
+            except Exception as e:
+                k2_logger.error(f"Failed closing stream tab {tid}: {str(e)}", "MAIN")
+        try:
+            if hasattr(self.tab_bar, 'close_all_stream_tabs_except_default'):
+                self.tab_bar.close_all_stream_tabs_except_default()
+        except Exception:
+            pass
+
+        # Clear model caches
         try:
             from k2_quant.utilities.services.model_loader_service import model_loader_service
             model_loader_service.clear_cache()
@@ -277,11 +354,10 @@ class MainWindow(QMainWindow):
     
     def cleanup(self):
         """Clean up all components"""
-        # Clean up Analysis tabs
         for tab_id, widget in self.analysis_tabs.items():
             widget.cleanup()
-        
-        # Clean up Stock Fetcher
+        for tab_id, widget in self.stream_tabs.items():
+            widget.cleanup()
         if hasattr(self, 'stock_fetcher'):
             self.stock_fetcher.cleanup()
 
