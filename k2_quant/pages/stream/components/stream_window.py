@@ -886,14 +886,19 @@ class StreamWindowWidget(QWidget):
 
     def _on_bar_completed(self, bar: dict):
         """Fully aggregated bar — persist and append to table + chart."""
-        dt_now = datetime.now()
         import pytz
         et = pytz.timezone("US/Eastern")
-        market_dt = datetime.now(et).replace(tzinfo=None)
+
+        start_ts = bar.get("start_ts", 0)
+        if start_ts:
+            utc_dt = datetime.utcfromtimestamp(start_ts / 1000)
+            market_dt = pytz.utc.localize(utc_dt).astimezone(et).replace(tzinfo=None)
+        else:
+            market_dt = datetime.now(et).replace(tzinfo=None)
 
         bar["date"] = market_dt.date()
         bar["time"] = market_dt.time()
-        bar["timestamp_ms"] = bar.get("start_ts", int(market_dt.timestamp() * 1000))
+        bar["timestamp_ms"] = start_ts or int(market_dt.timestamp() * 1000)
 
         actual_data_manager.insert_bar(self.table_name, bar)
         self.actual_data_widget.append_completed_bar(bar)
@@ -950,13 +955,35 @@ class StreamWindowWidget(QWidget):
         bars = actual_data_manager.get_all_bars(self.table_name)
         base_x = len(self.chart_widget.data) + len(bars)
 
-        old = self._actual_lines.pop("_forming", None)
-        if old and old.scene():
-            self.chart_widget.main_plot.removeItem(old)
+        for key in ("_forming_line", "_forming_dot"):
+            old = self._actual_lines.pop(key, None)
+            if old and old.scene():
+                self.chart_widget.main_plot.removeItem(old)
 
         close_val = bar.get("close")
         if close_val is None:
             return
+
+        prev_x, prev_y = None, None
+        if bars:
+            last_close = bars[-1][5]
+            if last_close is not None:
+                prev_x = float(base_x - 1)
+                prev_y = float(last_close)
+        elif 'Close' in self.chart_widget.data.columns:
+            last_close = self.chart_widget.data['Close'].dropna()
+            if len(last_close) > 0:
+                prev_x = float(len(self.chart_widget.data) - 1)
+                prev_y = float(last_close.iloc[-1])
+
+        if prev_x is not None and prev_y is not None:
+            line = pg.PlotDataItem(
+                x=[prev_x, float(base_x)],
+                y=[prev_y, float(close_val)],
+                pen=pg.mkPen(color="#00e676", width=2),
+            )
+            self.chart_widget.main_plot.addItem(line)
+            self._actual_lines["_forming_line"] = line
 
         dot = pg.ScatterPlotItem(
             x=[float(base_x)], y=[float(close_val)],
@@ -964,7 +991,7 @@ class StreamWindowWidget(QWidget):
             symbol='o',
         )
         self.chart_widget.main_plot.addItem(dot)
-        self._actual_lines["_forming"] = dot
+        self._actual_lines["_forming_dot"] = dot
 
     # ── Persistence helpers ───────────────────────────────────────
 

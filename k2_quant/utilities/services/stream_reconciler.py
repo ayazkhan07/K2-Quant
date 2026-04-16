@@ -85,6 +85,8 @@ class StreamReconciler(QObject):
                   last_bar_time: dt_time,
                   market_hours_only: bool):
         """Start an async backfill from `last_bar + 1 bar` to now."""
+        import pytz
+        et = pytz.timezone("US/Eastern")
 
         ts_lower = timespan.lower()
         if ts_lower.startswith("min"):
@@ -96,8 +98,9 @@ class StreamReconciler(QObject):
         else:
             delta = timedelta(minutes=frequency)
 
-        gap_start = datetime.combine(last_bar_date, last_bar_time) + delta
-        gap_end = datetime.now()
+        naive_start = datetime.combine(last_bar_date, last_bar_time) + delta
+        gap_start = et.localize(naive_start)
+        gap_end = datetime.now(et)
 
         if gap_end <= gap_start:
             self.reconciliation_complete.emit([])
