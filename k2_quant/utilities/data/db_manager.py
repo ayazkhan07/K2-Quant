@@ -815,10 +815,17 @@ class DatabaseManager:
         with self.get_connection() as conn:
             with self.get_cursor(conn) as cur:
                 for table_name, _ in tables:
+                    cur.execute(f"DROP TABLE IF EXISTS actual_{table_name}")
                     cur.execute(f"DROP TABLE IF EXISTS {table_name}")
+                cur.execute("DELETE FROM saved_models")
+                cur.execute("DELETE FROM model_state")
                 conn.commit()
-        k2_logger.database_operation("All tables dropped", f"{len(tables)} tables")
-        return len(tables)
+        total = len(tables)
+        k2_logger.database_operation(
+            "All tables dropped",
+            f"{total} stock + actual tables, saved_models/model_state cleared",
+        )
+        return total
 
     # ── Tab data persistence (forecast / workspace) ─────────────────
 

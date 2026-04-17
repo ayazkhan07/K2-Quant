@@ -86,9 +86,15 @@ class StreamReconciler(QObject):
                   market_hours_only: bool):
         """Start an async backfill from `last_bar + 1 bar` to now."""
         import pytz
+        import re as _re
         et = pytz.timezone("US/Eastern")
 
-        ts_lower = timespan.lower()
+        ts_lower = timespan.lower().strip()
+        _m = _re.match(r'^(\d+)\s*(min|minute|hour|day|week|month)', ts_lower)
+        if _m:
+            if frequency <= 1:
+                frequency = int(_m.group(1))
+            ts_lower = _m.group(2)
         if ts_lower.startswith("min"):
             delta = timedelta(minutes=frequency)
         elif ts_lower.startswith("hour"):
@@ -158,7 +164,14 @@ def _fetch_gap_bars(
     if not api_key:
         raise RuntimeError("Polygon API key not configured")
 
-    ts_lower = (timespan or "minute").lower()
+    import re as _re
+    ts_lower = (timespan or "minute").lower().strip()
+    _m = _re.match(r'^(\d+)\s*(min|minute|hour|day|week|month)', ts_lower)
+    if _m:
+        if frequency <= 1:
+            frequency = int(_m.group(1))
+        ts_lower = _m.group(2)
+
     if ts_lower.startswith("min"):
         api_timespan = "minute"
     elif ts_lower.startswith("hour"):

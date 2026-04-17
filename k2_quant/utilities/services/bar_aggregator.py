@@ -1,10 +1,13 @@
 """
 Bar Aggregator — accumulates 1-minute Polygon WS bars into model-frequency bars.
 
-Given a model with frequency=30 and timespan=minute, this class collects 30
-consecutive 1-minute bars and emits a single 30-minute OHLCV bar.  During
-accumulation it also emits partial "forming bar" updates so the UI can show
-real-time progress.
+Given a model with frequency=30 and timespan=minute, this class collects
+1-minute bars that fall within the same clock-aligned window and emits a
+single aggregated bar when the window closes.
+
+Clock alignment means a 30-minute model always produces bars starting at
+:00 and :30 past the hour (09:30, 10:00, 10:30, …), regardless of when
+the stream was started.
 
 Signals (Qt):
     bar_updated(dict)     — partial / forming bar (every incoming 1-min tick)
@@ -28,24 +31,27 @@ Bar dict format (emitted):
 """
 
 from typing import Optional, Dict, Any
+from datetime import datetime
 
+import pytz
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from k2_quant.utilities.logger import k2_logger
 
+_ET = pytz.timezone("US/Eastern")
+
 
 class BarAggregator(QObject):
-    """Accumulates 1-min bars into N-min bars for one symbol/model.
+    """Accumulates 1-min bars into clock-aligned N-min bars for one symbol.
 
     Parameters
     ----------
     symbol : str
         Ticker symbol (e.g. "AAPL").
     frequency : int
-        Number of 1-minute bars per aggregated bar (e.g. 30 for a 30-min model).
+        Number of minutes per aggregated bar (e.g. 30 for a 30-min model).
     timespan : str
-        Model timespan ("minute", "hour", "day").  Only "minute" triggers
-        accumulation; "hour" uses frequency*60 minutes; "day" is pass-through.
+        Model timespan ("minute", "hour", "day").
     """
 
     bar_updated = pyqtSignal(dict)
@@ -58,17 +64,38 @@ class BarAggregator(QObject):
         self.timespan = (timespan or "minute").lower()
 
         if self.timespan.startswith("hour"):
-            self._bars_required = frequency * 60
+            self._window_minutes = frequency * 60
         elif self.timespan.startswith("day"):
-            self._bars_required = 390  # full trading day in 1-min bars
+            self._window_minutes = 390
         else:
-            self._bars_required = max(1, frequency)
+            self._window_minutes = max(1, frequency)
 
         self._reset_accumulator()
 
     @property
     def bars_required(self) -> int:
-        return self._bars_required
+        return self._window_minutes
+
+    def _bar_window_key(self, ts_ms: int):
+        """Return (date, window_start_minute_of_day) for a given epoch-ms timestamp."""
+        utc_dt = datetime.utcfromtimestamp(ts_ms / 1000)
+        et_dt = pytz.utc.localize(utc_dt).astimezone(_ET)
+        minutes_of_day = et_dt.hour * 60 + et_dt.minute
+        window_start = (minutes_of_day // self._window_minutes) * self._window_minutes
+        return (et_dt.date(), window_start)
+
+    def _window_start_ts_ms(self, ts_ms: int) -> int:
+        """Snap a timestamp to its clock-aligned window start (epoch ms)."""
+        utc_dt = datetime.utcfromtimestamp(ts_ms / 1000)
+        et_dt = pytz.utc.localize(utc_dt).astimezone(_ET)
+        minutes_of_day = et_dt.hour * 60 + et_dt.minute
+        window_start_min = (minutes_of_day // self._window_minutes) * self._window_minutes
+        snapped = et_dt.replace(
+            hour=window_start_min // 60,
+            minute=window_start_min % 60,
+            second=0, microsecond=0,
+        )
+        return int(snapped.timestamp() * 1000)
 
     def ingest(self, ws_bar: dict):
         """Feed a raw Polygon AM message.  Ignored if symbol doesn't match."""
@@ -76,22 +103,31 @@ class BarAggregator(QObject):
         if sym != self.symbol:
             return
 
+        start_ts = int(ws_bar.get("s", 0))
+        new_key = self._bar_window_key(start_ts)
+
+        if self._count > 0 and self._current_window != new_key:
+            completed = self._to_dict()
+            completed["is_complete"] = True
+            self.bar_completed.emit(completed)
+            self._reset_accumulator()
+
         o = float(ws_bar.get("o", 0))
         h = float(ws_bar.get("h", 0))
         l_ = float(ws_bar.get("l", 0))
         c = float(ws_bar.get("c", 0))
         v = int(ws_bar.get("v", 0))
         vw = float(ws_bar.get("vw", 0))
-        start_ts = int(ws_bar.get("s", 0))
         end_ts = int(ws_bar.get("e", 0))
 
         if self._count == 0:
+            self._start_ts = self._window_start_ts_ms(start_ts)
             self._open = o
             self._high = h
             self._low = l_
-            self._start_ts = start_ts
             self._vw_sum = 0.0
             self._vol_total = 0
+            self._current_window = new_key
         else:
             self._high = max(self._high, h)
             self._low = min(self._low, l_)
@@ -103,14 +139,8 @@ class BarAggregator(QObject):
         self._count += 1
 
         bar_dict = self._to_dict()
-
-        if self._count >= self._bars_required:
-            bar_dict["is_complete"] = True
-            self.bar_completed.emit(bar_dict)
-            self._reset_accumulator()
-        else:
-            bar_dict["is_complete"] = False
-            self.bar_updated.emit(bar_dict)
+        bar_dict["is_complete"] = False
+        self.bar_updated.emit(bar_dict)
 
     def flush(self) -> Optional[Dict[str, Any]]:
         """Force-emit whatever is accumulated (e.g. at market close).
@@ -136,6 +166,7 @@ class BarAggregator(QObject):
         self._start_ts = 0
         self._end_ts = 0
         self._count = 0
+        self._current_window = None
 
     def _to_dict(self) -> dict:
         vwap = (self._vw_sum / self._vol_total) if self._vol_total > 0 else self._close
@@ -150,6 +181,6 @@ class BarAggregator(QObject):
             "volume": self._vol_total,
             "vwap": round(vwap, 2),
             "bars_accumulated": self._count,
-            "bars_required": self._bars_required,
+            "bars_required": self._window_minutes,
             "is_complete": False,
         }

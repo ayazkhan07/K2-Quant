@@ -7,22 +7,22 @@ Supports range parameter in table naming, CSV export, and market hours filter.
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional, Generator
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 import requests
 
 from k2_quant.utilities.services.polygon_client import polygon_client
 from k2_quant.utilities.data.db_manager import db_manager
 from k2_quant.utilities.logger import k2_logger, log_performance
 from k2_quant.utilities.config.api_config import api_config
-from datetime import datetime, timedelta
 import pandas as pd
 
 
 class StockService:
     """Service layer for stock data operations"""
 
-    MAX_WORKERS = 50
+    MAX_WORKERS = 20
     CHUNK_SIZE_DAYS = {
-        'minute': 7,
+        'minute': 30,
         'hour': 90,
         'day': 365,
         'week': 1825,
@@ -104,6 +104,7 @@ class StockService:
         all_results: List[Dict] = []
         failed_chunks = []
         completed_chunks = 0
+        self._thread_local = threading.local()
         with ThreadPoolExecutor(max_workers=self.MAX_WORKERS) as executor:
             future_to_chunk = {
                 executor.submit(self._fetch_chunk, symbol, timespan, multiplier, chunk[0], chunk[1]): chunk
@@ -120,7 +121,6 @@ class StockService:
                 except Exception as e:
                     failed_chunks.append(chunk)
                     k2_logger.error(f"Chunk failed {chunk[0]} to {chunk[1]}: {str(e)}", "API")
-        all_results.sort(key=lambda x: x['t'])
         return all_results
 
     def _generate_date_chunks(self, timespan: str, start_date: str, end_date: str) -> List[Tuple[str, str]]:
@@ -354,12 +354,14 @@ class StockService:
 
     def delete_projections(self, table_name: str, strategy_name: str) -> int:
         try:
+            if not self.db._check_column_exists(table_name, "is_projection"):
+                return 0
             affected = self.db.delete_where(table_name, "is_projection = TRUE AND projection_source = %s", [strategy_name])
             k2_logger.database_operation("Projections deleted", f"{affected} rows from {table_name} for {strategy_name}")
             return affected
         except Exception as e:
             k2_logger.error(f"delete_projections failed: {str(e)}", "DB")
-            raise
+            return 0
 
     # Indicator persistence and data access (unchanged)
     def get_full_dataframe(self, table_name: str):

@@ -84,7 +84,7 @@ class _NumericTableItem(QTableWidgetItem):
 def _should_filter_market_hours(metadata: dict) -> bool:
     if metadata.get('market_hours_only', False):
         return True
-    ts = str(metadata.get('timespan', '')).lower()
+    ts = str(metadata.get('timespan', '')).lower().lstrip('0123456789 ')
     return any(ts.startswith(prefix) for prefix in _INTRADAY_TIMESPANS)
 
 
@@ -810,17 +810,30 @@ class StreamWindowWidget(QWidget):
             self.stream_rejected.emit()
             return
 
-        timespan = self.current_metadata.get('timespan', 'minute')
+        raw_timespan = self.current_metadata.get('timespan', 'minute').lower().strip()
         freq_str = self.current_metadata.get('frequency', '1')
         frequency = int(''.join(c for c in str(freq_str) if c.isdigit()) or '1')
 
+        ts_match = re.match(r'^(\d+)\s*(min|minute|hour|day|week|month)', raw_timespan)
+        if ts_match:
+            embedded_freq = int(ts_match.group(1))
+            timespan = ts_match.group(2)
+            if frequency <= 1:
+                frequency = embedded_freq
+        else:
+            timespan = raw_timespan
+
         k2_logger.info(
             f"[STREAM START] {symbol} | table={self.table_name} | "
-            f"timespan={timespan} | frequency={frequency}",
+            f"raw_timespan={raw_timespan} | timespan={timespan} | "
+            f"raw_freq={freq_str} | frequency={frequency}",
             "STREAM",
         )
 
         actual_data_manager.ensure_table(self.table_name)
+
+        total_records = self.current_metadata.get('total_records', 0)
+        self.actual_data_widget.set_base_index(total_records)
 
         from k2_quant.utilities.data.db_manager import db_manager as _db
         model_last_bar = _db.get_last_bar(self.table_name)
@@ -836,6 +849,34 @@ class StreamWindowWidget(QWidget):
             if pruned:
                 k2_logger.info(
                     f"[STREAM START] Pruned {pruned} stale actual bars",
+                    "STREAM",
+                )
+
+        mkt_hours = self.current_metadata.get('market_hours_only', False)
+        if mkt_hours:
+            purged_mh = actual_data_manager.purge_outside_market_hours(
+                self.table_name
+            )
+            if purged_mh:
+                k2_logger.info(
+                    f"[STREAM START] Purged {purged_mh} after-hours actual bars",
+                    "STREAM",
+                )
+
+        if timespan.startswith("min"):
+            window_min = frequency
+        elif timespan.startswith("hour"):
+            window_min = frequency * 60
+        else:
+            window_min = 0
+        if window_min > 1:
+            purged = actual_data_manager.purge_misaligned(
+                self.table_name, window_min
+            )
+            if purged:
+                k2_logger.info(
+                    f"[STREAM START] Purged {purged} misaligned actual bars "
+                    f"(window={window_min}min)",
                     "STREAM",
                 )
 
@@ -997,6 +1038,12 @@ class StreamWindowWidget(QWidget):
         self.actual_data_widget.append_completed_bar(bar)
         self._update_chart_actual_series()
 
+    def _get_actual_base_x(self) -> int:
+        """Dynamic base x-position: always uses current chart data length."""
+        if self.chart_widget.data is not None:
+            return len(self.chart_widget.data)
+        return 0
+
     def _update_chart_actual_series(self):
         """Refresh the actual-data overlay as candlesticks on the chart."""
         import pyqtgraph as pg
@@ -1007,14 +1054,11 @@ class StreamWindowWidget(QWidget):
         if not bars or self.chart_widget.data is None or len(self.chart_widget.data) == 0:
             return
 
-        for key in list(self._actual_lines):
-            if key.startswith("_forming"):
-                continue
-            old = self._actual_lines.pop(key)
-            if old and old.scene():
-                self.chart_widget.main_plot.removeItem(old)
+        old = self._actual_lines.pop("actual_candles", None)
+        if old and old.scene():
+            self.chart_widget.main_plot.removeItem(old)
 
-        base_x = len(self.chart_widget.data)
+        base_x = self._get_actual_base_x()
         picture = QPicture()
         painter = QPainter(picture)
 
@@ -1055,6 +1099,12 @@ class StreamWindowWidget(QWidget):
         self.chart_widget.main_plot.addItem(candle_item)
         self._actual_lines["actual_candles"] = candle_item
 
+        k2_logger.info(
+            f"[CHART] Drew {len(bars)} actual candles starting at x={base_x} "
+            f"(chart data len={len(self.chart_widget.data)})",
+            "STREAM",
+        )
+
     def _update_chart_forming_candle(self, bar: dict):
         """Update a transient candlestick + live price line for the in-progress bar."""
         import pyqtgraph as pg
@@ -1064,8 +1114,9 @@ class StreamWindowWidget(QWidget):
         if self.chart_widget.data is None or len(self.chart_widget.data) == 0:
             return
 
-        bars = actual_data_manager.get_all_bars(self.table_name)
-        base_x = len(self.chart_widget.data) + len(bars)
+        actual_item = self._actual_lines.get("actual_candles")
+        if actual_item is None or actual_item.scene() is None:
+            self._update_chart_actual_series()
 
         for key in ("_forming_candle", "_price_line", "_price_label"):
             old = self._actual_lines.pop(key, None)
@@ -1078,6 +1129,9 @@ class StreamWindowWidget(QWidget):
         c = bar.get("close")
         if c is None or o is None:
             return
+
+        completed_bars = actual_data_manager.get_all_bars(self.table_name)
+        base_x = self._get_actual_base_x() + len(completed_bars)
 
         o, h, lo, c = float(o), float(h), float(lo), float(c)
         is_bull = c >= o
@@ -1117,8 +1171,6 @@ class StreamWindowWidget(QWidget):
         self._actual_lines["_price_line"] = price_line
 
         symbol = self.current_metadata.get('symbol', '')
-        label_bg = QColor(line_color)
-        label_bg.setAlpha(220)
         label_html = (
             f'<div style="background:{line_color}; color:#fff; padding:2px 6px; '
             f'font-size:11px; font-family:Consolas,monospace; font-weight:bold; '

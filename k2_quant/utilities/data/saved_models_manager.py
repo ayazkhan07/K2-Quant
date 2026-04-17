@@ -32,7 +32,6 @@ class SavedModelsManager:
 		try:
 			with self.db.get_connection() as conn:
 				with self.db.get_cursor(conn) as cur:
-					# Registry of saved models
 					cur.execute("""
 						CREATE TABLE IF NOT EXISTS saved_models (
 							id SERIAL PRIMARY KEY,
@@ -49,20 +48,19 @@ class SavedModelsManager:
 							created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 						)
 					""")
-				# Per-model UI state
-				cur.execute("""
-					CREATE TABLE IF NOT EXISTS model_state (
-						id SERIAL PRIMARY KEY,
-						table_name VARCHAR(255) UNIQUE NOT NULL,
-						indicators_json TEXT DEFAULT '{}',
-						active_strategy TEXT,
-						chart_range TEXT,
-						updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-					)
-				""")
-				cur.execute("ALTER TABLE model_state ADD COLUMN IF NOT EXISTS chat_html TEXT DEFAULT ''")
-				cur.execute("ALTER TABLE model_state ADD COLUMN IF NOT EXISTS chat_history_json TEXT DEFAULT '[]'")
-				conn.commit()
+					cur.execute("""
+						CREATE TABLE IF NOT EXISTS model_state (
+							id SERIAL PRIMARY KEY,
+							table_name VARCHAR(255) UNIQUE NOT NULL,
+							indicators_json TEXT DEFAULT '{}',
+							active_strategy TEXT,
+							chart_range TEXT,
+							updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+						)
+					""")
+					cur.execute("ALTER TABLE model_state ADD COLUMN IF NOT EXISTS chat_html TEXT DEFAULT ''")
+					cur.execute("ALTER TABLE model_state ADD COLUMN IF NOT EXISTS chat_history_json TEXT DEFAULT '[]'")
+					conn.commit()
 			k2_logger.info("Saved models tables ready", "SAVED_MODELS")
 		except Exception as e:
 			k2_logger.error(f"Failed ensuring saved_models/model_state tables: {e}", "SAVED_MODELS")

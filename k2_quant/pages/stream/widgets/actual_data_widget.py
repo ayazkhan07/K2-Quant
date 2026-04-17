@@ -37,6 +37,7 @@ class ActualDataWidget(QWidget):
         super().__init__(parent)
         self._row_count = 0
         self._forming_row: Optional[int] = None
+        self._base_index = 0
         self._init_ui()
 
     def _init_ui(self):
@@ -105,6 +106,10 @@ class ActualDataWidget(QWidget):
 
         layout.addWidget(self.table)
 
+    def set_base_index(self, base: int):
+        """Set the starting index so the # column continues from the model data."""
+        self._base_index = base
+
     def load_bars(self, bars: list):
         """Bulk-load bars (e.g. from reconciliation or DB restore).
         Each bar is a tuple (date, time, O, H, L, C, V, VWAP) or a dict."""
@@ -162,10 +167,11 @@ class ActualDataWidget(QWidget):
         self._update_row(row_idx, bar, forming)
 
     def _update_row(self, row_idx: int, bar, forming: bool):
+        display_num = self._base_index + row_idx + 1
         if isinstance(bar, (tuple, list)):
             d, t, o, h, l_, c, v, vw = bar[0], bar[1], bar[2], bar[3], bar[4], bar[5], bar[6], bar[7]
             values = {
-                "#": row_idx + 1,
+                "#": display_num,
                 "Date": str(d),
                 "Time": str(t)[:8],
                 "Open": f"{float(o):.2f}" if o is not None else "",
@@ -179,7 +185,7 @@ class ActualDataWidget(QWidget):
             d = bar.get("date") or bar.get("market_date", "")
             t = bar.get("time") or bar.get("market_time", "")
             values = {
-                "#": row_idx + 1,
+                "#": display_num,
                 "Date": str(d),
                 "Time": str(t)[:8],
                 "Open": f"{bar['open']:.2f}" if bar.get("open") is not None else "",
