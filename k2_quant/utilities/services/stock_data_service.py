@@ -155,16 +155,22 @@ class StockService:
             return []
 
     def get_display_data(self, table_name: str, limit: int = 1000, market_hours_only: bool = False,
-                         time_start: str = None, time_end: str = None) -> Tuple[List[Tuple], int]:
-        return self.db.fetch_display_data(table_name, limit, market_hours_only, time_start, time_end)
+                         time_start: str = None, time_end: str = None,
+                         cutoff_datetime: str = None) -> Tuple[List[Tuple], int]:
+        return self.db.fetch_display_data(
+            table_name, limit, market_hours_only, time_start, time_end,
+            cutoff_datetime=cutoff_datetime)
 
     def get_export_data(self, table_name: str, offset: int, limit: int, market_hours_only: bool = False,
-                        time_start: str = None, time_end: str = None) -> List[Tuple]:
+                        time_start: str = None, time_end: str = None,
+                        cutoff_datetime: str = None) -> List[Tuple]:
         try:
             k2_logger.database_operation(
                 f"Fetching export data from {table_name}",
                 f"Offset: {offset}, Limit: {limit}")
-            rows = self.db.fetch_export_data(table_name, offset, limit, market_hours_only, time_start, time_end)
+            rows = self.db.fetch_export_data(
+                table_name, offset, limit, market_hours_only, time_start, time_end,
+                cutoff_datetime=cutoff_datetime)
             k2_logger.database_operation("Export data fetched", f"Retrieved {len(rows)} records")
             return rows
         except Exception as e:
@@ -172,18 +178,21 @@ class StockService:
             raise
 
     def get_export_data_streaming(self, table_name: str, batch_size: int = None, market_hours_only: bool = False,
-                                  time_start: str = None, time_end: str = None) -> Generator[List[Tuple], None, None]:
+                                  time_start: str = None, time_end: str = None,
+                                  cutoff_datetime: str = None) -> Generator[List[Tuple], None, None]:
         if batch_size is None:
             batch_size = self.EXPORT_BATCH_SIZE
         try:
             _, total_count = self.get_display_data(
                 table_name, limit=1, market_hours_only=market_hours_only,
-                time_start=time_start, time_end=time_end)
+                time_start=time_start, time_end=time_end,
+                cutoff_datetime=cutoff_datetime)
             offset = 0
             while offset < total_count:
                 batch = self.get_export_data(
                     table_name, offset, batch_size, market_hours_only,
-                    time_start=time_start, time_end=time_end)
+                    time_start=time_start, time_end=time_end,
+                    cutoff_datetime=cutoff_datetime)
                 if not batch:
                     break
                 yield batch

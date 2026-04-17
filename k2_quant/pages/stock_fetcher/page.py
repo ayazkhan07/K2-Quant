@@ -236,12 +236,13 @@ class _DbLoadWorker(QThread):
     result_ready = pyqtSignal(object, int)
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, table_name, limit, time_start, time_end):
+    def __init__(self, table_name, limit, time_start, time_end, cutoff_datetime=None):
         super().__init__()
         self._table_name = table_name
         self._limit = limit
         self.time_start = time_start
         self.time_end = time_end
+        self.cutoff_datetime = cutoff_datetime
 
     def run(self):
         try:
@@ -251,6 +252,7 @@ class _DbLoadWorker(QThread):
                 market_hours_only=False,
                 time_start=self.time_start,
                 time_end=self.time_end,
+                cutoff_datetime=self.cutoff_datetime,
             )
             self.result_ready.emit(rows, total_count)
         except Exception as e:
@@ -264,13 +266,15 @@ class _ExportWorker(QThread):
     finished_ok = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, current_data, current_table, market_hours_only, time_start, time_end):
+    def __init__(self, current_data, current_table, market_hours_only, time_start, time_end,
+                 cutoff_datetime=None):
         super().__init__()
         self._data = current_data
         self._table = current_table
         self._market_hours = market_hours_only
         self._time_start = time_start
         self._time_end = time_end
+        self._cutoff_datetime = cutoff_datetime
         self._cancelled = False
 
     def cancel(self):
@@ -307,7 +311,8 @@ class _ExportWorker(QThread):
             try:
                 for batch in stock_service.get_export_data_streaming(
                         self._table, market_hours_only=False,
-                        time_start=self._time_start, time_end=self._time_end):
+                        time_start=self._time_start, time_end=self._time_end,
+                        cutoff_datetime=self._cutoff_datetime):
                     if self._cancelled:
                         break
                     for row in batch:
@@ -523,6 +528,20 @@ class StockFetcherWidget(QMainWindow):
         to_row.addWidget(self.date_to)
         layout.addLayout(to_row)
 
+        # --- Cutoff row (below TO) ---
+        cutoff_row = QHBoxLayout()
+        cutoff_label = QLabel("AT")
+        cutoff_label.setObjectName("fieldLabel")
+        cutoff_label.setFixedWidth(36)
+        cutoff_row.addWidget(cutoff_label)
+
+        self.cutoff_time = QComboBox()
+        self.cutoff_time.setObjectName("timeCombo")
+        self.cutoff_time.setEnabled(False)
+        self.cutoff_time.currentIndexChanged.connect(self._on_time_range_changed)
+        cutoff_row.addWidget(self.cutoff_time)
+        layout.addLayout(cutoff_row)
+
         # Populate initial dates from default range (1M)
         self._populate_dates_from_range(self.active_range)
 
@@ -618,6 +637,7 @@ class StockFetcherWidget(QMainWindow):
 
         # Default state: disabled (default freq is D)
         self._populate_time_combos(MARKET_HOURS_TIMES, "09:30", "16:00")
+        self._populate_cutoff_combo(MARKET_HOURS_TIMES, "16:00")
         self._set_time_controls_enabled(False)
 
         return section
@@ -1047,11 +1067,25 @@ class StockFetcherWidget(QMainWindow):
     def _set_time_controls_enabled(self, enabled: bool):
         self.time_from.setEnabled(enabled)
         self.time_to.setEnabled(enabled)
+        self.cutoff_time.setEnabled(enabled)
         self.market_hours_checkbox.setEnabled(enabled)
         if not enabled:
             self.filter_info_label.setText("")
+            self._populate_cutoff_combo([], "")
         else:
             self._update_filter_info()
+
+    def _populate_cutoff_combo(self, items, default_end: str):
+        """Repopulate the cutoff-time combo beside the TO date."""
+        self.cutoff_time.blockSignals(True)
+        self.cutoff_time.clear()
+        end_idx = 0
+        for i, (display, value) in enumerate(items):
+            self.cutoff_time.addItem(display, value)
+            if value == default_end:
+                end_idx = i
+        self.cutoff_time.setCurrentIndex(end_idx)
+        self.cutoff_time.blockSignals(False)
 
     def _refresh_time_combos(self):
         """Rebuild time combo items and defaults for the current frequency."""
@@ -1062,6 +1096,7 @@ class StockFetcherWidget(QMainWindow):
             items, default_end = _build_time_items(4, 0, 20, 0, self.active_frequency)
             default_start = "04:00"
         self._populate_time_combos(items, default_start, default_end)
+        self._populate_cutoff_combo(items, default_end)
         self._update_filter_info()
 
     def _update_filter_info(self):
@@ -1086,7 +1121,12 @@ class StockFetcherWidget(QMainWindow):
         self.market_hours_checkbox.setToolTip(f"Clamp time range to {label.strip('()')}")
 
     def _get_current_time_filter(self):
-        """Return (time_start, time_end) 24h strings, or (None, None) for daily+.
+        """Return (time_start, time_end, cutoff_datetime) for the active filter.
+
+        time_start / time_end are 24h strings (or None for daily+ frequencies).
+        cutoff_datetime is an ISO datetime string that caps the last day's data
+        when the user picks an end time earlier than the uniform time_end, or
+        None when no cutoff is needed.
 
         The returned time_end is extended by (interval - 1) minutes so the SQL
         BETWEEN clause captures all rows belonging to the last selected bar.
@@ -1101,8 +1141,21 @@ class StockFetcherWidget(QMainWindow):
                     end_total = int(parts[0]) * 60 + int(parts[1]) + freq_min - 1
                     eh, em = divmod(min(end_total, 23 * 60 + 59), 60)
                     te = f"{eh:02d}:{em:02d}"
-                return ts, te
-        return None, None
+
+                cutoff_dt = None
+                cutoff_val = self.cutoff_time.currentData()
+                if cutoff_val and cutoff_val != self.time_to.currentData():
+                    to_date_str = self.date_to.date().toString("yyyy-MM-dd")
+                    ct = cutoff_val if len(cutoff_val) > 5 else f"{cutoff_val}:00"
+                    if freq_min > 1:
+                        cp = cutoff_val.split(':')
+                        ct_total = int(cp[0]) * 60 + int(cp[1]) + freq_min - 1
+                        ch, cm = divmod(min(ct_total, 23 * 60 + 59), 60)
+                        ct = f"{ch:02d}:{cm:02d}:00"
+                    cutoff_dt = f"{to_date_str} {ct}"
+
+                return ts, te, cutoff_dt
+        return None, None, None
 
     def _on_time_range_changed(self):
         if self.current_table:
@@ -1220,19 +1273,24 @@ class StockFetcherWidget(QMainWindow):
     def load_data_from_db(self):
         if not self.current_table:
             return
-        time_start, time_end = self._get_current_time_filter()
-        worker = _DbLoadWorker(self.current_table, 1000, time_start, time_end)
+        time_start, time_end, cutoff_dt = self._get_current_time_filter()
+        worker = _DbLoadWorker(self.current_table, 1000, time_start, time_end, cutoff_dt)
         worker.result_ready.connect(self._on_db_load_finished)
         worker.error_occurred.connect(self._on_db_load_error)
         self._db_load_worker = worker
         worker.start()
 
     def _on_db_load_finished(self, rows, total_count):
-        time_start, time_end = self._get_current_time_filter()
+        time_start, time_end, cutoff_dt = self._get_current_time_filter()
         if time_start and time_end:
             ts_display = self.time_from.currentText()
             te_display = self.time_to.currentText()
-            self.record_count.setText(f"{total_count:,} records ({ts_display} – {te_display})")
+            suffix = ""
+            if cutoff_dt:
+                cutoff_display = self.cutoff_time.currentText()
+                suffix = f", last day until {cutoff_display}"
+            self.record_count.setText(
+                f"{total_count:,} records ({ts_display} – {te_display}{suffix})")
         else:
             self.record_count.setText(f"{total_count:,} records")
         if total_count > 1000:
@@ -1325,10 +1383,10 @@ class StockFetcherWidget(QMainWindow):
         self._export_dlg.setMinimumWidth(400)
         self._export_dlg.show()
 
-        time_start, time_end = self._get_current_time_filter()
+        time_start, time_end, cutoff_dt = self._get_current_time_filter()
         self.export_worker = _ExportWorker(
             self.current_data, self.current_table,
-            self.market_hours_only, time_start, time_end)
+            self.market_hours_only, time_start, time_end, cutoff_dt)
         self.export_worker.progress.connect(self._export_dlg.setValue)
         self.export_worker.finished_ok.connect(self._on_export_finished)
         self.export_worker.error_occurred.connect(self._on_export_error)

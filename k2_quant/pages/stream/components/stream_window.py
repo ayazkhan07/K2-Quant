@@ -16,6 +16,7 @@ from typing import Dict, Optional, Any, List
 
 import pandas as pd
 import numpy as np
+import pyqtgraph as pg
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QSplitter, QTabWidget, QMessageBox,
@@ -48,6 +49,38 @@ from k2_quant.utilities.data.actual_data_manager import actual_data_manager
 _INTRADAY_TIMESPANS = {'minute', 'min', 'hour'}
 
 
+class _PictureItem(pg.GraphicsObject):
+    """Lightweight wrapper that renders a pre-painted QPicture in a pyqtgraph scene."""
+
+    def __init__(self, picture):
+        super().__init__()
+        self._picture = picture
+        self._bounding = None
+
+    def paint(self, painter, *_args):
+        painter.drawPicture(0, 0, self._picture)
+
+    def boundingRect(self):
+        if self._bounding is None:
+            from PyQt6.QtCore import QRectF
+            self._bounding = QRectF(self._picture.boundingRect())
+        return self._bounding
+
+
+class _NumericTableItem(QTableWidgetItem):
+    """QTableWidgetItem that sorts by its stored numeric value."""
+
+    def __init__(self, text: str, sort_value=None):
+        super().__init__(text)
+        self._sort_value = sort_value
+
+    def __lt__(self, other):
+        if isinstance(other, _NumericTableItem):
+            if self._sort_value is not None and other._sort_value is not None:
+                return self._sort_value < other._sort_value
+        return super().__lt__(other)
+
+
 def _should_filter_market_hours(metadata: dict) -> bool:
     if metadata.get('market_hours_only', False):
         return True
@@ -75,6 +108,7 @@ class StreamWindowWidget(QWidget):
         self._aggregator: Optional[BarAggregator] = None
         self._reconciler: Optional[StreamReconciler] = None
         self._actual_lines: Dict[str, Any] = {}
+        self._last_forming_price: Optional[float] = None
 
         self._init_ui()
         self._load_model()
@@ -179,6 +213,11 @@ class StreamWindowWidget(QWidget):
         self.thinkspace.tab_writes_ready.connect(self._on_tab_writes)
         self.outputs_panel.reference_in_chat.connect(self._on_reference_run_in_chat)
         self.data_tabs.forecast_column_toggled.connect(self._on_forecast_column_toggled)
+        try:
+            vb = self.chart_widget.main_plot.getViewBox()
+            vb.sigRangeChanged.connect(self._reposition_price_label)
+        except Exception:
+            pass
 
     # ── Model loading ─────────────────────────────────────────────
 
@@ -330,7 +369,15 @@ class StreamWindowWidget(QWidget):
                     except (ValueError, TypeError):
                         text = str(value)
 
-                item = QTableWidgetItem(text)
+                if col_lower not in ('date', 'time'):
+                    try:
+                        sort_val = float(value)
+                    except (ValueError, TypeError):
+                        sort_val = None
+                    item = _NumericTableItem(text, sort_val)
+                else:
+                    item = QTableWidgetItem(text)
+
                 if col_lower in ('#', 'date', 'time'):
                     item.setTextAlignment(
                         Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
@@ -767,9 +814,36 @@ class StreamWindowWidget(QWidget):
         freq_str = self.current_metadata.get('frequency', '1')
         frequency = int(''.join(c for c in str(freq_str) if c.isdigit()) or '1')
 
+        k2_logger.info(
+            f"[STREAM START] {symbol} | table={self.table_name} | "
+            f"timespan={timespan} | frequency={frequency}",
+            "STREAM",
+        )
+
         actual_data_manager.ensure_table(self.table_name)
 
+        from k2_quant.utilities.data.db_manager import db_manager as _db
+        model_last_bar = _db.get_last_bar(self.table_name)
+        k2_logger.info(
+            f"[STREAM START] Model last bar: {model_last_bar}",
+            "STREAM",
+        )
+
+        if model_last_bar:
+            pruned = actual_data_manager.prune_up_to(
+                self.table_name, model_last_bar[0], model_last_bar[1]
+            )
+            if pruned:
+                k2_logger.info(
+                    f"[STREAM START] Pruned {pruned} stale actual bars",
+                    "STREAM",
+                )
+
         existing_bars = actual_data_manager.get_all_bars(self.table_name)
+        k2_logger.info(
+            f"[STREAM START] Existing actual bars after prune: {len(existing_bars)}",
+            "STREAM",
+        )
         if existing_bars:
             self.actual_data_widget.load_bars(existing_bars)
 
@@ -788,15 +862,27 @@ class StreamWindowWidget(QWidget):
         if last_actual:
             anchor_date = last_actual["date"]
             anchor_time = last_actual["time"]
+            k2_logger.info(
+                f"[STREAM START] Anchor source: ACTUAL DATA | "
+                f"date={anchor_date} time={anchor_time}",
+                "STREAM",
+            )
+        elif model_last_bar:
+            anchor_date = model_last_bar[0]
+            anchor_time = model_last_bar[1]
+            k2_logger.info(
+                f"[STREAM START] Anchor source: MODEL LAST BAR | "
+                f"date={anchor_date} time={anchor_time}",
+                "STREAM",
+            )
         else:
-            from k2_quant.utilities.data.db_manager import db_manager as _db
-            last_model_bar = _db.get_last_bar(self.table_name)
-            if last_model_bar:
-                anchor_date = last_model_bar[0]
-                anchor_time = last_model_bar[1]
-            else:
-                anchor_date = dt_date.today()
-                anchor_time = dt_time(9, 30)
+            anchor_date = dt_date.today()
+            anchor_time = dt_time(9, 30)
+            k2_logger.info(
+                f"[STREAM START] Anchor source: FALLBACK (today 09:30) | "
+                f"date={anchor_date} time={anchor_time}",
+                "STREAM",
+            )
 
         if isinstance(anchor_date, str):
             anchor_date = datetime.strptime(anchor_date, "%Y-%m-%d").date()
@@ -805,6 +891,13 @@ class StreamWindowWidget(QWidget):
 
         self._is_streaming = True
         self.stream_status_changed.emit("Reconciling …")
+
+        k2_logger.info(
+            f"[STREAM START] Sending to reconciler: symbol={symbol} "
+            f"anchor={anchor_date} {anchor_time} "
+            f"timespan={timespan} freq={frequency}",
+            "STREAM",
+        )
 
         self._reconciler.reconcile(
             symbol=symbol,
@@ -905,49 +998,68 @@ class StreamWindowWidget(QWidget):
         self._update_chart_actual_series()
 
     def _update_chart_actual_series(self):
-        """Refresh the actual-data overlay lines on the chart."""
+        """Refresh the actual-data overlay as candlesticks on the chart."""
         import pyqtgraph as pg
+        from PyQt6.QtGui import QPicture, QPainter, QColor
+        from PyQt6.QtCore import QRectF
 
         bars = actual_data_manager.get_all_bars(self.table_name)
         if not bars or self.chart_widget.data is None or len(self.chart_widget.data) == 0:
             return
 
+        for key in list(self._actual_lines):
+            if key.startswith("_forming"):
+                continue
+            old = self._actual_lines.pop(key)
+            if old and old.scene():
+                self.chart_widget.main_plot.removeItem(old)
+
         base_x = len(self.chart_widget.data)
-        n = len(bars)
+        picture = QPicture()
+        painter = QPainter(picture)
 
-        ohlc_map = {
-            "actual_close": (5, "#00e676"),  # green
-        }
+        bull_color = QColor("#00e676")
+        bear_color = QColor("#ff1744")
+        wick_width = 1
+        body_width = 0.6
 
-        for key, (col_idx, color) in ohlc_map.items():
-            old_item = self._actual_lines.pop(key, None)
-            if old_item and old_item.scene():
-                self.chart_widget.main_plot.removeItem(old_item)
+        for i, bar in enumerate(bars):
+            x = base_x + i
+            o = float(bar[2]) if bar[2] is not None else 0
+            h = float(bar[3]) if bar[3] is not None else 0
+            lo = float(bar[4]) if bar[4] is not None else 0
+            c = float(bar[5]) if bar[5] is not None else 0
 
-            y_vals = np.array(
-                [float(b[col_idx]) if b[col_idx] is not None else np.nan for b in bars],
-                dtype=np.float64,
+            color = bull_color if c >= o else bear_color
+
+            painter.setPen(pg.mkPen(color=color, width=wick_width))
+            painter.drawLine(
+                pg.QtCore.QPointF(x, lo),
+                pg.QtCore.QPointF(x, h),
             )
-            x_vals = np.arange(base_x, base_x + n, dtype=np.float64)
 
-            if 'Close' in self.chart_widget.data.columns:
-                last_close = self.chart_widget.data['Close'].dropna()
-                if len(last_close) > 0:
-                    anchor_y = float(last_close.iloc[-1])
-                    x_vals = np.insert(x_vals, 0, base_x - 1)
-                    y_vals = np.insert(y_vals, 0, anchor_y)
+            painter.setBrush(pg.mkBrush(color))
+            body_top = max(o, c)
+            body_bot = min(o, c)
+            body_h = body_top - body_bot
+            if body_h < 0.01:
+                body_h = 0.01
+            painter.drawRect(QRectF(
+                x - body_width / 2, body_bot,
+                body_width, body_h,
+            ))
 
-            plot_item = pg.PlotDataItem(
-                x=x_vals, y=y_vals,
-                pen=pg.mkPen(color=color, width=2),
-                connect='finite',
-            )
-            self.chart_widget.main_plot.addItem(plot_item)
-            self._actual_lines[key] = plot_item
+        painter.end()
+
+        candle_item = _PictureItem(picture)
+        self.chart_widget.main_plot.addItem(candle_item)
+        self._actual_lines["actual_candles"] = candle_item
 
     def _update_chart_forming_candle(self, bar: dict):
-        """Update a transient marker for the in-progress bar."""
+        """Update a transient candlestick + live price line for the in-progress bar."""
         import pyqtgraph as pg
+        from PyQt6.QtGui import QPicture, QPainter, QColor, QFont
+        from PyQt6.QtCore import QRectF
 
         if self.chart_widget.data is None or len(self.chart_widget.data) == 0:
             return
@@ -955,43 +1067,83 @@ class StreamWindowWidget(QWidget):
         bars = actual_data_manager.get_all_bars(self.table_name)
         base_x = len(self.chart_widget.data) + len(bars)
 
-        for key in ("_forming_line", "_forming_dot"):
+        for key in ("_forming_candle", "_price_line", "_price_label"):
             old = self._actual_lines.pop(key, None)
             if old and old.scene():
                 self.chart_widget.main_plot.removeItem(old)
 
-        close_val = bar.get("close")
-        if close_val is None:
+        o = bar.get("open")
+        h = bar.get("high")
+        lo = bar.get("low")
+        c = bar.get("close")
+        if c is None or o is None:
             return
 
-        prev_x, prev_y = None, None
-        if bars:
-            last_close = bars[-1][5]
-            if last_close is not None:
-                prev_x = float(base_x - 1)
-                prev_y = float(last_close)
-        elif 'Close' in self.chart_widget.data.columns:
-            last_close = self.chart_widget.data['Close'].dropna()
-            if len(last_close) > 0:
-                prev_x = float(len(self.chart_widget.data) - 1)
-                prev_y = float(last_close.iloc[-1])
+        o, h, lo, c = float(o), float(h), float(lo), float(c)
+        is_bull = c >= o
+        forming_color = QColor("#00e676") if is_bull else QColor("#ff1744")
+        forming_color.setAlpha(160)
 
-        if prev_x is not None and prev_y is not None:
-            line = pg.PlotDataItem(
-                x=[prev_x, float(base_x)],
-                y=[prev_y, float(close_val)],
-                pen=pg.mkPen(color="#00e676", width=2),
-            )
-            self.chart_widget.main_plot.addItem(line)
-            self._actual_lines["_forming_line"] = line
+        picture = QPicture()
+        painter = QPainter(picture)
 
-        dot = pg.ScatterPlotItem(
-            x=[float(base_x)], y=[float(close_val)],
-            size=8, brush=pg.mkBrush("#00e676"), pen=pg.mkPen(None),
-            symbol='o',
+        painter.setPen(pg.mkPen(color=forming_color, width=1))
+        painter.drawLine(
+            pg.QtCore.QPointF(base_x, lo),
+            pg.QtCore.QPointF(base_x, h),
         )
-        self.chart_widget.main_plot.addItem(dot)
-        self._actual_lines["_forming_dot"] = dot
+
+        painter.setBrush(pg.mkBrush(forming_color))
+        body_top = max(o, c)
+        body_bot = min(o, c)
+        body_h = max(body_top - body_bot, 0.01)
+        painter.drawRect(QRectF(
+            base_x - 0.3, body_bot,
+            0.6, body_h,
+        ))
+
+        painter.end()
+
+        item = _PictureItem(picture)
+        self.chart_widget.main_plot.addItem(item)
+        self._actual_lines["_forming_candle"] = item
+
+        line_color = "#00e676" if is_bull else "#ff1744"
+        price_line = pg.InfiniteLine(
+            pos=c, angle=0, movable=False,
+            pen=pg.mkPen(color=line_color, width=1, style=pg.QtCore.Qt.PenStyle.DashLine),
+        )
+        self.chart_widget.main_plot.addItem(price_line, ignoreBounds=True)
+        self._actual_lines["_price_line"] = price_line
+
+        symbol = self.current_metadata.get('symbol', '')
+        label_bg = QColor(line_color)
+        label_bg.setAlpha(220)
+        label_html = (
+            f'<div style="background:{line_color}; color:#fff; padding:2px 6px; '
+            f'font-size:11px; font-family:Consolas,monospace; font-weight:bold; '
+            f'border-radius:2px;">'
+            f'{symbol} {c:.2f}</div>'
+        )
+        price_label = pg.TextItem(html=label_html, anchor=(0, 0.5))
+        vb = self.chart_widget.main_plot.getViewBox()
+        x_max = vb.viewRange()[0][1]
+        price_label.setPos(x_max - 1, c)
+        self.chart_widget.main_plot.addItem(price_label, ignoreBounds=True)
+        self._actual_lines["_price_label"] = price_label
+        self._last_forming_price = c
+
+    def _reposition_price_label(self):
+        """Keep the price label anchored to the right edge of the visible area."""
+        label = self._actual_lines.get("_price_label")
+        if label is None or self._last_forming_price is None:
+            return
+        try:
+            vb = self.chart_widget.main_plot.getViewBox()
+            x_max = vb.viewRange()[0][1]
+            label.setPos(x_max - 1, self._last_forming_price)
+        except Exception:
+            pass
 
     # ── Persistence helpers ───────────────────────────────────────
 

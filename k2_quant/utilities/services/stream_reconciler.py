@@ -102,15 +102,24 @@ class StreamReconciler(QObject):
         gap_start = et.localize(naive_start)
         gap_end = datetime.now(et)
 
-        if gap_end <= gap_start:
-            self.reconciliation_complete.emit([])
-            return
-
         k2_logger.info(
-            f"Reconciling {symbol}: {gap_start} -> {gap_end} "
-            f"(timespan={timespan}, freq={frequency})",
+            f"[RECONCILER] Input: last_bar={last_bar_date} {last_bar_time} | "
+            f"delta={delta} | timespan={timespan} freq={frequency}",
             "RECONCILER",
         )
+        k2_logger.info(
+            f"[RECONCILER] Gap: {gap_start} -> {gap_end} "
+            f"(gap_days={(gap_end - gap_start).total_seconds() / 86400:.1f})",
+            "RECONCILER",
+        )
+
+        if gap_end <= gap_start:
+            k2_logger.info(
+                "[RECONCILER] No gap to fill (gap_end <= gap_start), skipping",
+                "RECONCILER",
+            )
+            self.reconciliation_complete.emit([])
+            return
 
         self._worker = _ReconcileWorker(
             symbol=symbol, timespan=timespan, frequency=frequency,
@@ -173,6 +182,16 @@ def _fetch_gap_bars(
         "limit": 50000,
     }
 
+    k2_logger.info(
+        f"[RECONCILER] REST request: {url.replace(api_key, '***')}",
+        "RECONCILER",
+    )
+    k2_logger.info(
+        f"[RECONCILER] Date range: {start_str} to {end_str} | "
+        f"frequency={frequency} | timespan={api_timespan}",
+        "RECONCILER",
+    )
+
     all_results: List[dict] = []
 
     resp = requests.get(url, params=params, timeout=60)
@@ -185,11 +204,33 @@ def _fetch_gap_bars(
     raw_bars = data.get("results") or []
     total_est = min(len(raw_bars), BACKFILL_CAP)
 
+    k2_logger.info(
+        f"[RECONCILER] Polygon returned {len(raw_bars)} raw bars | "
+        f"status={data.get('status')} | resultsCount={data.get('resultsCount', '?')}",
+        "RECONCILER",
+    )
+
     import pytz
     et = pytz.timezone("US/Eastern")
 
-    # Polygon returns full calendar days — we must drop bars before gap_start
     gap_start_epoch_ms = int(start_dt.timestamp() * 1000)
+    skipped_before_gap = 0
+    skipped_market_hours = 0
+
+    if raw_bars:
+        first_ts = raw_bars[0].get("t", 0)
+        last_ts = raw_bars[-1].get("t", 0)
+        first_dt = datetime.utcfromtimestamp(first_ts / 1000) if first_ts else None
+        last_dt = datetime.utcfromtimestamp(last_ts / 1000) if last_ts else None
+        k2_logger.info(
+            f"[RECONCILER] Raw bar range: {first_dt} UTC -> {last_dt} UTC",
+            "RECONCILER",
+        )
+        k2_logger.info(
+            f"[RECONCILER] Gap filter: epoch_ms >= {gap_start_epoch_ms} "
+            f"(= {start_dt})",
+            "RECONCILER",
+        )
 
     for i, bar in enumerate(raw_bars):
         if len(all_results) >= BACKFILL_CAP:
@@ -198,6 +239,7 @@ def _fetch_gap_bars(
         ts_ms = bar.get("t", 0)
 
         if ts_ms < gap_start_epoch_ms:
+            skipped_before_gap += 1
             continue
 
         utc_dt = datetime.utcfromtimestamp(ts_ms / 1000)
@@ -206,6 +248,7 @@ def _fetch_gap_bars(
         if market_hours_only:
             mt = market_dt.time()
             if not (dt_time(9, 30) <= mt < dt_time(16, 0)):
+                skipped_market_hours += 1
                 continue
 
         all_results.append({
@@ -226,4 +269,24 @@ def _fetch_gap_bars(
             progress_cb(len(all_results), total_est)
 
     all_results.sort(key=lambda b: b["timestamp_ms"])
+
+    first_bar_str = (
+        f"{all_results[0]['date']} {all_results[0]['time']}"
+        if all_results else "N/A"
+    )
+    last_bar_str = (
+        f"{all_results[-1]['date']} {all_results[-1]['time']}"
+        if all_results else "N/A"
+    )
+    k2_logger.info(
+        f"[RECONCILER] Result: {len(all_results)} bars kept | "
+        f"{skipped_before_gap} skipped (before gap) | "
+        f"{skipped_market_hours} skipped (outside market hours)",
+        "RECONCILER",
+    )
+    k2_logger.info(
+        f"[RECONCILER] Actual data range: {first_bar_str} -> {last_bar_str}",
+        "RECONCILER",
+    )
+
     return all_results

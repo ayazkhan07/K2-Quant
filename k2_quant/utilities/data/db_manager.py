@@ -456,6 +456,17 @@ class DatabaseManager:
         except Exception:
             return False
 
+    @staticmethod
+    def _get_cutoff_clause(cutoff_datetime: str = None) -> str:
+        """Return an AND-able clause that caps data at an absolute datetime.
+
+        cutoff_datetime should be an ISO-ish string like '2026-04-16 14:00:00'.
+        Returns empty string when no cutoff is needed.
+        """
+        if not cutoff_datetime:
+            return ""
+        return f"date_time_market <= TIMESTAMP '{cutoff_datetime}'"
+
     def _get_market_hours_where_clause(self, table_name: str = None) -> str:
         """
         Get market hours WHERE clause that works with both old and new table schemas.
@@ -484,24 +495,33 @@ class DatabaseManager:
             return self._get_market_hours_where_clause(table_name)
         return ""
 
+    def _build_where(self, clauses: list) -> str:
+        """Join non-empty clause fragments into a full WHERE string."""
+        parts = [c for c in clauses if c]
+        if not parts:
+            return ""
+        return "WHERE " + " AND ".join(parts)
+
     def get_record_count(self, table_name: str, market_hours_only: bool = False,
-                         time_start: str = None, time_end: str = None) -> int:
+                         time_start: str = None, time_end: str = None,
+                         cutoff_datetime: str = None) -> int:
         with self.get_connection() as conn:
             with self.get_cursor(conn) as cur:
                 time_filter = self._get_time_filter_clause(
                     table_name, market_hours_only, time_start, time_end)
-                if time_filter:
-                    query = f"SELECT COUNT(*) FROM {table_name} WHERE {time_filter}"
-                else:
-                    query = f"SELECT COUNT(*) FROM {table_name}"
+                cutoff = self._get_cutoff_clause(cutoff_datetime)
+                where_clause = self._build_where([time_filter, cutoff])
+                query = f"SELECT COUNT(*) FROM {table_name} {where_clause}"
                 cur.execute(query)
                 return cur.fetchone()[0]
 
     def fetch_display_data(self, table_name: str, limit: int = 1000, market_hours_only: bool = False,
-                           time_start: str = None, time_end: str = None) -> Tuple[List[Tuple], int]:
+                           time_start: str = None, time_end: str = None,
+                           cutoff_datetime: str = None) -> Tuple[List[Tuple], int]:
         with self.get_connection() as conn:
             with self.get_cursor(conn) as cur:
-                total_count = self.get_record_count(table_name, market_hours_only, time_start, time_end)
+                total_count = self.get_record_count(
+                    table_name, market_hours_only, time_start, time_end, cutoff_datetime)
 
                 has_new_columns = self._check_column_exists(table_name, 'market_date')
                 has_derived = self._check_column_exists(table_name, 'open_pct')
@@ -527,7 +547,8 @@ class DatabaseManager:
 
                 time_filter = self._get_time_filter_clause(
                     table_name, market_hours_only, time_start, time_end)
-                where_clause = f"WHERE {time_filter}" if time_filter else ""
+                cutoff = self._get_cutoff_clause(cutoff_datetime)
+                where_clause = self._build_where([time_filter, cutoff])
 
                 if total_count <= limit:
                     query = f"""
@@ -561,7 +582,8 @@ class DatabaseManager:
                 return rows, total_count
 
     def fetch_export_data(self, table_name: str, offset: int, limit: int, market_hours_only: bool = False,
-                          time_start: str = None, time_end: str = None) -> List[Tuple]:
+                          time_start: str = None, time_end: str = None,
+                          cutoff_datetime: str = None) -> List[Tuple]:
         with self.get_connection() as conn:
             with self.get_cursor(conn) as cur:
                 has_new_columns = self._check_column_exists(table_name, 'market_date')
@@ -581,7 +603,8 @@ class DatabaseManager:
 
                 time_filter = self._get_time_filter_clause(
                     table_name, market_hours_only, time_start, time_end)
-                where_clause = f"WHERE {time_filter}" if time_filter else ""
+                cutoff = self._get_cutoff_clause(cutoff_datetime)
+                where_clause = self._build_where([time_filter, cutoff])
 
                 query = f"""
                     SELECT {select_clause}
