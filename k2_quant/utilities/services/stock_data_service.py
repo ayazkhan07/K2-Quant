@@ -134,8 +134,14 @@ class StockService:
             current_start = chunk_end + timedelta(days=1)
         return chunks
 
+    def _get_thread_session(self) -> requests.Session:
+        if not hasattr(self._thread_local, 'session'):
+            self._thread_local.session = requests.Session()
+        return self._thread_local.session
+
     def _fetch_chunk(self, symbol: str, timespan: str, multiplier: int, start: str, end: str) -> List[Dict]:
         try:
+            session = self._get_thread_session()
             base_url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range"
             url = f"{base_url}/{multiplier}/{timespan}/{start}/{end}"
             params = {
@@ -144,7 +150,7 @@ class StockService:
                 'sort': 'asc',
                 'limit': 50000,
             }
-            response = requests.get(url, params=params, timeout=30)
+            response = session.get(url, params=params, timeout=30)
             response.raise_for_status()
             data = response.json()
             if data.get('status') == 'OK' and 'results' in data:

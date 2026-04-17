@@ -112,54 +112,85 @@ class DatabaseManager:
 
     @log_performance
     def bulk_insert_stock_data(self, table_name: str, data: List[Dict], market_hours_only: bool = False) -> int:
-        records = []
-        for item in data:
-            if 'timestamp' in item:
-                market_datetime = self.convert_to_market_time(item['timestamp'])
-                market_date = market_datetime.date()
-                market_time = market_datetime.time()
-                # Filter at write time if requested
-                if market_hours_only and not (time(9, 30) <= market_time < time(16, 0)):
-                    continue
-                records.append((
-                    item['timestamp'],
-                    market_datetime,
-                    market_date,
-                    market_time,
-                    round(float(item['open']), 2),
-                    round(float(item['high']), 2),
-                    round(float(item['low']), 2),
-                    round(float(item['close']), 2),
-                    item['volume'],
-                    round(float(item.get('vwap', 0)), 2),
-                    item.get('number_of_transactions', 0)
-                ))
-            else:
-                market_datetime = self.convert_to_market_time(item['t'])
-                market_date = market_datetime.date()
-                market_time = market_datetime.time()
-                # Filter at write time if requested
-                if market_hours_only and not (time(9, 30) <= market_time < time(16, 0)):
-                    continue
-                records.append((
-                    item['t'],
-                    market_datetime,
-                    market_date,
-                    market_time,
-                    round(float(item['o']), 2),
-                    round(float(item['h']), 2),
-                    round(float(item['l']), 2),
-                    round(float(item['c']), 2),
-                    item['v'],
-                    round(float(item.get('vw', 0)), 2),
-                    item.get('n', 0)
-                ))
-        if not records:
+        import numpy as np
+
+        if not data:
             k2_logger.warning("No records to insert", "DATABASE")
             return 0
+
+        first = data[0]
+        use_long_keys = 'timestamp' in first
+
+        if use_long_keys:
+            ts_arr = np.array([item['timestamp'] for item in data], dtype=np.int64)
+            o_arr = np.array([item['open'] for item in data], dtype=np.float64)
+            h_arr = np.array([item['high'] for item in data], dtype=np.float64)
+            l_arr = np.array([item['low'] for item in data], dtype=np.float64)
+            c_arr = np.array([item['close'] for item in data], dtype=np.float64)
+            v_arr = np.array([item['volume'] for item in data], dtype=np.int64)
+            vw_arr = np.array([item.get('vwap', 0) for item in data], dtype=np.float64)
+            n_arr = np.array([item.get('number_of_transactions', 0) for item in data], dtype=np.int64)
+        else:
+            ts_arr = np.array([item['t'] for item in data], dtype=np.int64)
+            o_arr = np.array([item['o'] for item in data], dtype=np.float64)
+            h_arr = np.array([item['h'] for item in data], dtype=np.float64)
+            l_arr = np.array([item['l'] for item in data], dtype=np.float64)
+            c_arr = np.array([item['c'] for item in data], dtype=np.float64)
+            v_arr = np.array([item['v'] for item in data], dtype=np.int64)
+            vw_arr = np.array([item.get('vw', 0) for item in data], dtype=np.float64)
+            n_arr = np.array([item.get('n', 0) for item in data], dtype=np.int64)
+
+        market_dt_series = pd.to_datetime(ts_arr, unit='ms', utc=True).tz_convert(self.timezone_str)
+        naive_dt = market_dt_series.tz_localize(None)
+        market_dates = naive_dt.date
+        market_times = naive_dt.time
+
+        np.round(o_arr, 2, out=o_arr)
+        np.round(h_arr, 2, out=h_arr)
+        np.round(l_arr, 2, out=l_arr)
+        np.round(c_arr, 2, out=c_arr)
+        np.round(vw_arr, 2, out=vw_arr)
+
+        if market_hours_only:
+            t_start = time(9, 30)
+            t_end = time(16, 0)
+            mask = np.array([t_start <= t < t_end for t in market_times], dtype=bool)
+            ts_arr = ts_arr[mask]
+            naive_dt_arr = naive_dt[mask]
+            market_dates = market_dates[mask]
+            market_times = market_times[mask]
+            o_arr = o_arr[mask]
+            h_arr = h_arr[mask]
+            l_arr = l_arr[mask]
+            c_arr = c_arr[mask]
+            v_arr = v_arr[mask]
+            vw_arr = vw_arr[mask]
+            n_arr = n_arr[mask]
+        else:
+            naive_dt_arr = naive_dt
+
+        count = len(ts_arr)
+        if count == 0:
+            k2_logger.warning("No records to insert after filtering", "DATABASE")
+            return 0
+
+        records = list(zip(
+            ts_arr.tolist(),
+            naive_dt_arr.to_pydatetime().tolist(),
+            market_dates.tolist(),
+            market_times.tolist(),
+            o_arr.tolist(),
+            h_arr.tolist(),
+            l_arr.tolist(),
+            c_arr.tolist(),
+            v_arr.tolist(),
+            vw_arr.tolist(),
+            n_arr.tolist(),
+        ))
+
         with self.get_connection() as conn:
             with self.get_cursor(conn) as cur:
-                k2_logger.database_operation("Bulk insert", f"{len(records):,} records")
+                k2_logger.database_operation("Bulk insert", f"{count:,} records")
                 execute_values(
                     cur,
                     f"""INSERT INTO {table_name} (timestamp, date_time_market, market_date, market_time, open, high, low, close, volume, vwap, transactions) VALUES %s""",
@@ -168,8 +199,8 @@ class DatabaseManager:
                     page_size=self.BULK_INSERT_PAGE_SIZE,
                 )
                 conn.commit()
-                k2_logger.database_operation("Bulk insert completed", f"{len(records):,} records")
-        return len(records)
+                k2_logger.database_operation("Bulk insert completed", f"{count:,} records")
+        return count
 
     def convert_to_logged_table(self, table_name: str):
         with self.get_connection() as conn:
@@ -220,9 +251,9 @@ class DatabaseManager:
     def store_stock_data(self, symbol: str, timespan: str, range_val: str, data: List[Dict], market_hours_only: bool = False) -> Tuple[str, int]:
         table_name = self.create_stock_table(symbol, timespan, range_val)
         inserted_count = self.bulk_insert_stock_data(table_name, data, market_hours_only=market_hours_only)
-        self.convert_to_logged_table(table_name)
-        self.create_indexes(table_name)
         self.compute_derived_columns(table_name)
+        self.create_indexes(table_name)
+        self.convert_to_logged_table(table_name)
         return table_name, inserted_count
 
     def compute_derived_columns(self, table_name: str):
