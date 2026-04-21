@@ -52,6 +52,7 @@ from k2_quant.utilities.services.strategy_service import strategy_service
 from k2_quant.utilities.report_helpers import format_blocks_plain
 from k2_quant.utilities.numeric_rounding import round_dataframe_numeric_columns
 from k2_quant.utilities.services.dynamic_python_engine import dpe_service
+from k2_quant.utilities.services.strategy_runner import strategy_runner
 
 # Import the three pane components
 from PyQt6.QtWidgets import QTabWidget
@@ -91,7 +92,16 @@ class AnalysisPageWidget(QWidget):
         self.current_data = None
         self.current_metadata = {}
         self.applied_indicators = {}
-        
+
+        # Strategy-runner wiring. Same contract as stream_window: signals
+        # are shared across pages, so handlers filter on ``_strategy_jobs``.
+        self._strategy_jobs: Dict[str, str] = {}
+        strategy_runner.started.connect(self._on_strategy_started)
+        strategy_runner.progress.connect(self._on_strategy_progress)
+        strategy_runner.finished.connect(self._on_strategy_finished)
+        strategy_runner.failed.connect(self._on_strategy_failed)
+        strategy_runner.cancelled.connect(self._on_strategy_cancelled)
+
         self.init_ui()
         self.setup_styling()
         self.load_saved_models()
@@ -499,16 +509,19 @@ class AnalysisPageWidget(QWidget):
                 k2_logger.warning("No chart window available for indicator calculation", "ANALYSIS")
                 return
 
-            # Build a timezone-naive datetime index (Date+Time when available)
-            if 'Date' in display_df.columns and 'Time' in display_df.columns:
+            # Build a timezone-naive datetime index. Prefer the chart's
+            # already-precomputed 'datetime' column (see _precompute_datetime_column
+            # in chart/main.py) to avoid reparsing millions of Date+Time strings
+            # on every indicator toggle.
+            if 'datetime' in display_df.columns:
+                dt_index = pd.to_datetime(display_df['datetime'], errors='coerce')
+            elif 'Date' in display_df.columns and 'Time' in display_df.columns:
                 dt_index = pd.to_datetime(
                     display_df['Date'].astype(str) + ' ' + display_df['Time'].astype(str),
                     errors='coerce'
                 )
             elif 'Date' in display_df.columns:
                 dt_index = pd.to_datetime(display_df['Date'], errors='coerce')
-            elif 'datetime' in display_df.columns:
-                dt_index = pd.to_datetime(display_df['datetime'], errors='coerce')
             else:
                 k2_logger.warning("Indicator source dataframe missing Date column", "ANALYSIS")
                 return
@@ -676,30 +689,77 @@ class AnalysisPageWidget(QWidget):
             k2_logger.error(f"Strategy toggle failed: {str(e)}", "ANALYSIS")
     
     def apply_strategy(self, strategy_name: str):
-        """Apply strategy — routes to forecast tab or DB projections."""
+        """Apply strategy - dispatched to ``strategy_runner`` so the GUI stays
+        responsive on large minute-bar models. Post-processing happens in
+        ``_on_strategy_finished``."""
         table_name = self.current_model
-        
         code = strategy_service.get_strategy_code(strategy_name)
         if not code:
             k2_logger.warning(f"Strategy code not found: {strategy_name}", "ANALYSIS")
             return
-        
-        # Load full dataset, respecting the model's market-hours preference
-        mkt_hours = self.current_metadata.get('market_hours_only', False)
-        rows, _ = stock_service.get_display_data(
+
+        mkt_hours = bool(self.current_metadata.get('market_hours_only', False))
+        has_rn = bool(self.current_metadata.get('has_row_number', False))
+
+        def _loader():
+            return self._build_strategy_frame(table_name, mkt_hours, has_rn)
+
+        key = strategy_runner.submit(
+            table_name=table_name,
+            strategy_name=strategy_name,
+            code=code,
+            loader=_loader,
+        )
+        if key is None:
+            return
+        self._strategy_jobs[key] = strategy_name
+
+    @staticmethod
+    def _build_strategy_frame(table_name: str, mkt_hours: bool,
+                              has_rn: bool) -> pd.DataFrame:
+        """Runs on the strategy worker thread - no Qt calls."""
+        import time as _time
+        t0 = _time.time()
+        rows, _total = stock_service.get_display_data(
             table_name, limit=10**9, market_hours_only=mkt_hours)
-        has_rn = self.current_metadata.get('has_row_number', False)
+        t_fetch = (_time.time() - t0) * 1000.0
+        k2_logger.info(
+            f"[loader] db_fetch took={t_fetch:,.0f} ms rows={len(rows):,} "
+            f"table={table_name} mkt_hours={mkt_hours}",
+            "ANALYSIS",
+        )
+
         if has_rn:
             all_columns = ['#','Date','Time','Open','High','Low','Close','Volume','VWAP',
                             'Open_%','High_%','Low_%','Close_%','Elasticity','Close-Open_%']
         else:
             all_columns = ['Date','Time','Open','High','Low','Close','Volume','VWAP',
                             'Open_%','High_%','Low_%','Close_%','Elasticity','Close-Open_%']
+
+        t1 = _time.time()
         df = pd.DataFrame(rows, columns=all_columns[:len(rows[0])] if rows else all_columns[:8])
-        
-        df['date_time_market'] = pd.to_datetime(df['Date'].astype(str) + ' ' + df['Time'].astype(str))
+        t_build = (_time.time() - t1) * 1000.0
+        k2_logger.info(
+            f"[loader] df_build took={t_build:,.0f} ms shape={df.shape}",
+            "ANALYSIS",
+        )
+
+        t2 = _time.time()
+        # ``Date`` arrives as datetime.date, ``Time`` as datetime.time from psycopg2.
+        # The previous implementation did ``Date.astype(str) + ' ' + Time.astype(str)``
+        # then ``pd.to_datetime`` with format-inference: on 1.9M rows that is
+        # ~1s of pure Python string work + C parse. Passing an explicit
+        # ``format`` lets pandas take the fast strptime path (~3-5x faster),
+        # and we only pay the construction cost once.
+        date_str = df['Date'].astype(str)
+        time_str = df['Time'].astype(str)
+        df['date_time_market'] = pd.to_datetime(
+            date_str + ' ' + time_str,
+            format='%Y-%m-%d %H:%M:%S',
+            errors='coerce',
+            cache=True,
+        )
         df = df.rename(columns={'Open':'open','High':'high','Low':'low','Close':'close','Volume':'volume','VWAP':'vwap'})
-        # Display fetch uses UI labels; strategies and DB use snake_case.
         df = df.rename(columns={
             'Open_%': 'open_pct',
             'High_%': 'high_pct',
@@ -708,28 +768,84 @@ class AnalysisPageWidget(QWidget):
             'Elasticity': 'elasticity',
             'Close-Open_%': 'close_open_pct',
         })
-        # Legacy tables may omit derived columns from SELECT; mirror db_manager.compute_derived_columns.
+        recomputed = False
         if 'open_pct' not in df.columns and all(c in df.columns for c in ('open', 'high', 'low', 'close')):
+            recomputed = True
             df = df.sort_values('date_time_market', kind='mergesort').reset_index(drop=True)
-            for c in ('open', 'high', 'low', 'close'):
-                prev = df[c].astype(float).shift(1)
-                cur = df[c].astype(float)
-                df[f'{c}_pct'] = np.where(
+            # Coerce each price column to float once, then reuse. With the
+            # NUMERIC->float typecaster in db_manager these are already float
+            # and ``astype(float)`` is a no-op fast path; this keeps
+            # correctness on legacy connections while avoiding 4x redundant
+            # ``astype`` calls.
+            o_ = df['open'].astype(float, copy=False)
+            hi = df['high'].astype(float, copy=False)
+            lo = df['low'].astype(float, copy=False)
+            cl = df['close'].astype(float, copy=False)
+            for name, cur in (('open', o_), ('high', hi), ('low', lo), ('close', cl)):
+                prev = cur.shift(1)
+                df[f'{name}_pct'] = np.where(
                     (prev != 0) & prev.notna() & cur.notna(),
                     (cur - prev) / prev * 100.0,
                     np.nan,
                 )
-            lo = df['low'].astype(float)
-            o_ = df['open'].astype(float)
-            cl = df['close'].astype(float)
-            hi = df['high'].astype(float)
             df['elasticity'] = np.where(lo != 0, (hi - lo) / lo * 100.0, np.nan)
             df['close_open_pct'] = np.where(o_ != 0, (cl - o_) / o_ * 100.0, np.nan)
+        t_derive = (_time.time() - t2) * 1000.0
+        k2_logger.info(
+            f"[loader] derive_cols took={t_derive:,.0f} ms recomputed_pct={recomputed}",
+            "ANALYSIS",
+        )
 
-        df = round_dataframe_numeric_columns(df)
+        t3 = _time.time()
+        out = round_dataframe_numeric_columns(df)
+        t_round = (_time.time() - t3) * 1000.0
+        k2_logger.info(
+            f"[loader] round_numeric took={t_round:,.0f} ms",
+            "ANALYSIS",
+        )
+        k2_logger.info(
+            f"[loader] total={(t_fetch + t_build + t_derive + t_round):,.0f} ms",
+            "ANALYSIS",
+        )
+        return out
 
-        result = dpe_service.execute_strategy(code, df)
+    # ── Strategy runner signal handlers (GUI thread) ─────────────────
+    def _own_strategy_key(self, key: str) -> bool:
+        return key in self._strategy_jobs
 
+    def _on_strategy_started(self, key: str):
+        if not self._own_strategy_key(key):
+            return
+        name = self._strategy_jobs.get(key, '?')
+        k2_logger.info(f"Strategy started: {name}", "ANALYSIS")
+
+    def _on_strategy_progress(self, key: str, message: str):
+        if not self._own_strategy_key(key):
+            return
+        name = self._strategy_jobs.get(key, '?')
+        k2_logger.info(f"Strategy '{name}' progress: {message}", "ANALYSIS")
+
+    def _on_strategy_failed(self, key: str, error: str):
+        if not self._own_strategy_key(key):
+            return
+        name = self._strategy_jobs.pop(key, '?')
+        k2_logger.error(f"Strategy '{name}' failed: {error}", "ANALYSIS")
+
+    def _on_strategy_cancelled(self, key: str):
+        if not self._own_strategy_key(key):
+            return
+        name = self._strategy_jobs.pop(key, '?')
+        k2_logger.info(f"Strategy '{name}' cancelled", "ANALYSIS")
+
+    def _on_strategy_finished(self, key: str, result: object):
+        if not self._own_strategy_key(key):
+            return
+        strategy_name = self._strategy_jobs.pop(key, None)
+        if strategy_name is None or not isinstance(result, dict):
+            return
+
+        table_name = self.current_model
+        code = strategy_service.get_strategy_code(strategy_name) or ''
         strategy_service.save_run(
             strategy_name=strategy_name,
             code_snapshot=code,
@@ -741,8 +857,7 @@ class AnalysisPageWidget(QWidget):
         if not result.get('success'):
             k2_logger.error(f"Strategy execution failed: {result.get('error')}", "ANALYSIS")
             return
-        
-        # ── Route tab writes (forecast + working) if the strategy produced any ──
+
         tab_writes = result.get('_tab_writes', [])
         forecast_writes = [w for w in tab_writes if w.get("type") == "forecast"]
         working_writes = [w for w in tab_writes if w.get("type") == "working"]
@@ -769,32 +884,39 @@ class AnalysisPageWidget(QWidget):
                 "ANALYSIS",
             )
             return
-        
-        # ── Legacy path: DB projection rows ──
-        result_df = result.get('data') if isinstance(result.get('data'), pd.DataFrame) else df
-        proj_df = result_df.iloc[len(df):].copy() if len(result_df) > len(df) else pd.DataFrame()
-        
+
+        result_df = result.get('data')
+        if not isinstance(result_df, pd.DataFrame):
+            return
+        metrics = result.get('metrics') or {}
+        original_rows = int(metrics.get('original_rows') or 0)
+        proj_df = (result_df.iloc[original_rows:].copy()
+                   if original_rows and len(result_df) > original_rows
+                   else pd.DataFrame())
+
         if not proj_df.empty:
             stock_service.delete_projections(table_name, strategy_name)
             stock_service.insert_projections(table_name, proj_df, strategy_name)
-            
             saved_models_manager.set_model_state(
                 table_name,
                 indicators=None,
                 active_strategy=strategy_name,
-                chart_range=None
+                chart_range=None,
             )
-            
             mkt_hours = self.current_metadata.get('market_hours_only', False)
             rows, total_count = stock_service.get_display_data(
                 table_name, limit=500, market_hours_only=mkt_hours)
             self.middle_pane.load_data(rows, self.current_metadata)
             self.model_label.setText(f"Model: {table_name} ({total_count:,} records)")
-    
+
     def remove_strategy(self, strategy_name: str):
         """Remove strategy projections and clear that strategy's forecast columns."""
         table_name = self.current_model
-        
+
+        key = strategy_runner.make_key(table_name or '', strategy_name)
+        if strategy_runner.is_running(key):
+            strategy_runner.cancel(key)
+
         try:
             stock_service.delete_projections(table_name, strategy_name)
         except Exception:

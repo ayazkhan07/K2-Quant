@@ -26,7 +26,15 @@ report_config([
     ('MAX_T_ALLOWED', f'{MAX_T_ALLOWED*100:.0f} %', 'Hard ceiling for any step tolerance'),
     ('INIT_TOL_MAX', f'{INIT_TOL_MAX*100:.0f} %', 'Upper bound scanned for initial tolerance'),
 ])
+# Progress hook - no-op when strategy is run outside DPE.
+try:
+    __k2_progress__
+except NameError:
+    def __k2_progress__(*_a, **_k):
+        pass
+
 # --------------------------- PREP THE DATA -------------------------------
+__k2_progress__('prep', f'n_rows={len(df):,}')
 df_sorted = df.sort_values('#').reset_index(drop=True) if '#' in df.columns else df.sort_values('date_time_market').reset_index(drop=True)
 if '#' not in df_sorted.columns:
     df_sorted['#'] = range(1, len(df_sorted) + 1)
@@ -43,6 +51,7 @@ P_h     = float(df_sorted.loc[pos_i, 'high'])
 P_L     = float(df_sorted.loc[pos_i, 'low'])
 h_focal = H[pos_i]
 l_focal = L[pos_i]
+__k2_progress__('prep_done', f'max_idx={max_idx} focal_h={h_focal:.4f} focal_l={l_focal:.4f}')
 report_table(
     'Step 1: Focal anchor',
     ['Quantity', 'Value', 'Notes'],
@@ -72,6 +81,8 @@ def run_recursive_match(series_name, focal_val, focal_series, I_arr, H_arr, L_ar
     mx = int(I_arr.max())
     best_failed = None
     max_loop = int(INIT_TOL_MAX * 100)
+    __k2_progress__(f'track_{series_name}_start',
+                    f'focal={focal_val:.4f} max_loop={max_loop} N={len(all_vals):,}')
     for tp in range(1, max_loop + 1):
         t0 = tp / 100.0
         lo0 = focal_val - abs(focal_val) * t0
@@ -79,6 +90,8 @@ def run_recursive_match(series_name, focal_val, focal_series, I_arr, H_arr, L_ar
         init_idx = I_arr[(all_vals >= lo0) & (all_vals <= hi0)]
         if len(init_idx) < r2lo:
             continue
+        __k2_progress__(f'track_{series_name}_tp',
+                        f'tp={tp} t0={t0:.2f} init_matches={len(init_idx):,}')
         for ts in range(10, 200, 5):
             t1_start = ts / 100.0
             for ti in range(5, 200, 5):
@@ -143,10 +156,14 @@ def run_recursive_match(series_name, focal_val, focal_series, I_arr, H_arr, L_ar
                         'step_log': step_log,
                     }
     return {'success': False, 'best_failed': best_failed}
+__k2_progress__('match_H', 'dispatching high track')
 h_result = run_recursive_match('H', h_focal, Hf_arr, I, H, L, idx_to_pos,
                                R1, R2_Lo, R2_Hi, ADAPT_FACTOR, MAX_T_ALLOWED)
+__k2_progress__('match_H_done', f"success={h_result.get('success')}")
+__k2_progress__('match_L', 'dispatching low track')
 l_result = run_recursive_match('L', l_focal, Lf_arr, I, H, L, idx_to_pos,
                                R1, R2_Lo, R2_Hi, ADAPT_FACTOR, MAX_T_ALLOWED)
+__k2_progress__('match_L_done', f"success={l_result.get('success')}")
 # --------------- STEP 2 READOUT: TRACK DIAGNOSTICS -----------------------
 def _track_readout(label, focal_val, price_anchor, res):
     rows = []
@@ -339,8 +356,10 @@ def build_matrix(indices, H_arr, L_arr, itp):
                 m_h[r, c] = H_arr[p]
                 m_l[r, c] = L_arr[p]
     return m_h, m_l
+__k2_progress__('build_matrix', f'h_surv={len(h_surv)} l_surv={len(l_surv)}')
 Mh, _  = build_matrix(h_surv, H, L, idx_to_pos)
 _,  ML = build_matrix(l_surv, H, L, idx_to_pos)
+__k2_progress__('build_matrix_done', f'Mh={Mh.shape} ML={ML.shape}')
 report_table('Step 4b: Forward % matrices',
              ['Matrix', 'Shape', 'Role'],
              [['Mh', f"{Mh.shape[0]}x{Mh.shape[1]}", 'High survivors -> high_pct'],
@@ -381,8 +400,10 @@ forecast_pairs = [
     ('ML_Min', ML_Min_price, P_L),
     ('ML_Max', ML_Max_price, P_L),
 ]
+__k2_progress__('forecast_write', f'{len(forecast_pairs)} columns')
 for name, vec, anchor in forecast_pairs:
     to_forecast(name, list(vec), anchor_price=anchor)
 report_table('Forecast Columns Written',
              ['Column', 'Length'],
              [[n, len(v)] for n, v, _ in forecast_pairs])
+__k2_progress__('done', 'forecast columns written')

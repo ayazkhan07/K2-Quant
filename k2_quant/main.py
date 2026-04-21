@@ -418,6 +418,14 @@ class MainApplication(QObject):
             self.landing_page.cleanup()
         if self.main_window:
             self.main_window.cleanup()
+        # Cancel any in-flight strategies and wait briefly for the pool
+        # to drain so psycopg2 connections and file handles are released.
+        try:
+            from k2_quant.utilities.services.strategy_runner import strategy_runner
+            strategy_runner.shutdown(wait_ms=3000)
+        except Exception as e:
+            k2_logger.warning(
+                f"strategy_runner shutdown failed: {e}", "MAIN")
 
 
 def setup_global_styling(app):

@@ -57,4 +57,31 @@ RULE 5 — Run retention: last N per strategy
 records are kept per strategy name. After each ``save_run``, older rows
 beyond this limit are deleted inside the same connection. The Outputs panel
 UI requests at most ``MAX_RUNS_PER_STRATEGY`` rows when building the tree.
+
+---------------------------------------------------------------------------
+RULE 7 — Report cells are capped to MAX_REPORT_CELL_CHARS
+---------------------------------------------------------------------------
+Every string cell captured by ``report_table`` / ``report_config`` is passed
+through ``report_helpers._cap_cell_text`` before being appended to the active
+blocks list. The cap is ``report_helpers.MAX_REPORT_CELL_CHARS`` (1,500).
+Comma-separated lists are truncated on ``', '`` token boundaries and marked
+``" … (+K more)"``; other long strings are hard-sliced and marked
+``" … (+K chars)"``.
+
+Rationale: ``OutputsPanel._append_data_table`` calls
+``QTableWidget.resizeColumnsToContents()`` followed by
+``setFixedWidth(total_w)``. Cells large enough to produce column widths in the
+millions of pixels (observed ~136 KB single cells on full-model RPP runs)
+collapse the QScrollArea layout so neither the offending table nor its
+siblings render — the OUTPUTS detail pane shows only the meta rows (Strategy
+/ Model / Timestamp / Status / Time) with no report body.
+
+The cap protects three independent surfaces at once:
+  1) UI layout in ``OutputsPanel._append_data_table``.
+  2) DB row size for ``strategy_runs.report_blocks_json`` (~5x shrink on RPP).
+  3) Thinkspace / LLM context payloads when a run is sent to chat.
+
+Strategy authors: if you need the true item count alongside a (possibly long)
+list, surface it as its own column (e.g. ``'Count'``). Only the list-column
+string is truncated; numeric columns pass through untouched.
 """

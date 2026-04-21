@@ -27,6 +27,7 @@ from PyQt6.QtGui import QFont, QCursor
 from k2_quant.utilities.logger import k2_logger
 from k2_quant.utilities.data.saved_models_manager import saved_models_manager
 from k2_quant.utilities.services.strategy_service import strategy_service
+from k2_quant.utilities.services.strategy_runner import strategy_runner
 
 from k2_quant.pages.analysis.components.left_pane import LeftPaneWidget
 from k2_quant.pages.stream.components.stream_window import StreamWindowWidget
@@ -629,6 +630,19 @@ class StreamPageWidget(QWidget):
         content = self._get_active_content()
         if content is None:
             k2_logger.warning("No active stream window for strategy toggle", "STREAM")
+            return
+
+        # Reentrancy guard: silently ignore a duplicate "enable" while a run
+        # for this (table, strategy) pair is still in flight. This prevents
+        # double-submits when users click the checkbox twice in rapid
+        # succession or when session restore re-fires signals.
+        key = strategy_runner.make_key(content.table_name, strategy_name)
+        if enabled and strategy_runner.is_running(key):
+            k2_logger.info(
+                f"Strategy '{strategy_name}' already running on "
+                f"{content.table_name}; ignoring duplicate toggle.",
+                "STREAM",
+            )
             return
 
         if enabled:

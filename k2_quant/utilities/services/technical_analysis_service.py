@@ -67,10 +67,15 @@ class IndicatorConfig:
 
 class TechnicalAnalysisService:
     """Service for calculating technical indicators"""
-    
+
+    # Upper bound on the number of cached indicator results. Each entry is
+    # typically one Series (or a small dict of Series) sized to the chart
+    # window; at ~2M rows that's ~16 MB per entry, so keep this modest.
+    _CACHE_MAX_ENTRIES = 64
+
     def __init__(self):
         self.indicators = self.initialize_indicators()
-        self.calculated_cache = {}  # Cache calculated indicators
+        self.calculated_cache = {}  # (service_name, params_key, fingerprint) -> Series | Dict[str, Series]
     
     def initialize_indicators(self) -> Dict[str, IndicatorConfig]:
         """Initialize all available indicators alphabetically"""
@@ -283,6 +288,60 @@ class TechnicalAnalysisService:
         
         return name_mappings.get(display_name_upper)
     
+    def _make_cache_key(self, service_name: str, params: Dict[str, Any],
+                        data: pd.DataFrame):
+        """Build a stable, lightweight fingerprint for (indicator, params, data window).
+
+        The fingerprint does NOT hold a reference to `data` so cached entries
+        don't prevent garbage collection of old chart frames. We disambiguate
+        windows of the same length via the first/last index values and the
+        first/last close price.
+        """
+        try:
+            n = len(data)
+            if n == 0:
+                return None
+            idx0 = data.index[0]
+            idx1 = data.index[-1]
+            close0 = close1 = None
+            if 'close' in data.columns:
+                try:
+                    close0 = float(data['close'].iloc[0])
+                    close1 = float(data['close'].iloc[-1])
+                except Exception:
+                    pass
+            params_key = tuple(sorted(params.items()))
+            return (service_name, params_key, n, idx0, idx1, close0, close1)
+        except Exception:
+            return None
+
+    def _cache_get(self, key):
+        """Return a defensive copy of a cached result, or None."""
+        if key is None:
+            return None
+        cached = self.calculated_cache.get(key)
+        if cached is None:
+            return None
+        if isinstance(cached, dict):
+            return {k: v.copy() for k, v in cached.items()}
+        return cached.copy()
+
+    def _cache_put(self, key, value):
+        """Store a result with simple FIFO eviction to bound memory."""
+        if key is None or value is None:
+            return
+        if isinstance(value, pd.Series) and value.empty:
+            return
+        cache = self.calculated_cache
+        if key in cache:
+            cache.pop(key)
+        cache[key] = value
+        while len(cache) > self._CACHE_MAX_ENTRIES:
+            try:
+                cache.pop(next(iter(cache)))
+            except StopIteration:
+                break
+
     def calculate_indicator(self, data: pd.DataFrame, indicator_name: str,
                           custom_params: Dict[str, Any] = None) -> pd.Series:
         """
@@ -319,6 +378,12 @@ class TechnicalAnalysisService:
         # Override with custom parameters if provided
         if custom_params:
             params.update(custom_params)
+
+        cache_key = self._make_cache_key(indicator_name, params, data)
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            k2_logger.info(f"Cache hit for {indicator_name}", "TA")
+            return cached
         
         try:
             # Prepare data - TA-Lib requires float64 (C double)
@@ -337,7 +402,8 @@ class TechnicalAnalysisService:
                 if result is not None:
                     series = pd.Series(result, index=data.index)
                     k2_logger.info(f"Calculated {indicator_name} (daily reset)", "TA")
-                    return series
+                    self._cache_put(cache_key, series)
+                    return series.copy()
                 return pd.Series()
             
             # Calculate based on indicator type
@@ -353,7 +419,8 @@ class TechnicalAnalysisService:
                 for key, values in result.items():
                     series_dict[key] = pd.Series(values, index=data.index)
                 k2_logger.info(f"Calculated {indicator_name} (multiple lines)", "TA")
-                return series_dict
+                self._cache_put(cache_key, series_dict)
+                return {k: v.copy() for k, v in series_dict.items()}
             elif isinstance(result, tuple):
                 # For indicators that return multiple values (like MACD)
                 # Return the main line
@@ -362,7 +429,8 @@ class TechnicalAnalysisService:
             if result is not None:
                 series = pd.Series(result, index=data.index)
                 k2_logger.info(f"Calculated {indicator_name}", "TA")
-                return series
+                self._cache_put(cache_key, series)
+                return series.copy()
             
         except Exception as e:
             k2_logger.error(f"Failed to calculate {indicator_name}: {str(e)}", "TA")

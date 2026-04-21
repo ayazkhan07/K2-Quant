@@ -32,6 +32,7 @@ from k2_quant.utilities.services.strategy_service import strategy_service
 from k2_quant.utilities.report_helpers import format_blocks_plain
 from k2_quant.utilities.numeric_rounding import round_dataframe_numeric_columns
 from k2_quant.utilities.services.dynamic_python_engine import dpe_service
+from k2_quant.utilities.services.strategy_runner import strategy_runner
 
 from k2_quant.pages.analysis.widgets.chart import ChartWidget
 from k2_quant.pages.analysis.widgets.data_tabs_widget import DataTabsWidget
@@ -109,6 +110,16 @@ class StreamWindowWidget(QWidget):
         self._reconciler: Optional[StreamReconciler] = None
         self._actual_lines: Dict[str, Any] = {}
         self._last_forming_price: Optional[float] = None
+
+        # Strategy-runner wiring: map job_key -> strategy_name so signal
+        # handlers can route back to the right post-processing step. Only
+        # signals whose key matches this window's table_name are acted on.
+        self._strategy_jobs: Dict[str, str] = {}
+        strategy_runner.started.connect(self._on_strategy_started)
+        strategy_runner.progress.connect(self._on_strategy_progress)
+        strategy_runner.finished.connect(self._on_strategy_finished)
+        strategy_runner.failed.connect(self._on_strategy_failed)
+        strategy_runner.cancelled.connect(self._on_strategy_cancelled)
 
         self._init_ui()
         self._load_model()
@@ -551,6 +562,14 @@ class StreamWindowWidget(QWidget):
 
     # ── Strategy support ──────────────────────────────────────────
 
+    # ── Strategy apply: async dispatch to StrategyRunner ──────────
+    #
+    # The data load, DataFrame build, and DPE exec all run on a worker
+    # thread so the Qt event loop stays responsive on large minute-bar
+    # models (1M+ rows). See k2_quant.utilities.services.strategy_runner.
+    # Post-processing (save_run, forecast routing, chart reload) runs on
+    # the GUI thread in ``_on_strategy_finished``.
+
     def apply_strategy(self, strategy_name: str):
         table_name = self.table_name
         code = strategy_service.get_strategy_code(strategy_name)
@@ -558,10 +577,41 @@ class StreamWindowWidget(QWidget):
             k2_logger.warning(f"Strategy code not found: {strategy_name}", "STREAM")
             return
 
-        mkt_hours = self.current_metadata.get('market_hours_only', False)
-        rows, _ = stock_service.get_display_data(
+        mkt_hours = bool(self.current_metadata.get('market_hours_only', False))
+        has_rn = bool(self.current_metadata.get('has_row_number', False))
+
+        def _loader():
+            return self._build_strategy_frame(table_name, mkt_hours, has_rn)
+
+        key = strategy_runner.submit(
+            table_name=table_name,
+            strategy_name=strategy_name,
+            code=code,
+            loader=_loader,
+        )
+        if key is None:
+            return
+        self._strategy_jobs[key] = strategy_name
+
+    @staticmethod
+    def _build_strategy_frame(table_name: str, mkt_hours: bool,
+                              has_rn: bool) -> pd.DataFrame:
+        """Runs on the strategy worker thread - no Qt calls.
+
+        Logs per-step wall-clock so the terminal shows where the 15-20s
+        pre-strategy cost goes on large minute-bar tables.
+        """
+        import time as _time
+        t0 = _time.time()
+        rows, _total = stock_service.get_display_data(
             table_name, limit=10**9, market_hours_only=mkt_hours)
-        has_rn = self.current_metadata.get('has_row_number', False)
+        t_fetch = (_time.time() - t0) * 1000.0
+        k2_logger.info(
+            f"[loader] db_fetch took={t_fetch:,.0f} ms rows={len(rows):,} "
+            f"table={table_name} mkt_hours={mkt_hours}",
+            "STREAM",
+        )
+
         if has_rn:
             all_columns = ['#', 'Date', 'Time', 'Open', 'High', 'Low', 'Close',
                            'Volume', 'VWAP', 'Open_%', 'High_%', 'Low_%',
@@ -570,8 +620,16 @@ class StreamWindowWidget(QWidget):
             all_columns = ['Date', 'Time', 'Open', 'High', 'Low', 'Close',
                            'Volume', 'VWAP', 'Open_%', 'High_%', 'Low_%',
                            'Close_%', 'Elasticity', 'Close-Open_%']
-        df = pd.DataFrame(rows, columns=all_columns[:len(rows[0])] if rows else all_columns[:8])
 
+        t1 = _time.time()
+        df = pd.DataFrame(rows, columns=all_columns[:len(rows[0])] if rows else all_columns[:8])
+        t_build = (_time.time() - t1) * 1000.0
+        k2_logger.info(
+            f"[loader] df_build took={t_build:,.0f} ms shape={df.shape}",
+            "STREAM",
+        )
+
+        t2 = _time.time()
         df['date_time_market'] = pd.to_datetime(
             df['Date'].astype(str) + ' ' + df['Time'].astype(str))
         df = df.rename(columns={
@@ -581,8 +639,10 @@ class StreamWindowWidget(QWidget):
             'Low_%': 'low_pct', 'Close_%': 'close_pct',
             'Elasticity': 'elasticity', 'Close-Open_%': 'close_open_pct',
         })
+        recomputed = False
         if 'open_pct' not in df.columns and all(
                 c in df.columns for c in ('open', 'high', 'low', 'close')):
+            recomputed = True
             df = df.sort_values('date_time_market', kind='mergesort').reset_index(drop=True)
             for c in ('open', 'high', 'low', 'close'):
                 prev = df[c].astype(float).shift(1)
@@ -596,9 +656,75 @@ class StreamWindowWidget(QWidget):
             hi = df['high'].astype(float)
             df['elasticity'] = np.where(lo != 0, (hi - lo) / lo * 100.0, np.nan)
             df['close_open_pct'] = np.where(o_ != 0, (cl - o_) / o_ * 100.0, np.nan)
+        t_derive = (_time.time() - t2) * 1000.0
+        k2_logger.info(
+            f"[loader] derive_cols took={t_derive:,.0f} ms "
+            f"recomputed_pct={recomputed}",
+            "STREAM",
+        )
 
-        df = round_dataframe_numeric_columns(df)
-        result = dpe_service.execute_strategy(code, df)
+        t3 = _time.time()
+        out = round_dataframe_numeric_columns(df)
+        t_round = (_time.time() - t3) * 1000.0
+        k2_logger.info(
+            f"[loader] round_numeric took={t_round:,.0f} ms",
+            "STREAM",
+        )
+        k2_logger.info(
+            f"[loader] total={(t_fetch + t_build + t_derive + t_round):,.0f} ms",
+            "STREAM",
+        )
+        return out
+
+    # ── Strategy runner signal handlers (GUI thread) ──────────────
+    def _own_key(self, key: str) -> bool:
+        """True if ``key`` belongs to a job this window submitted."""
+        return key in self._strategy_jobs
+
+    def _on_strategy_started(self, key: str):
+        if not self._own_key(key):
+            return
+        name = self._strategy_jobs.get(key, '?')
+        k2_logger.info(f"Strategy started: {name}", "STREAM")
+        self.stream_status_changed.emit(f"Running strategy: {name}")
+
+    def _on_strategy_progress(self, key: str, message: str):
+        if not self._own_key(key):
+            return
+        name = self._strategy_jobs.get(key, '?')
+        self.stream_status_changed.emit(f"{name}: {message}")
+
+    def _on_strategy_failed(self, key: str, error: str):
+        if not self._own_key(key):
+            return
+        name = self._strategy_jobs.pop(key, '?')
+        k2_logger.error(f"Strategy '{name}' failed: {error}", "STREAM")
+        self.stream_status_changed.emit(f"Strategy '{name}' failed")
+        # Mark as applied so the checkbox state matches left-pane; user
+        # can un-check to clear and retry.
+        self.applied_strategies.add(name)
+
+    def _on_strategy_cancelled(self, key: str):
+        if not self._own_key(key):
+            return
+        name = self._strategy_jobs.pop(key, '?')
+        k2_logger.info(f"Strategy '{name}' cancelled", "STREAM")
+        self.stream_status_changed.emit(f"Strategy '{name}' cancelled")
+        self.applied_strategies.discard(name)
+
+    def _on_strategy_finished(self, key: str, result: object):
+        if not self._own_key(key):
+            return
+        strategy_name = self._strategy_jobs.pop(key, None)
+        if strategy_name is None:
+            return
+        if not isinstance(result, dict):
+            k2_logger.error(
+                f"Strategy '{strategy_name}' finished with non-dict result", "STREAM")
+            return
+
+        table_name = self.table_name
+        code = strategy_service.get_strategy_code(strategy_name) or ''
         strategy_service.save_run(
             strategy_name=strategy_name, code_snapshot=code,
             result=result, model_table=table_name)
@@ -606,8 +732,12 @@ class StreamWindowWidget(QWidget):
         self.applied_strategies.add(strategy_name)
 
         if not result.get('success'):
-            k2_logger.error(f"Strategy execution failed: {result.get('error')}", "STREAM")
+            k2_logger.error(
+                f"Strategy execution failed: {result.get('error')}", "STREAM")
+            self.stream_status_changed.emit(f"Strategy '{strategy_name}' failed")
             return
+
+        self.stream_status_changed.emit(f"Strategy '{strategy_name}' complete")
 
         tab_writes = result.get('_tab_writes', [])
         forecast_writes = [w for w in tab_writes if w.get("type") == "forecast"]
@@ -621,13 +751,22 @@ class StreamWindowWidget(QWidget):
             self._on_tab_writes(forecast_writes)
             return
 
-        result_df = result.get('data') if isinstance(result.get('data'), pd.DataFrame) else df
-        proj_df = result_df.iloc[len(df):].copy() if len(result_df) > len(df) else pd.DataFrame()
+        result_df = result.get('data')
+        if not isinstance(result_df, pd.DataFrame):
+            return
+        # The worker produced ``result_df``. We no longer have the input
+        # frame in scope, but ``save_run`` already persisted metrics.
+        # ``metrics.original_rows`` tells us where projections begin.
+        metrics = result.get('metrics') or {}
+        original_rows = int(metrics.get('original_rows') or 0)
+        proj_df = (result_df.iloc[original_rows:].copy()
+                   if original_rows and len(result_df) > original_rows
+                   else pd.DataFrame())
         if not proj_df.empty:
             stock_service.delete_projections(table_name, strategy_name)
             stock_service.insert_projections(table_name, proj_df, strategy_name)
             mkt_hours = self.current_metadata.get('market_hours_only', False)
-            rows, total = stock_service.get_display_data(
+            _, total = stock_service.get_display_data(
                 table_name, limit=500, market_hours_only=mkt_hours)
             self.current_metadata['total_records'] = total
             self.chart_widget.load_data_from_table(
@@ -637,6 +776,13 @@ class StreamWindowWidget(QWidget):
             )
 
     def remove_strategy(self, strategy_name: str):
+        # If this strategy is still executing, request cancel; the
+        # ``cancelled`` signal will unwind applied_strategies.
+        key = strategy_runner.make_key(self.table_name, strategy_name)
+        if strategy_runner.is_running(key):
+            strategy_runner.cancel(key)
+            # Fall through to clear any partial projections/columns too.
+
         try:
             stock_service.delete_projections(self.table_name, strategy_name)
         except Exception:
@@ -1258,6 +1404,23 @@ class StreamWindowWidget(QWidget):
                     pass
             if self._reconciler:
                 self._reconciler.cancel()
+
+            # Cancel any in-flight strategy runs this window submitted and
+            # disconnect from the shared runner so signals don't reach a
+            # partially-destroyed widget. Other windows remain subscribed.
+            for key in list(self._strategy_jobs.keys()):
+                try:
+                    strategy_runner.cancel(key)
+                except Exception:
+                    pass
+            self._strategy_jobs.clear()
+            for sig in (strategy_runner.started, strategy_runner.progress,
+                        strategy_runner.finished, strategy_runner.failed,
+                        strategy_runner.cancelled):
+                try:
+                    sig.disconnect(self)
+                except (TypeError, RuntimeError):
+                    pass
 
             for key, item in self._actual_lines.items():
                 if item and item.scene():

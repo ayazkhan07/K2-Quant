@@ -5,6 +5,36 @@ When capture is active (during normal DPE runs), structured blocks are recorded
 for the OUTPUTS panel (dark grid tables). Plain ``print`` box-drawing is
 skipped so stdout stays clean. If capture is off, legacy ASCII tables are
 printed for ad-hoc use.
+
+Invariant — per-cell character cap
+----------------------------------
+Every string cell that lands in a captured report block is capped at
+``MAX_REPORT_CELL_CHARS`` (1,500 chars) before being appended. The cap is
+applied centrally in ``_cap_cell_text`` and wired in through:
+
+* ``_serialize_cell`` (string branch)        — covers ``report_table`` cells
+* ``report_config``  (inline per-cell)       — covers config rows
+
+If a cell is a comma-separated list (``', '`` present), the cap preserves
+whole tokens and appends ``" \u2026 (+K more)"``. Otherwise the cell is
+hard-sliced and marked ``" \u2026 (+K chars)"``.
+
+Rationale: ``QTableWidget.resizeColumnsToContents()`` in
+``OutputsPanel._append_data_table`` measures the natural text width of every
+cell. Pathological cells (observed >100 KB, e.g., comma-joined index lists
+from large-model RPP runs) produce column widths on the order of 10\u2076 pixels,
+which collapses the OutputsPanel layout so *neither* the offending table nor
+its siblings render. The cap protects three things simultaneously:
+
+1. UI layout in ``OutputsPanel._append_data_table``.
+2. DB row size for ``strategy_runs.report_blocks_json`` (~5x shrink on RPP).
+3. Thinkspace / LLM context payloads when a run is referenced.
+
+Strategy authors who need to expose the true item count should pass it as its
+own column (e.g. ``'Count'``) alongside any list column; only the list-column
+string is truncated for display.
+
+See also: ``strategy_lifecycle_rules`` RULE 7.
 """
 
 from __future__ import annotations
@@ -22,6 +52,42 @@ from k2_quant.utilities.numeric_rounding import (
 _active_blocks: ContextVar[Optional[List[dict]]] = ContextVar(
     "_active_blocks", default=None
 )
+
+MAX_REPORT_CELL_CHARS = 1500
+_CELL_MARKER_RESERVE = 40
+
+
+def _cap_cell_text(text: str, max_chars: int = MAX_REPORT_CELL_CHARS) -> str:
+    """Cap a string cell so the OUTPUTS renderer and DB stay well-behaved.
+
+    Comma-separated lists are truncated on token boundaries with a
+    ``" \u2026 (+K more)"`` marker; everything else is hard-sliced with a
+    ``" \u2026 (+K chars)"`` marker. See module docstring (invariant).
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    if len(text) <= max_chars:
+        return text
+
+    if ", " in text:
+        tokens = text.split(", ")
+        budget = max(0, max_chars - _CELL_MARKER_RESERVE)
+        kept: List[str] = []
+        running = 0
+        for tok in tokens:
+            addl = len(tok) + (2 if kept else 0)
+            if running + addl > budget:
+                break
+            kept.append(tok)
+            running += addl
+        if kept:
+            remaining = len(tokens) - len(kept)
+            if remaining > 0:
+                return ", ".join(kept) + f" \u2026 (+{remaining:,} more)"
+            return ", ".join(kept)
+
+    head = text[:max(0, max_chars - _CELL_MARKER_RESERVE)]
+    return head + f" \u2026 (+{len(text) - len(head):,} chars)"
 
 
 def start_report_capture() -> List[dict]:
@@ -51,7 +117,7 @@ def _serialize_cell(v: Any) -> Any:
         if math.isnan(x) or math.isinf(x):
             return None
         return round(x, COMPUTATION_DECIMALS)
-    return str(v)
+    return _cap_cell_text(str(v))
 
 
 def _fmt_val(v: Any) -> str:
@@ -123,7 +189,11 @@ def report_config(params: List[Tuple[str, Any, str]]) -> None:
     bl = _blocks()
     if bl is not None:
         rows = [
-            [str(name), _fmt_val(value), str(desc)]
+            [
+                _cap_cell_text(str(name)),
+                _cap_cell_text(_fmt_val(value)),
+                _cap_cell_text(str(desc)),
+            ]
             for name, value, desc in params
         ]
         bl.append({

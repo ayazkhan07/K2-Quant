@@ -14,6 +14,26 @@ import pytz
 from k2_quant.utilities.logger import k2_logger, log_exception, log_performance
 
 
+# Return NUMERIC (and NUMERIC[]) as Python ``float`` instead of ``Decimal`` for
+# every psycopg2 cursor in this process. On bulk reads of OHLCV tables
+# (~2M rows x 12 numeric columns) Decimal boxing dominates fetch wall-time;
+# all downstream consumers already round prices to 2dp and computations to
+# 3dp via ``round_dataframe_numeric_columns``, so full Decimal precision is
+# unused cost. Registered at import time so every connection benefits.
+_DEC2FLOAT = psycopg2.extensions.new_type(
+    psycopg2.extensions.DECIMAL.values,
+    "DEC2FLOAT",
+    lambda value, curs: float(value) if value is not None else None,
+)
+_DEC2FLOAT_ARRAY = psycopg2.extensions.new_array_type(
+    (1231,),  # NUMERIC[]
+    "DEC2FLOAT_ARRAY",
+    _DEC2FLOAT,
+)
+psycopg2.extensions.register_type(_DEC2FLOAT)
+psycopg2.extensions.register_type(_DEC2FLOAT_ARRAY)
+
+
 class DatabaseManager:
     MAX_TABLE_VERSIONS = 100
     BULK_INSERT_PAGE_SIZE = 10000
@@ -30,6 +50,10 @@ class DatabaseManager:
         )
         self.timezone_str = os.getenv('MARKET_TIMEZONE', 'US/Eastern')
         self.market_tz = pytz.timezone(self.timezone_str)
+        # In-process cache of column existence to avoid per-call round-trips
+        # when a hot path (e.g. fetch_display_data) probes several columns on
+        # the same table. Keyed by (table_name, column_name).
+        self._col_exists_cache: Dict[Tuple[str, str], bool] = {}
 
     @contextmanager
     def get_connection(self):
@@ -317,6 +341,7 @@ class DatabaseManager:
                         f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS projection_source TEXT"
                     )
                     conn.commit()
+                    self.invalidate_column_cache(table_name)
                 except Exception as e:
                     conn.rollback()
                     k2_logger.error(f"Failed ensuring projection columns on {table_name}: {str(e)}", "DB")
@@ -362,6 +387,7 @@ class DatabaseManager:
             with self.get_cursor(conn) as cur:
                 cur.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS {column_name} {sql_type}")
                 conn.commit()
+        self.invalidate_column_cache(table_name)
 
     def bulk_update_column_by_timestamp(self, table_name: str, column_name: str, ts_series: pd.Series, val_series: pd.Series) -> int:
         """Efficiently update a numeric indicator column by joining on timestamp."""
@@ -460,7 +486,8 @@ class DatabaseManager:
                     f"Row number column added to {table_name}: {affected} rows numbered",
                     "DATABASE",
                 )
-                return affected
+        self.invalidate_column_cache(table_name)
+        return affected
 
     def fetch_dataframe(self, table_name: str) -> pd.DataFrame:
         """Fetch dataframe including any persisted indicator columns."""
@@ -471,7 +498,18 @@ class DatabaseManager:
             )
 
     def _check_column_exists(self, table_name: str, column_name: str) -> bool:
-        """Check if a column exists in a table"""
+        """Check if a column exists in a table.
+
+        Results are memoised per process; the DDL shape of a stock table is
+        effectively immutable once created (callers rebuild tables rather
+        than alter them), so hitting information_schema on every
+        ``fetch_display_data`` call is wasted round-trips. Use
+        :meth:`invalidate_column_cache` if a table is altered in place.
+        """
+        key = (table_name, column_name)
+        cached = self._col_exists_cache.get(key)
+        if cached is not None:
+            return cached
         try:
             with self.get_connection() as conn:
                 with self.get_cursor(conn) as cur:
@@ -483,9 +521,20 @@ class DatabaseManager:
                             AND column_name = %s
                         )
                     """, (table_name, column_name))
-                    return cur.fetchone()[0]
+                    result = bool(cur.fetchone()[0])
         except Exception:
-            return False
+            result = False
+        self._col_exists_cache[key] = result
+        return result
+
+    def invalidate_column_cache(self, table_name: Optional[str] = None) -> None:
+        """Drop cached column-existence flags (call after DDL changes)."""
+        if table_name is None:
+            self._col_exists_cache.clear()
+            return
+        stale = [k for k in self._col_exists_cache if k[0] == table_name]
+        for k in stale:
+            self._col_exists_cache.pop(k, None)
 
     @staticmethod
     def _get_cutoff_clause(cutoff_datetime: str = None) -> str:
@@ -840,6 +889,7 @@ class DatabaseManager:
                 cur.execute(f"DROP TABLE IF EXISTS {table_name}")
                 conn.commit()
                 k2_logger.database_operation("Table dropped", table_name)
+        self.invalidate_column_cache(table_name)
 
     def drop_all_stock_tables(self) -> int:
         tables = self.get_stock_tables()
@@ -851,6 +901,7 @@ class DatabaseManager:
                 cur.execute("DELETE FROM saved_models")
                 cur.execute("DELETE FROM model_state")
                 conn.commit()
+        self.invalidate_column_cache()
         total = len(tables)
         k2_logger.database_operation(
             "All tables dropped",

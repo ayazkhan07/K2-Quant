@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import math
 import numbers
-from typing import Any
+from typing import Any, Dict, Optional
 
 import pandas as pd
 
@@ -75,36 +75,76 @@ def round_computation_scalar(x: Any) -> Any:
     return x
 
 
+def _classify_column(col: Any) -> Optional[tuple]:
+    """Return ``(decimals, coerce_nonnumeric)`` or ``None`` to skip.
+
+    Matches the original policy branches one-for-one so behaviour is
+    preserved: explicit price / volume / percent / row-number columns are
+    coerced from object dtype when necessary, but generic columns with
+    unrecognised names are only rounded when already numeric.
+    """
+    raw = str(col).lower()
+    n = raw.replace("-", "_")
+    if n in ("date", "time") or "date_time" in n:
+        return None
+    if n == "#":
+        return (0, True)
+    if n == "volume":
+        return (0, True)
+    if n in _PRICE_NAMES:
+        return (PRICE_DECIMALS, True)
+    if (
+        n == "elasticity"
+        or n.endswith("_pct")
+        or "_%" in raw
+        or ("close_open" in n and "%" in raw)
+    ):
+        return (COMPUTATION_DECIMALS, True)
+    # Generic fallback: only round if already numeric.
+    return (COMPUTATION_DECIMALS, False)
+
+
 def round_dataframe_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a copy with OHLCV prices, volume, percents, and other floats rounded."""
+    """Return a DataFrame with prices, volume, percents, and other floats
+    rounded to policy decimal counts.
+
+    Performance contract
+    --------------------
+    * Does **not** call ``df.copy()``. We use ``DataFrame.assign`` which
+      materialises only the columns we rewrite; untouched columns are
+      shared by reference.
+    * Takes the fast path (``Series.round`` directly) when a column is
+      already a numeric dtype - the common case now that the database
+      layer returns NUMERIC as ``float``. ``pd.to_numeric`` is only
+      invoked for object-dtype columns that an explicit rule covers
+      (prices, percents, etc.); this spares the expensive coerce + box
+      cycle on million-row OHLCV frames.
+    * Unknown object-dtype columns are left untouched (legacy behaviour).
+    """
     if df is None or df.empty:
         return df
-    out = df.copy()
-    for col in out.columns:
-        raw_name = str(col)
-        n = _norm_col(col)
-        if n in ("date", "time") or "date_time" in n:
+
+    replacements: Dict[str, pd.Series] = {}
+    for col in df.columns:
+        rule = _classify_column(col)
+        if rule is None:
             continue
-        if n == "#":
-            try:
-                s = pd.to_numeric(out[col], errors="coerce")
-                out[col] = s.round(0)
-            except Exception:
-                pass
+        decimals, coerce_nonnumeric = rule
+        s = df[col]
+        if pd.api.types.is_numeric_dtype(s):
+            replacements[col] = s.round(decimals)
             continue
-        if is_volume_column(col):
-            s = pd.to_numeric(out[col], errors="coerce")
-            out[col] = s.round(0)
+        if not coerce_nonnumeric:
             continue
-        if is_price_column(col):
-            out[col] = pd.to_numeric(out[col], errors="coerce").round(PRICE_DECIMALS)
+        try:
+            coerced = pd.to_numeric(s, errors="coerce")
+        except Exception:
             continue
-        if is_percent_or_elasticity_column(col):
-            out[col] = pd.to_numeric(out[col], errors="coerce").round(COMPUTATION_DECIMALS)
-            continue
-        if pd.api.types.is_numeric_dtype(out[col]):
-            out[col] = pd.to_numeric(out[col], errors="coerce").round(COMPUTATION_DECIMALS)
-    return out
+        replacements[col] = coerced.round(decimals)
+
+    if not replacements:
+        return df
+    return df.assign(**replacements)
 
 
 def format_price_for_display(x: Any) -> str:
