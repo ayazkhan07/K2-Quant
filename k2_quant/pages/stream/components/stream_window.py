@@ -1026,6 +1026,22 @@ class StreamWindowWidget(QWidget):
                     "STREAM",
                 )
 
+        # Clean up rows left behind by a previous aggregator that tiled the
+        # calendar day into 390-min slices and saved up to three rows per
+        # trading date (stamped 00:00 / 06:30 / 13:00 ET). Every legitimate
+        # day bar — historical, reconciler-fetched, or live-aggregated —
+        # has timestamp_ms at exactly midnight UTC of its trading date.
+        if timespan.startswith("day"):
+            purged_day = actual_data_manager.purge_non_daily_anchored(
+                self.table_name
+            )
+            if purged_day:
+                k2_logger.info(
+                    f"[STREAM START] Purged {purged_day} non-daily-anchored "
+                    f"actual bars",
+                    "STREAM",
+                )
+
         existing_bars = actual_data_manager.get_all_bars(self.table_name)
         k2_logger.info(
             f"[STREAM START] Existing actual bars after prune: {len(existing_bars)}",
@@ -1159,13 +1175,15 @@ class StreamWindowWidget(QWidget):
         if self._aggregator:
             self._aggregator.ingest(ws_bar)
 
-    def _on_bar_updated(self, bar: dict):
-        """Partial / forming bar — update UI in real-time."""
-        self.actual_data_widget.update_forming_bar(bar)
-        self._update_chart_forming_candle(bar)
+    def _stamp_bar_time(self, bar: dict):
+        """Populate ``date`` / ``time`` / ``timestamp_ms`` on an aggregator
+        bar dict from its ``start_ts``.
 
-    def _on_bar_completed(self, bar: dict):
-        """Fully aggregated bar — persist and append to table + chart."""
+        Mirrors the UTC→ET conversion used by ``db_manager`` for historical
+        rows and by ``StreamReconciler`` for backfilled rows, so every
+        persisted bar — historical, reconciler, or live-streamed — shares
+        one ``(market_date, market_time, timestamp_ms)`` convention.
+        """
         import pytz
         et = pytz.timezone("US/Eastern")
 
@@ -1175,12 +1193,42 @@ class StreamWindowWidget(QWidget):
             market_dt = pytz.utc.localize(utc_dt).astimezone(et).replace(tzinfo=None)
         else:
             market_dt = datetime.now(et).replace(tzinfo=None)
+            start_ts = int(market_dt.timestamp() * 1000)
 
         bar["date"] = market_dt.date()
         bar["time"] = market_dt.time()
-        bar["timestamp_ms"] = start_ts or int(market_dt.timestamp() * 1000)
+        bar["timestamp_ms"] = start_ts
 
-        actual_data_manager.insert_bar(self.table_name, bar)
+    def _on_bar_updated(self, bar: dict):
+        """Partial / forming bar — refine the current window in real time.
+
+        Every incoming 1-minute WS tick upserts the forming bar into
+        ``actual_{table}`` using the same ``timestamp_ms`` its eventual
+        ``bar_completed`` twin would use. That gives a live-moving row in
+        the ACTUAL DATA table and a live dashed close-price line on the
+        chart, and it survives a stream stop / restart or a process crash
+        because the partial state is already persisted. When the window
+        closes, ``_on_bar_completed`` writes the final OHLCV with the same
+        key via upsert, cleanly replacing the last forming snapshot.
+        """
+        self._stamp_bar_time(bar)
+        try:
+            actual_data_manager.insert_bar(self.table_name, bar, upsert=True)
+        except Exception as e:
+            k2_logger.error(f"Forming-bar upsert failed: {e}", "STREAM")
+        self.actual_data_widget.update_forming_bar(bar)
+        self._update_chart_forming_candle(bar)
+
+    def _on_bar_completed(self, bar: dict):
+        """Fully aggregated bar — persist final OHLCV and append to table +
+        chart. Uses upsert for all timeframes: for daily it replaces the
+        last forming snapshot with the finalized bar; for intraday the
+        forming path already wrote the same ``timestamp_ms``, so the final
+        write is effectively a no-op on value but guarantees idempotency
+        under restart-mid-window.
+        """
+        self._stamp_bar_time(bar)
+        actual_data_manager.insert_bar(self.table_name, bar, upsert=True)
         self.actual_data_widget.append_completed_bar(bar)
         self._update_chart_actual_series()
 

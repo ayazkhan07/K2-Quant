@@ -63,10 +63,20 @@ class BarAggregator(QObject):
         self.symbol = symbol.upper()
         self.timespan = (timespan or "minute").lower()
 
-        if self.timespan.startswith("hour"):
-            self._window_minutes = frequency * 60
-        elif self.timespan.startswith("day"):
+        # Daily models collapse an entire trading date into one bar. Any
+        # intra-day frequency/multiplier on a "day" timespan (e.g. 5-day,
+        # weekly stored as days) still buckets per calendar date — the
+        # minute-slice arithmetic used for intraday sizes is wrong here
+        # because it tiles the 24-hour clock with session-length chunks.
+        self._is_daily = self.timespan.startswith("day")
+
+        if self._is_daily:
+            # Retained only for progress display (bars_required / "N/390 min")
+            # A regular U.S. session is 390 one-minute bars; pre-/post-market
+            # minutes will count too but progress is advisory only.
             self._window_minutes = 390
+        elif self.timespan.startswith("hour"):
+            self._window_minutes = frequency * 60
         else:
             self._window_minutes = max(1, frequency)
 
@@ -76,18 +86,52 @@ class BarAggregator(QObject):
     def bars_required(self) -> int:
         return self._window_minutes
 
+    @property
+    def is_daily(self) -> bool:
+        return self._is_daily
+
     def _bar_window_key(self, ts_ms: int):
-        """Return (date, window_start_minute_of_day) for a given epoch-ms timestamp."""
+        """Return a hashable key identifying the aggregation window a raw
+        1-minute bar belongs to.
+
+        For daily models the key is simply the ET calendar date, so every
+        1-minute bar between 04:00 ET (Polygon AM feed start) and 19:59 ET
+        of the same trading date collapses into a single bucket.
+
+        For intraday models the key is (date, clock-aligned window start
+        minute) as before.
+        """
         utc_dt = datetime.utcfromtimestamp(ts_ms / 1000)
         et_dt = pytz.utc.localize(utc_dt).astimezone(_ET)
+
+        if self._is_daily:
+            return (et_dt.date(),)
+
         minutes_of_day = et_dt.hour * 60 + et_dt.minute
         window_start = (minutes_of_day // self._window_minutes) * self._window_minutes
         return (et_dt.date(), window_start)
 
     def _window_start_ts_ms(self, ts_ms: int) -> int:
-        """Snap a timestamp to its clock-aligned window start (epoch ms)."""
+        """Snap a timestamp to the window-start epoch-ms used by the DB.
+
+        Daily bars are stamped at midnight UTC of the trading date, matching
+        Polygon's ``/v2/aggs/.../1/day`` convention (``t`` = 00:00 UTC of the
+        trading date). Downstream code in ``StreamWindow._on_bar_completed``
+        converts this back to ET — yielding the same ``(market_date,
+        market_time)`` pair a reconciler backfill would produce, which keeps
+        live-streamed day bars aligned with historical daily rows and with
+        the ``actual_{table}`` primary key used for upserts.
+        """
         utc_dt = datetime.utcfromtimestamp(ts_ms / 1000)
         et_dt = pytz.utc.localize(utc_dt).astimezone(_ET)
+
+        if self._is_daily:
+            trading_date = et_dt.date()
+            midnight_utc = pytz.utc.localize(
+                datetime(trading_date.year, trading_date.month, trading_date.day)
+            )
+            return int(midnight_utc.timestamp() * 1000)
+
         minutes_of_day = et_dt.hour * 60 + et_dt.minute
         window_start_min = (minutes_of_day // self._window_minutes) * self._window_minutes
         snapped = et_dt.replace(
