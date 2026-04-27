@@ -48,6 +48,7 @@ from k2_quant.utilities.logger import k2_logger
 from k2_quant.utilities.services.technical_analysis_service import ta_service
 from k2_quant.utilities.services.stock_data_service import stock_service
 from k2_quant.utilities.data.saved_models_manager import saved_models_manager
+from k2_quant.utilities.data.data_store import data_store
 from k2_quant.utilities.services.strategy_service import strategy_service
 from k2_quant.utilities.report_helpers import format_blocks_plain
 from k2_quant.utilities.numeric_rounding import round_dataframe_numeric_columns
@@ -300,18 +301,35 @@ class AnalysisPageWidget(QWidget):
         
         try:
             from k2_quant.utilities.data.db_manager import db_manager as _db
-            base_metadata = saved_models_manager.get_model_metadata(table_name) or {'symbol': table_name}
+            cached_meta = data_store.get_metadata(table_name)
+            if cached_meta:
+                base_metadata = cached_meta
+            else:
+                base_metadata = saved_models_manager.get_model_metadata(table_name) or {'symbol': table_name}
+                data_store.set_metadata(table_name, base_metadata)
             mkt_hours = _should_filter_market_hours(base_metadata)
-            rows, total_count = stock_service.get_display_data(
-                table_name, limit=500, market_hours_only=mkt_hours)
-            
+
+            cached_display = data_store.get_display(table_name, mkt_hours)
+            if cached_display is not None:
+                rows, total_count = cached_display
+            else:
+                rows, total_count = stock_service.get_display_data(
+                    table_name, limit=500, market_hours_only=mkt_hours)
+                if rows:
+                    data_store.set_display(table_name, mkt_hours, rows, total_count)
+
             if rows:
                 self.current_model = table_name
                 self.current_data = rows
-                
+
                 parts = table_name.split('_')
                 symbol = parts[1].upper() if len(parts) > 1 else 'UNKNOWN'
-                has_row_number = _db._check_column_exists(table_name, '#')
+                cached_hrn = data_store.get_has_row_number(table_name)
+                if cached_hrn is None:
+                    has_row_number = _db._check_column_exists(table_name, '#')
+                    data_store.set_has_row_number(table_name, has_row_number)
+                else:
+                    has_row_number = cached_hrn
 
                 self.current_metadata = dict(base_metadata)
                 self.current_metadata.update({

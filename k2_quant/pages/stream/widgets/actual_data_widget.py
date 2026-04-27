@@ -133,10 +133,23 @@ class ActualDataWidget(QWidget):
         self._scroll_to_bottom()
 
     def update_forming_bar(self, bar: dict):
-        """Update (or create) the forming bar at the bottom of the table."""
+        """Update (or create) the forming bar at the bottom of the table.
+
+        If this is the first forming tick after ``load_bars`` and the last
+        loaded row shares the bar's ``(Date, Time)`` key — which happens on
+        day-model stream starts where the reconciler has already inserted
+        a partial same-session row for today — promote that row into the
+        forming row in place, rather than appending a visual duplicate
+        that the DB would never actually store under separate keys.
+        """
         if self._forming_row is None:
-            self._append_bar_row(bar, forming=True)
-            self._forming_row = self._row_count - 1
+            last_row = self._row_count - 1
+            if last_row >= 0 and self._row_matches_bar(last_row, bar):
+                self._update_row(last_row, bar, forming=True)
+                self._forming_row = last_row
+            else:
+                self._append_bar_row(bar, forming=True)
+                self._forming_row = self._row_count - 1
         else:
             self._update_row(self._forming_row, bar, forming=True)
 
@@ -144,6 +157,22 @@ class ActualDataWidget(QWidget):
         required = bar.get("bars_required", 1)
         self._bar_progress.setText(f"Forming: {progress}/{required} min")
         self._scroll_to_bottom()
+
+    def _row_matches_bar(self, row_idx: int, bar: dict) -> bool:
+        """True if the grid row at ``row_idx`` has the same Date+Time cells
+        as the bar dict would render. Used to collapse a reconciler-loaded
+        partial row and the first live forming tick into one row."""
+        if row_idx < 0 or row_idx >= self._row_count:
+            return False
+        d = bar.get("date") or bar.get("market_date", "")
+        t = bar.get("time") or bar.get("market_time", "")
+        date_str = str(d)
+        time_str = str(t)[:8]
+        date_item = self.table.item(row_idx, _COL_IDX["Date"])
+        time_item = self.table.item(row_idx, _COL_IDX["Time"])
+        if date_item is None or time_item is None:
+            return False
+        return date_item.text() == date_str and time_item.text() == time_str
 
     def clear(self):
         self.table.setRowCount(0)

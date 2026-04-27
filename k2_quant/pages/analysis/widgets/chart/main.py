@@ -50,6 +50,13 @@ except ImportError:
     def round_dataframe_numeric_columns(df):
         return df
 
+# Process-wide cache shared across every ChartWidget instance. Without it
+# each tab refetches the same daily/raw rows from Postgres on restore.
+try:
+    from k2_quant.utilities.data.data_store import data_store
+except ImportError:  # pragma: no cover - utilities always present in the app
+    data_store = None
+
 
 # Time span enumeration
 class TimeSpan(Enum):
@@ -447,7 +454,12 @@ def _precompute_datetime_column(df: pd.DataFrame) -> pd.DataFrame:
 
 
 class _RawDataWorker(QThread):
-    """Background worker that fetches all raw rows from Postgres."""
+    """Background worker that fetches all raw rows from Postgres.
+
+    Coordinates via ``data_store`` so that when multiple chart widgets
+    open the same table at once (e.g. on session restore) only the first
+    actually hits the database; the rest wait for the published result.
+    """
     finished = pyqtSignal(str, object)  # (table_name, DataFrame or None)
 
     def __init__(self, table_name: str, total_records: int,
@@ -458,19 +470,51 @@ class _RawDataWorker(QThread):
         self._market_hours_only = market_hours_only
 
     def run(self):
+        table = self._table_name
+        mkt = self._market_hours_only
+
+        if data_store is not None:
+            cached = data_store.get_raw(table, mkt)
+            if cached is not None:
+                self.finished.emit(table, cached)
+                return
+
+            claimed = data_store.claim_raw_fetch(table, mkt)
+            if not claimed:
+                # Another worker is already fetching; wait for its result
+                # via a threading.Event then forward whatever it published.
+                import threading as _threading
+                evt = _threading.Event()
+                result_box: Dict[str, Optional[pd.DataFrame]] = {'df': None}
+
+                def _on_ready(df):
+                    result_box['df'] = df
+                    evt.set()
+
+                already = data_store.register_raw_waiter(table, mkt, _on_ready)
+                if not already:
+                    # Bound the wait so a hung/failed fetch cannot stall us
+                    # forever; widgets will retry on next interaction.
+                    evt.wait(timeout=120)
+                self.finished.emit(table, result_box['df'])
+                return
+
         try:
             df = stock_service.get_chart_data_chunk(
-                self._table_name, 0, self._total,
-                market_hours_only=self._market_hours_only)
+                table, 0, self._total, market_hours_only=mkt)
             if isinstance(df, pd.DataFrame) and not df.empty:
                 for col in list(NUMERIC_COLUMNS & set(df.columns)):
                     df[col] = pd.to_numeric(df[col], errors='coerce')
                 df = _precompute_datetime_column(df)
-                self.finished.emit(self._table_name, df)
+                if data_store is not None:
+                    data_store.set_raw(table, mkt, df)
+                self.finished.emit(table, df)
                 return
         except Exception as e:
             k2_logger.error(f"Background fetch failed: {e}", "CHART")
-        self.finished.emit(self._table_name, None)
+        if data_store is not None:
+            data_store.release_raw_fetch(table, mkt)
+        self.finished.emit(table, None)
 
 
 class OptimizedPlotDataItem(pg.PlotDataItem):
@@ -1389,7 +1433,11 @@ class ChartWidget(QWidget):
                             metadata: Optional[Dict] = None):
         """Two-phase load:
         Phase 1 — server-side daily bars (fast, ~200ms).  Chart is usable.
-        Phase 2 — background thread fetches all raw rows for intraday."""
+        Phase 2 — background thread fetches all raw rows for intraday.
+
+        Both phases are short-circuited by ``data_store`` when another
+        widget (or the prefetcher) has already warmed the cache for this
+        table."""
         if self.is_fetching:
             return
 
@@ -1408,19 +1456,30 @@ class ChartWidget(QWidget):
             k2_logger.warning("No records to load for chart", "CHART")
             return
 
-        # --- Phase 1: daily bars (instant) ---
-        if table_name in self._raw_ready:
-            self.original_data = self._model_cache.get(table_name)
+        mkt_hours = metadata.get('market_hours_only', False) if metadata else False
+
+        # --- Phase 1: prefer the full raw cache, then the daily cache,
+        # then hit the database. ---
+        raw_df = data_store.get_raw(table_name, mkt_hours) if data_store is not None else None
+        if raw_df is not None and not raw_df.empty:
+            self.original_data = raw_df
+            self._model_cache[table_name] = raw_df
+            self._raw_ready.add(table_name)
         else:
-            daily_df = None
-            mkt_hours = metadata.get('market_hours_only', False) if metadata else False
-            if stock_service:
-                daily_df = stock_service.get_daily_bars(table_name, market_hours_only=mkt_hours)
+            daily_df = (
+                data_store.get_daily_bars(table_name, mkt_hours)
+                if data_store is not None else None
+            )
             if daily_df is None or daily_df.empty:
-                return
-            for col in list(NUMERIC_COLUMNS & set(daily_df.columns)):
-                daily_df[col] = pd.to_numeric(daily_df[col], errors='coerce')
-            daily_df = round_dataframe_numeric_columns(daily_df)
+                if stock_service:
+                    daily_df = stock_service.get_daily_bars(table_name, market_hours_only=mkt_hours)
+                if daily_df is None or daily_df.empty:
+                    return
+                for col in list(NUMERIC_COLUMNS & set(daily_df.columns)):
+                    daily_df[col] = pd.to_numeric(daily_df[col], errors='coerce')
+                daily_df = round_dataframe_numeric_columns(daily_df)
+                if data_store is not None:
+                    data_store.set_daily_bars(table_name, mkt_hours, daily_df)
             self.original_data = daily_df
             self._model_cache[table_name] = daily_df
 
@@ -1441,11 +1500,19 @@ class ChartWidget(QWidget):
             f"{self.current_timeframe} bars for {table_name}", "CHART")
 
         # --- Phase 2: background fetch of raw rows for intraday ---
+        # Skip when the shared DataStore already has raw rows for this
+        # table; the Phase-1 block above picked them up and seeded
+        # ``self._model_cache`` / ``self._raw_ready``, so there is nothing
+        # left to fetch.
         if table_name not in self._raw_ready:
             self._start_background_fetch(table_name)
 
     def _start_background_fetch(self, table_name: str):
-        """Kick off a background thread to fetch all raw rows."""
+        """Kick off a background thread to fetch all raw rows.
+
+        The worker itself checks ``data_store`` before hitting the DB, so
+        even if two widgets race here only one actual query is issued.
+        """
         if self._bg_worker is not None and self._bg_worker.isRunning():
             self._bg_worker.finished.disconnect()
             self._bg_worker.quit()
@@ -1463,6 +1530,13 @@ class ChartWidget(QWidget):
             df = round_dataframe_numeric_columns(df)
             self._model_cache[table_name] = df
             self._raw_ready.add(table_name)
+            # Ensure other widgets viewing the same table can short-circuit
+            # their own background fetches. ``set_raw`` is idempotent when
+            # the worker already published.
+            if data_store is not None:
+                mkt = self._model_metadata.get('market_hours_only', False) if self._model_metadata else False
+                if not data_store.is_raw_ready(table_name, mkt):
+                    data_store.set_raw(table_name, mkt, df)
             if self.current_table_name == table_name:
                 self.original_data = df
                 # Critical: phase-1 used ~daily bars and a matching x viewport.

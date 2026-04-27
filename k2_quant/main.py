@@ -16,6 +16,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QStackedWidget
 from PyQt6.QtCore import QObject, QSettings, QTimer
 
+# Enable pyqtgraph's OpenGL fast path for all charts. The rig this app
+# ships on has a dedicated GPU with 16 GB VRAM sitting idle; OpenGL line
+# rendering is ~5-10x faster than the raster path on multi-million-point
+# series, and the ``enableExperimental`` flag turns on the newer buffer
+# path that avoids CPU-side point decimation. Wrapped in a try/except so
+# headless / missing-GL environments still work via the raster fallback.
+try:
+    import pyqtgraph as _pg
+    _pg.setConfigOptions(useOpenGL=True, enableExperimental=True, antialias=False)
+except Exception:
+    pass
+
 from k2_quant.pages.landing.page import LandingPageWidget
 from k2_quant.pages.stock_fetcher.page import StockFetcherWidget
 from k2_quant.pages.analysis.page import AnalysisPageWidget
@@ -199,10 +211,34 @@ class MainWindow(QMainWindow):
             f"{len(stream_sessions)} stream tabs)", "MAIN")
 
     def _restore_session(self):
-        """Recreate analysis and stream tabs from a previous session."""
+        """Recreate analysis and stream tabs from a previous session.
+
+        Only the *active* tab is fully hydrated here. Inactive tabs get
+        their widget created (so the tab bar renders) but their data load
+        is queued for after the main window becomes visible, then
+        processed one tab at a time via short ``QTimer`` hops so each DB
+        round trip yields the event loop. The prior behaviour fired all
+        7+ loads synchronously, producing a 15-20s stall before the
+        window was interactive.
+        """
         settings = QSettings("K2Quant", "K2Quant")
 
-        # --- Restore analysis tabs ---
+        saved_page = settings.value("session/active_page_type", "stock_fetcher")
+        saved_tab = settings.value("session/active_tab_id", 0)
+        try:
+            saved_tab = int(saved_tab)
+        except (TypeError, ValueError):
+            saved_tab = 0
+
+        # Pending-load queues. Each entry is a zero-arg callable that does
+        # the actual restore work on the GUI thread. ``_drain_pending_loads``
+        # pops one per QTimer tick so the UI stays responsive.
+        self._pending_restore_calls = []
+
+        def _queue(call):
+            self._pending_restore_calls.append(call)
+
+        # --- Analysis tabs -----------------------------------------
         raw = settings.value("session/analysis_tabs", "")
         analysis_count = 0
         if raw:
@@ -220,15 +256,20 @@ class MainWindow(QMainWindow):
                         self.analysis_tabs[tab_id] = new_analysis
                         self.stacked_widget.addWidget(new_analysis)
                     if model and tab_id in self.analysis_tabs:
-                        try:
-                            self.analysis_tabs[tab_id].load_model_by_table(model)
-                        except Exception as e:
-                            k2_logger.error(
-                                f"Failed to restore model '{model}' on tab {tab_id}: {e}",
-                                "MAIN")
+                        widget = self.analysis_tabs[tab_id]
+                        is_active = (saved_page == 'analysis' and saved_tab == tab_id)
+                        if is_active:
+                            try:
+                                widget.load_model_by_table(model)
+                            except Exception as e:
+                                k2_logger.error(
+                                    f"Failed to restore model '{model}' on tab {tab_id}: {e}",
+                                    "MAIN")
+                        else:
+                            _queue(lambda w=widget, m=model, tid=tab_id: self._restore_analysis_tab(w, m, tid))
                 analysis_count = len(session_tabs)
 
-        # --- Restore stream tabs ---
+        # --- Stream tabs -------------------------------------------
         # One-time migration: wipe stale stream sessions saved before the title-bar fix
         if not settings.value("session/_stream_titlebar_migrated"):
             settings.remove("session/stream_tabs")
@@ -239,6 +280,7 @@ class MainWindow(QMainWindow):
                     self.stream_tabs[0]._load_left_pane_data()
                 except Exception:
                     pass
+
         raw_stream = settings.value("session/stream_tabs", "")
         stream_count = 0
         if raw_stream:
@@ -255,24 +297,62 @@ class MainWindow(QMainWindow):
                         self.stream_tabs[tab_id] = new_stream
                         self.stacked_widget.addWidget(new_stream)
                     if tab_id in self.stream_tabs:
-                        try:
-                            self.stream_tabs[tab_id].restore_session_state(state)
-                        except Exception as e:
-                            k2_logger.error(
-                                f"Failed to restore stream tab {tab_id}: {e}", "MAIN")
+                        widget = self.stream_tabs[tab_id]
+                        is_active = (saved_page == 'stream' and saved_tab == tab_id)
+                        if is_active:
+                            try:
+                                widget.restore_session_state(state)
+                            except Exception as e:
+                                k2_logger.error(
+                                    f"Failed to restore stream tab {tab_id}: {e}", "MAIN")
+                        else:
+                            _queue(lambda w=widget, s=state, tid=tab_id: self._restore_stream_tab(w, s, tid))
                 stream_count = len(stream_sessions)
 
-        saved_page = settings.value("session/active_page_type", "stock_fetcher")
-        saved_tab = settings.value("session/active_tab_id", 0)
-        try:
-            saved_tab = int(saved_tab)
-        except (TypeError, ValueError):
-            saved_tab = 0
         self.tab_bar.select_tab(saved_page, saved_tab)
 
         k2_logger.info(
             f"Session restored ({analysis_count} analysis, "
-            f"{stream_count} stream tabs)", "MAIN")
+            f"{stream_count} stream tabs) — "
+            f"{len(self._pending_restore_calls)} deferred",
+            "MAIN")
+
+        # Drain the deferred restores after the window has painted at
+        # least once so the user sees the active tab immediately.
+        if self._pending_restore_calls:
+            QTimer.singleShot(50, self._drain_pending_loads)
+
+    def _drain_pending_loads(self):
+        """Pop one pending restore per tick until the queue is empty.
+
+        Running one-per-tick keeps the event loop responsive during
+        session restore — each tab's DB round trip yields back before the
+        next starts so the UI can repaint, process clicks, etc."""
+        if not getattr(self, "_pending_restore_calls", None):
+            return
+        call = self._pending_restore_calls.pop(0)
+        try:
+            call()
+        except Exception as e:
+            k2_logger.error(f"Deferred restore failed: {e}", "MAIN")
+        if self._pending_restore_calls:
+            QTimer.singleShot(0, self._drain_pending_loads)
+
+    def _restore_analysis_tab(self, widget, model: str, tab_id: int):
+        try:
+            widget.load_model_by_table(model)
+        except Exception as e:
+            k2_logger.error(
+                f"Deferred restore of analysis tab {tab_id} ('{model}'): {e}",
+                "MAIN")
+
+    def _restore_stream_tab(self, widget, state: dict, tab_id: int):
+        try:
+            widget.restore_session_state(state)
+        except Exception as e:
+            k2_logger.error(
+                f"Deferred restore of stream tab {tab_id}: {e}",
+                "MAIN")
 
     def handle_database_cleared(self):
         """Reset analysis and stream views and caches after database deletion."""
@@ -339,6 +419,20 @@ class MainWindow(QMainWindow):
             model_loader_service.clear_cache()
         except Exception as e:
             k2_logger.warning(f"Model cache clear failed: {str(e)}", "MAIN")
+
+        # Clear the shared in-memory DataStore so stale daily bars / raw
+        # rows from dropped tables do not leak into the next session.
+        try:
+            from k2_quant.utilities.data.data_store import data_store
+            data_store.clear()
+        except Exception as e:
+            k2_logger.warning(f"DataStore clear failed: {str(e)}", "MAIN")
+
+        try:
+            from k2_quant.utilities.data.saved_models_manager import saved_models_manager
+            saved_models_manager._invalidate_saved_models_cache()
+        except Exception:
+            pass
     
     def handle_stock_data(self, data):
         """Handle stock data when fetched"""
@@ -388,12 +482,23 @@ class MainApplication(QObject):
     def show_landing_page(self):
         """Display the landing page"""
         k2_logger.ui_operation("Displaying landing page", "Video playback ready")
-        
+
         # Create and show landing page
         self.landing_page = LandingPageWidget()
         self.landing_page.continue_requested.connect(self.transition_to_main_app)
         self.landing_page.show()
         k2_logger.ui_operation("Landing page active", "Click anywhere to continue")
+
+        # Warm the data cache for every table referenced by the saved
+        # session. The ~5s splash video is otherwise idle; by the time the
+        # user clicks "continue", daily bars, 500-row display slices, and
+        # schema probes are already resident in memory and every restored
+        # tab skips its Postgres round-trips.
+        try:
+            from k2_quant.utilities.data.prefetcher import start_prefetch
+            start_prefetch()
+        except Exception as e:
+            k2_logger.warning(f"Prefetcher failed to start: {e}", "MAIN")
 
     def transition_to_main_app(self):
         """Transition from landing page to main application"""

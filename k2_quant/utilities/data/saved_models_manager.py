@@ -26,6 +26,17 @@ class SavedModelsManager:
 	def __init__(self):
 		self.db = db_manager
 		self._ensure_tables_exist()
+		# Short-lived cache of get_saved_models() results. The analysis and
+		# stream pages each populate their left-pane lists on startup (×7
+		# tabs on restore = 7 duplicate reads) and every result contains
+		# a pg_total_relation_size() call per row. Cached by version
+		# counter so any mutating API bumps it to invalidate the cache.
+		self._saved_models_cache: Optional[List[Dict[str, Any]]] = None
+		self._saved_models_version: int = 0
+
+	def _invalidate_saved_models_cache(self) -> None:
+		self._saved_models_cache = None
+		self._saved_models_version += 1
 
 	def _ensure_tables_exist(self) -> None:
 		"""Create required tables if they don't exist."""
@@ -111,13 +122,21 @@ class SavedModelsManager:
 					))
 					conn.commit()
 			k2_logger.info(f"Model saved: {model_data['table_name']}", "SAVED_MODELS")
+			self._invalidate_saved_models_cache()
 			return True
 		except Exception as e:
 			k2_logger.error(f"Failed to save model: {e}", "SAVED_MODELS")
 			return False
 
 	def get_saved_models(self) -> List[Dict[str, Any]]:
-		"""Return all saved models, with computed display_name and size."""
+		"""Return all saved models, with computed display_name and size.
+
+		Results are memoised until a mutating call (save/unsave/update)
+		invalidates the cache. This is what keeps the restore path from
+		running the same list query once per tab.
+		"""
+		if self._saved_models_cache is not None:
+			return list(self._saved_models_cache)
 		try:
 			with self.db.get_connection() as conn:
 				with self.db.get_cursor(conn, RealDictCursor) as cur:
@@ -175,6 +194,7 @@ class SavedModelsManager:
 					"date_range": (r.get("date_range_start"), r.get("date_range_end")),
 				})
 			k2_logger.info(f"Retrieved {len(result)} saved models", "SAVED_MODELS")
+			self._saved_models_cache = list(result)
 			return result
 		except Exception as e:
 			k2_logger.error(f"Failed to get saved models: {e}", "SAVED_MODELS")
@@ -201,6 +221,7 @@ class SavedModelsManager:
 						cur.execute(f"DROP TABLE IF EXISTS {table_name}")
 				conn.commit()
 			k2_logger.info(f"Model unsaved: {table_name}", "SAVED_MODELS")
+			self._invalidate_saved_models_cache()
 			return True
 		except Exception as e:
 			k2_logger.error(f"unsave_model failed: {e}", "SAVED_MODELS")
@@ -214,6 +235,7 @@ class SavedModelsManager:
 						(custom_name, table_name))
 				conn.commit()
 			k2_logger.info(f"Updated model name: {table_name} -> {custom_name}", "SAVED_MODELS")
+			self._invalidate_saved_models_cache()
 			return True
 		except Exception as e:
 			k2_logger.error(f"update_model_name failed: {e}", "SAVED_MODELS")
@@ -253,6 +275,7 @@ class SavedModelsManager:
 				conn.commit()
 			if deleted:
 				k2_logger.info(f"Cleaned up {deleted} orphaned saved_models", "SAVED_MODELS")
+				self._invalidate_saved_models_cache()
 			return deleted
 		except Exception as e:
 			k2_logger.error(f"cleanup_orphaned_entries failed: {e}", "SAVED_MODELS")

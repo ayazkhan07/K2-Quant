@@ -226,7 +226,20 @@ def _fetch_gap_bars(
     import pytz
     et = pytz.timezone("US/Eastern")
 
-    gap_start_epoch_ms = int(start_dt.timestamp() * 1000)
+    # Daily bars get re-stamped to 09:30 ET of their trading date (see the
+    # per-bar loop below), which means the gap filter can't use
+    # ``start_dt.timestamp()`` directly — Polygon's raw ``t`` for a daily
+    # bar is midnight UTC of the trading date, a few hours EARLIER than the
+    # re-stamped epoch. Instead, for daily we filter on "trading date of
+    # this Polygon bar >= trading date at or after gap_start", expressed as
+    # midnight UTC of the calendar date of ``start_dt`` viewed in ET.
+    if api_timespan == "day":
+        start_dt_et_date = start_dt.astimezone(et).date()
+        gap_start_epoch_ms = int(pytz.utc.localize(datetime(
+            start_dt_et_date.year, start_dt_et_date.month, start_dt_et_date.day
+        )).timestamp() * 1000)
+    else:
+        gap_start_epoch_ms = int(start_dt.timestamp() * 1000)
     skipped_before_gap = 0
     skipped_market_hours = 0
 
@@ -256,7 +269,23 @@ def _fetch_gap_bars(
             continue
 
         utc_dt = datetime.utcfromtimestamp(ts_ms / 1000)
-        market_dt = pytz.utc.localize(utc_dt).astimezone(et).replace(tzinfo=None)
+
+        if api_timespan == "day":
+            # Polygon's ``t`` for a daily aggregate is midnight UTC of the
+            # trading date (so ``utc_dt.date()`` IS the trading date D).
+            # Re-stamp to 09:30 ET of D so stored rows show the real
+            # trading date, a meaningful session-open time, and a DST-
+            # aware epoch that matches ``BarAggregator`` and
+            # ``stock_data_service`` for seamless upsert on overlap.
+            trading_date = utc_dt.date()
+            session_open_et = et.localize(datetime(
+                trading_date.year, trading_date.month, trading_date.day,
+                9, 30,
+            ))
+            market_dt = session_open_et.replace(tzinfo=None)
+            ts_ms = int(session_open_et.timestamp() * 1000)
+        else:
+            market_dt = pytz.utc.localize(utc_dt).astimezone(et).replace(tzinfo=None)
 
         if market_hours_only:
             mt = market_dt.time()

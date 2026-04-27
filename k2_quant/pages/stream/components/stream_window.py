@@ -28,6 +28,7 @@ from k2_quant.utilities.logger import k2_logger
 from k2_quant.utilities.services.technical_analysis_service import ta_service
 from k2_quant.utilities.services.stock_data_service import stock_service
 from k2_quant.utilities.data.saved_models_manager import saved_models_manager
+from k2_quant.utilities.data.data_store import data_store
 from k2_quant.utilities.services.strategy_service import strategy_service
 from k2_quant.utilities.report_helpers import format_blocks_plain
 from k2_quant.utilities.numeric_rounding import round_dataframe_numeric_columns
@@ -236,12 +237,24 @@ class StreamWindowWidget(QWidget):
         try:
             from k2_quant.utilities.data.db_manager import db_manager as _db
 
-            base_metadata = saved_models_manager.get_model_metadata(self.table_name) or {
-                'symbol': self.table_name
-            }
+            cached_meta = data_store.get_metadata(self.table_name)
+            if cached_meta:
+                base_metadata = cached_meta
+            else:
+                base_metadata = saved_models_manager.get_model_metadata(self.table_name) or {
+                    'symbol': self.table_name
+                }
+                data_store.set_metadata(self.table_name, base_metadata)
             mkt_hours = _should_filter_market_hours(base_metadata)
-            rows, total_count = stock_service.get_display_data(
-                self.table_name, limit=500, market_hours_only=mkt_hours)
+
+            cached_display = data_store.get_display(self.table_name, mkt_hours)
+            if cached_display is not None:
+                rows, total_count = cached_display
+            else:
+                rows, total_count = stock_service.get_display_data(
+                    self.table_name, limit=500, market_hours_only=mkt_hours)
+                if rows:
+                    data_store.set_display(self.table_name, mkt_hours, rows, total_count)
 
             if not rows:
                 k2_logger.warning(f"No data for model {self.table_name}", "STREAM")
@@ -250,7 +263,12 @@ class StreamWindowWidget(QWidget):
             self.current_data = rows
             parts = self.table_name.split('_')
             symbol = parts[1].upper() if len(parts) > 1 else 'UNKNOWN'
-            has_row_number = _db._check_column_exists(self.table_name, '#')
+            cached_hrn = data_store.get_has_row_number(self.table_name)
+            if cached_hrn is None:
+                has_row_number = _db._check_column_exists(self.table_name, '#')
+                data_store.set_has_row_number(self.table_name, has_row_number)
+            else:
+                has_row_number = cached_hrn
 
             self.current_metadata = dict(base_metadata)
             self.current_metadata.update({
@@ -1144,6 +1162,12 @@ class StreamWindowWidget(QWidget):
             self.actual_data_widget.load_bars(all_bars)
             self._update_chart_actual_series()
 
+        # Seed the aggregator from the just-inserted current-window bar so
+        # the first live WS tick refines real session state (real 09:30 open,
+        # accumulated session H/L/V) instead of cold-starting from the
+        # moment of stream start.
+        self._seed_aggregator_from_actual()
+
         if self._is_streaming:
             symbol = self.current_metadata.get('symbol', '').upper()
             polygon_ws_manager.bar_received.connect(self._on_ws_bar)
@@ -1153,6 +1177,48 @@ class StreamWindowWidget(QWidget):
 
         k2_logger.info(
             f"Reconciliation done for {self.table_name}: {len(bars)} bars backfilled",
+            "STREAM",
+        )
+
+    def _seed_aggregator_from_actual(self):
+        """Seed the aggregator's accumulator from the most recent bar in
+        ``actual_{table}`` iff that bar belongs to the aggregator's current
+        trading window. No-op for prior-window bars (e.g. last row is
+        yesterday's close — today's window starts fresh).
+
+        Also renders the seeded state as the forming row immediately so the
+        user sees real session data before the first WS tick arrives.
+        """
+        if not self._aggregator:
+            return
+        last = actual_data_manager.get_last_bar(self.table_name)
+        if not last:
+            return
+        if not self._aggregator.try_seed(last):
+            k2_logger.info(
+                "[STREAM START] Aggregator not seeded: last actual bar is "
+                "from a prior window (current window will start fresh)",
+                "STREAM",
+            )
+            return
+
+        seed_bar = dict(last)
+        seed_bar["start_ts"] = last.get("timestamp_ms")
+        seed_bar["bars_accumulated"] = self._aggregator._count
+        seed_bar["bars_required"] = self._aggregator.bars_required
+        try:
+            self.actual_data_widget.update_forming_bar(seed_bar)
+        except Exception as e:
+            k2_logger.debug(f"Forming row render from seed failed: {e}", "STREAM")
+        try:
+            self._update_chart_forming_candle(seed_bar)
+        except Exception as e:
+            k2_logger.debug(f"Forming chart render from seed failed: {e}", "STREAM")
+
+        k2_logger.info(
+            f"[STREAM START] Aggregator seeded: O={last.get('open')} "
+            f"H={last.get('high')} L={last.get('low')} C={last.get('close')} "
+            f"V={last.get('volume')} ts={last.get('timestamp_ms')}",
             "STREAM",
         )
 
@@ -1261,7 +1327,18 @@ class StreamWindowWidget(QWidget):
         wick_width = 1
         body_width = 0.6
 
+        # Whether the last row in ``bars`` is the in-progress forming bar.
+        # With progressive per-tick upsert the forming bar is already stored
+        # as the latest row in ``actual_{table}``; ``_update_chart_forming_candle``
+        # will render that slot itself with the semi-transparent forming
+        # style, so skip it here to avoid a bright completed candle peeking
+        # out from under the forming overlay at the same x-position.
+        has_forming = bool(self._aggregator and self._aggregator._count > 0)
+        last_idx = len(bars) - 1
+
         for i, bar in enumerate(bars):
+            if has_forming and i == last_idx:
+                continue
             x = base_x + i
             o = float(bar[2]) if bar[2] is not None else 0
             h = float(bar[3]) if bar[3] is not None else 0
@@ -1293,9 +1370,11 @@ class StreamWindowWidget(QWidget):
         self.chart_widget.main_plot.addItem(candle_item)
         self._actual_lines["actual_candles"] = candle_item
 
+        drawn = max(0, len(bars) - (1 if has_forming else 0))
         k2_logger.info(
-            f"[CHART] Drew {len(bars)} actual candles starting at x={base_x} "
-            f"(chart data len={len(self.chart_widget.data)})",
+            f"[CHART] Drew {drawn}/{len(bars)} actual candles starting at x={base_x} "
+            f"(chart data len={len(self.chart_widget.data)}, "
+            f"forming_owns_last={has_forming})",
             "STREAM",
         )
 
@@ -1308,9 +1387,13 @@ class StreamWindowWidget(QWidget):
         if self.chart_widget.data is None or len(self.chart_widget.data) == 0:
             return
 
-        actual_item = self._actual_lines.get("actual_candles")
-        if actual_item is None or actual_item.scene() is None:
-            self._update_chart_actual_series()
+        # Refresh the actual-data series unconditionally. ``_update_chart_actual_series``
+        # skips the last bar whenever ``_aggregator._count > 0`` so the forming
+        # candle below has sole ownership of that x-slot. Skipping that
+        # refresh here (as the old "only redraw if missing" guard did) would
+        # leave the bright candle from a pre-seed render peeking through
+        # the semi-transparent forming candle.
+        self._update_chart_actual_series()
 
         for key in ("_forming_candle", "_price_line", "_price_label"):
             old = self._actual_lines.pop(key, None)
@@ -1325,7 +1408,16 @@ class StreamWindowWidget(QWidget):
             return
 
         completed_bars = actual_data_manager.get_all_bars(self.table_name)
-        base_x = self._get_actual_base_x() + len(completed_bars)
+        # Progressive per-tick upsert means the forming bar is already the
+        # last row in ``actual_{table}``. Overlay that exact x-slot instead
+        # of drawing one position past it (which would show as a phantom
+        # candle for the NEXT trading day / window). When the actual table
+        # is still empty — i.e. first forming tick before any DB write —
+        # fall back to the base index.
+        if len(completed_bars) > 0:
+            base_x = self._get_actual_base_x() + len(completed_bars) - 1
+        else:
+            base_x = self._get_actual_base_x()
 
         o, h, lo, c = float(o), float(h), float(lo), float(c)
         is_bull = c >= o

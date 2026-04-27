@@ -40,8 +40,14 @@ class DatabaseManager:
     EXPORT_FETCH_SIZE = 10000
 
     def __init__(self):
+        # Pool sized for a single-tenant workstation: the app fans out 7+
+        # parallel restores during session rehydration plus the background
+        # prefetcher (up to 8 concurrent warmers). Undersized pools force
+        # those to serialise and show up as a load stall. Environment
+        # variables let us dial this down on smaller boxes.
         self.pool = ThreadedConnectionPool(
-            5, 50,
+            int(os.getenv('DB_POOL_MIN', '10')),
+            int(os.getenv('DB_POOL_MAX', '80')),
             host=os.getenv('DB_HOST', 'localhost'),
             database=os.getenv('DB_NAME', 'k2_quant'),
             user=os.getenv('DB_USER', 'postgres'),

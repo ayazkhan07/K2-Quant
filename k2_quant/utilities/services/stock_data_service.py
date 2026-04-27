@@ -10,11 +10,73 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import requests
 
+import pytz
+
 from k2_quant.utilities.services.polygon_client import polygon_client
 from k2_quant.utilities.data.db_manager import db_manager
 from k2_quant.utilities.logger import k2_logger, log_performance
 from k2_quant.utilities.config.api_config import api_config
 import pandas as pd
+
+_ET = pytz.timezone("US/Eastern")
+
+
+def _restamp_daily_to_session_open(results: List[Dict]) -> List[Dict]:
+    """Rewrite each Polygon daily bar's ``t`` to 09:30 ET of its trading date.
+
+    Polygon stamps daily aggregates with ``t = midnight UTC of trading date``.
+    Left as-is, ``db_manager.bulk_insert_stock_data`` converts that to naive
+    ET and stores the row labeled ``(D-1, 20:00)`` in EDT (or ``19:00`` in
+    EST) — one calendar day behind the real trading date and at a time
+    outside market hours. Shifting ``t`` to 09:30 ET of the trading date
+    makes stored rows show the actual trading date at a meaningful session-
+    open time, and makes ``timestamp`` identical to what ``BarAggregator``
+    and ``StreamReconciler`` now produce for the same bar.
+    """
+    for bar in results:
+        t_ms = bar.get('t', 0)
+        if not t_ms:
+            continue
+        # Polygon t for a daily bar = midnight UTC of trading date, so
+        # the UTC-interpreted date of t IS the trading date.
+        utc_dt = datetime.utcfromtimestamp(t_ms / 1000)
+        trading_date = utc_dt.date()
+        session_open_et = _ET.localize(datetime(
+            trading_date.year, trading_date.month, trading_date.day, 9, 30
+        ))
+        bar['t'] = int(session_open_et.timestamp() * 1000)
+    return results
+
+
+def _exclude_today_et(results: List[Dict]) -> List[Dict]:
+    """Drop today's partial daily bar from a Polygon daily-bars list.
+
+    Polygon stamps each daily aggregate with ``t = midnight UTC of trading
+    date`` — so ``datetime.utcfromtimestamp(t/1000).date()`` IS the trading
+    date. If that matches today in ET, drop the bar.
+
+    Historical models should contain only complete trading days; today's
+    live-session bar belongs in ACTUAL DATA, where ``StreamReconciler``
+    fetches it on demand and ``BarAggregator`` refines it tick-by-tick.
+    Keeping today in the model causes the reconciler's gap math to report
+    "no gap" on stream start (last model row is "already today") and
+    leaves the live aggregator to cold-start from whatever the price is
+    at stream-start moment instead of the real session open.
+    """
+    today_et = datetime.now(_ET).date()
+    filtered = [
+        bar for bar in results
+        if bar.get('t', 0) > 0
+        and datetime.utcfromtimestamp(bar['t'] / 1000).date() != today_et
+    ]
+    dropped = len(results) - len(filtered)
+    if dropped:
+        k2_logger.info(
+            f"Dropped {dropped} in-progress daily bar(s) for today ({today_et}) "
+            f"from model build — will be backfilled by the stream reconciler.",
+            "STOCK_SERVICE",
+        )
+    return filtered
 
 
 class StockService:
@@ -75,6 +137,14 @@ class StockService:
         all_results = self._parallel_fetch_data(symbol, timespan, api_start, api_end, multiplier)
         if not all_results:
             raise ValueError(f"No data available for {symbol}")
+        if timespan.startswith('day'):
+            all_results = _exclude_today_et(all_results)
+            all_results = _restamp_daily_to_session_open(all_results)
+            if not all_results:
+                raise ValueError(
+                    f"No complete trading days available for {symbol} in this range "
+                    f"(today's partial bar was excluded from model build)."
+                )
         k2_logger.step(4, 6, "Storing data in database")
         table_name, inserted_count = self.db.store_stock_data(
             symbol, timespan, time_range.lower(), all_results, market_hours_only=market_hours_only)

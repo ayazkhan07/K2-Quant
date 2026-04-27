@@ -31,7 +31,7 @@ Bar dict format (emitted):
 """
 
 from typing import Optional, Dict, Any
-from datetime import datetime
+from datetime import datetime, time as dt_time
 
 import pytz
 from PyQt6.QtCore import QObject, pyqtSignal
@@ -114,23 +114,27 @@ class BarAggregator(QObject):
     def _window_start_ts_ms(self, ts_ms: int) -> int:
         """Snap a timestamp to the window-start epoch-ms used by the DB.
 
-        Daily bars are stamped at midnight UTC of the trading date, matching
-        Polygon's ``/v2/aggs/.../1/day`` convention (``t`` = 00:00 UTC of the
-        trading date). Downstream code in ``StreamWindow._on_bar_completed``
-        converts this back to ET — yielding the same ``(market_date,
-        market_time)`` pair a reconciler backfill would produce, which keeps
-        live-streamed day bars aligned with historical daily rows and with
-        the ``actual_{table}`` primary key used for upserts.
+        Daily bars are stamped at **09:30 ET of the trading date** (DST
+        aware). Downstream code in ``StreamWindow._on_bar_completed``
+        converts this back to naive ET, yielding ``market_date = trading
+        date`` and ``market_time = 09:30:00`` — matching ``stock_data_service``'s
+        re-stamped historical rows and ``StreamReconciler``'s re-stamped
+        backfill rows. Live, historical, and backfilled daily bars all
+        share one ``timestamp_ms`` primary key which makes the upsert-on-
+        tick behavior idempotent.
+
+        Intraday bars keep their original clock-aligned window start.
         """
         utc_dt = datetime.utcfromtimestamp(ts_ms / 1000)
         et_dt = pytz.utc.localize(utc_dt).astimezone(_ET)
 
         if self._is_daily:
             trading_date = et_dt.date()
-            midnight_utc = pytz.utc.localize(
-                datetime(trading_date.year, trading_date.month, trading_date.day)
+            session_open_et = _ET.localize(
+                datetime(trading_date.year, trading_date.month,
+                         trading_date.day, 9, 30)
             )
-            return int(midnight_utc.timestamp() * 1000)
+            return int(session_open_et.timestamp() * 1000)
 
         minutes_of_day = et_dt.hour * 60 + et_dt.minute
         window_start_min = (minutes_of_day // self._window_minutes) * self._window_minutes
@@ -185,6 +189,50 @@ class BarAggregator(QObject):
         bar_dict = self._to_dict()
         bar_dict["is_complete"] = False
         self.bar_updated.emit(bar_dict)
+
+    def try_seed(self, bar: dict, now_ts_ms: Optional[int] = None) -> bool:
+        """Pre-load the accumulator from an already-existing bar.
+
+        Used on stream start: once the reconciler has backfilled today's
+        partial daily bar (real session open, accumulated H/L/V from market
+        open), we seed the in-memory accumulator so the first live WS 1-
+        minute tick follows the ``_count > 0`` branch of ``ingest()`` —
+        taking ``max(seed_high, new_high)``, ``min(seed_low, new_low)``,
+        ``close = new_close``, ``volume += new_volume`` — instead of the
+        ``_count == 0`` branch that would blindly overwrite the real
+        session open with whatever GOOG is trading at stream-start moment.
+
+        Only seeds if ``bar``'s ``timestamp_ms`` matches the aggregator's
+        current trading-window key (computed from ``now_ts_ms``). Returns
+        True if seeded, False if the bar belongs to a prior window (caller
+        should not treat it as the current in-progress bar).
+        """
+        import time as _time
+        ts_ms = int(bar.get("timestamp_ms") or bar.get("start_ts") or 0)
+        if ts_ms <= 0:
+            return False
+        now_ms = now_ts_ms if now_ts_ms is not None else int(_time.time() * 1000)
+        if self._window_start_ts_ms(now_ms) != ts_ms:
+            return False
+
+        self._start_ts = ts_ms
+        self._current_window = self._bar_window_key(ts_ms)
+        self._open = float(bar.get("open") or 0.0)
+        self._high = float(bar.get("high") or self._open)
+        self._low = float(bar.get("low") or self._open)
+        self._close = float(bar.get("close") or self._open)
+        vol = int(bar.get("volume") or 0)
+        self._vol_total = vol
+        vwap_val = bar.get("vwap")
+        self._vw_sum = (float(vwap_val) * vol) if (vwap_val is not None and vol > 0) else 0.0
+        self._end_ts = int(bar.get("end_ts") or ts_ms)
+        # Use elapsed minutes since the window's session-open ts as a
+        # best-guess sample count for the progress display ("N/390 min").
+        # The seed summarises an unknown number of 1-minute bars so this
+        # is advisory only; cap at the window size.
+        elapsed_min = max(1, (now_ms - ts_ms) // 60000)
+        self._count = min(int(elapsed_min), self._window_minutes)
+        return True
 
     def flush(self) -> Optional[Dict[str, Any]]:
         """Force-emit whatever is accumulated (e.g. at market close).
