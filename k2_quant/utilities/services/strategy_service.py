@@ -14,14 +14,24 @@ from datetime import datetime
 from typing import Dict, List, Any, Optional, Tuple
 from pathlib import Path
 
+from PyQt6.QtCore import QObject, pyqtSignal
+
 from k2_quant.utilities.logger import k2_logger
 from k2_quant.utilities.strategy_validator import validate_strategy
 
 
-class StrategyService:
-    """Service for managing custom trading strategies"""
-    
+class StrategyService(QObject):
+    """Service for managing custom trading strategies.
+
+    Emits ``strategies_changed`` after any save/rename/delete so every
+    open ``LeftPaneWidget`` (Analysis or Stream) can repopulate from the
+    single source of truth without page-to-page wiring.
+    """
+
+    strategies_changed = pyqtSignal()
+
     def __init__(self):
+        super().__init__()
         self.db_path = Path("data/strategies.db")
         self.db_path.parent.mkdir(exist_ok=True)
         self.initialize_database()
@@ -129,6 +139,7 @@ class StrategyService:
                     k2_logger.info(f"Strategy saved: {name}", "STRATEGY")
                 
                 conn.commit()
+                self._emit_changed()
                 return True, [], val_warnings
                 
         except Exception as e:
@@ -204,6 +215,7 @@ class StrategyService:
                     return False
                 conn.commit()
                 k2_logger.info(f"Strategy renamed: {old_name} -> {new_name}", "STRATEGY")
+                self._emit_changed()
                 return True
         except Exception as e:
             k2_logger.error(f"Failed to rename strategy: {str(e)}", "STRATEGY")
@@ -246,11 +258,23 @@ class StrategyService:
                     f"Strategy deleted: {name} (removed {runs_removed} run record(s))",
                     "STRATEGY",
                 )
+                self._emit_changed()
                 return True
 
         except Exception as e:
             k2_logger.error(f"Failed to delete strategy: {str(e)}", "STRATEGY")
             return False
+
+    def _emit_changed(self) -> None:
+        """Notify listeners that the strategy registry mutated.
+
+        Wrapped so a misbehaving slot cannot break a successful DB write.
+        """
+        try:
+            self.strategies_changed.emit()
+        except Exception as e:
+            k2_logger.error(
+                f"strategies_changed emit failed: {e}", "STRATEGY")
 
     # ------------------------------------------------------------------
     # Strategy Runs

@@ -42,7 +42,6 @@ import numpy as np
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
                              QSplitter, QLabel, QStatusBar)
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QFont
 
 from k2_quant.utilities.logger import k2_logger
 from k2_quant.utilities.services.technical_analysis_service import ta_service
@@ -116,9 +115,6 @@ class AnalysisPageWidget(QWidget):
         main_layout.setSpacing(0)
         self.setLayout(main_layout)
         
-        # Create header
-        self.create_header(main_layout)
-        
         # Create splitter for three panes
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         self.splitter.setHandleWidth(1)
@@ -183,25 +179,6 @@ class AnalysisPageWidget(QWidget):
         # Load initial data
         self.refresh_left_pane_data()
     
-    def create_header(self, parent_layout):
-        """Create header with title"""
-        header = QWidget()
-        header.setFixedHeight(40)
-        header.setObjectName("analysisHeader")
-        
-        header_layout = QHBoxLayout()
-        header_layout.setContentsMargins(20, 0, 20, 0)
-        header.setLayout(header_layout)
-        
-        title = QLabel(f"K2 QUANT - ANALYSIS (Tab {self.tab_id})")
-        title.setFont(QFont("Arial", 14))
-        title.setStyleSheet("color: #999; letter-spacing: 1px;")
-        header_layout.addWidget(title)
-        
-        header_layout.addStretch()
-        
-        parent_layout.addWidget(header)
-    
     def create_status_bar(self) -> QWidget:
         """Create status bar"""
         widget = QWidget()
@@ -238,6 +215,15 @@ class AnalysisPageWidget(QWidget):
         self.left_pane.strategy_toggled.connect(self.on_strategy_toggled)
         self.left_pane.strategy_deleted.connect(self.on_strategy_deleted)
         self.left_pane.indicator_toggled.connect(self.on_indicator_toggled)
+
+        # Cross-page sync: pick up saves/deletes made on any other tab
+        # (Analysis tabs share a singleton service with Stream tabs).
+        # Without these, this tab's STRATEGIES / SAVED MODELS list only
+        # reflects the snapshot taken when the tab was first constructed.
+        strategy_service.strategies_changed.connect(
+            self.left_pane.refresh_strategies)
+        saved_models_manager.models_changed.connect(
+            self.left_pane.refresh_models)
         
         # Middle pane connections
         self.middle_pane.column_toggled.connect(self.on_column_toggled)
@@ -1200,11 +1186,6 @@ class AnalysisPageWidget(QWidget):
                 color: #ffffff;
             }
             
-            #analysisHeader {
-                background-color: #0f0f0f;
-                border-bottom: 1px solid #1a1a1a;
-            }
-            
             #analysisStatusBar {
                 background-color: #0f0f0f;
                 border-top: 1px solid #1a1a1a;
@@ -1220,6 +1201,20 @@ class AnalysisPageWidget(QWidget):
                     self.current_model,
                     json.dumps(self.right_pane._message_records),
                     list(self.right_pane.conversation_history))
+
+            # Drop singleton -> deleted-widget references first so a
+            # late strategies_changed / models_changed emit (during
+            # teardown of other tabs) cannot land on a destroyed widget.
+            for sig, slot in (
+                (strategy_service.strategies_changed,
+                 self.left_pane.refresh_strategies),
+                (saved_models_manager.models_changed,
+                 self.left_pane.refresh_models),
+            ):
+                try:
+                    sig.disconnect(slot)
+                except (TypeError, RuntimeError):
+                    pass
 
             # Clear left pane states
             self.left_pane.clear_all_indicators()

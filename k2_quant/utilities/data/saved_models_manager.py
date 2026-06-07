@@ -16,14 +16,24 @@ from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 from psycopg2.extras import RealDictCursor
 
+from PyQt6.QtCore import QObject, pyqtSignal
+
 from k2_quant.utilities.data.db_manager import db_manager
 from k2_quant.utilities.logger import k2_logger
 
 
-class SavedModelsManager:
-	"""PostgreSQL-backed manager for saved models and per-model UI state."""
+class SavedModelsManager(QObject):
+	"""PostgreSQL-backed manager for saved models and per-model UI state.
+
+	Emits ``models_changed`` after any save/unsave/rename/cleanup so every
+	open ``LeftPaneWidget`` (Analysis or Stream) can repopulate from the
+	single source of truth without page-to-page wiring.
+	"""
+
+	models_changed = pyqtSignal()
 
 	def __init__(self):
+		super().__init__()
 		self.db = db_manager
 		self._ensure_tables_exist()
 		# Short-lived cache of get_saved_models() results. The analysis and
@@ -37,6 +47,11 @@ class SavedModelsManager:
 	def _invalidate_saved_models_cache(self) -> None:
 		self._saved_models_cache = None
 		self._saved_models_version += 1
+		try:
+			self.models_changed.emit()
+		except Exception as e:
+			k2_logger.error(
+				f"models_changed emit failed: {e}", "SAVED_MODELS")
 
 	def _ensure_tables_exist(self) -> None:
 		"""Create required tables if they don't exist."""

@@ -19,10 +19,10 @@ from typing import Dict, Optional
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QLabel,
-    QMdiArea, QMdiSubWindow, QMessageBox, QPushButton,
+    QMdiArea, QMdiSubWindow, QMessageBox, QPushButton, QSizePolicy,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QRect, QPoint, QSize
-from PyQt6.QtGui import QFont, QCursor
+from PyQt6.QtGui import QCursor
 
 from k2_quant.utilities.logger import k2_logger
 from k2_quant.utilities.data.saved_models_manager import saved_models_manager
@@ -185,8 +185,14 @@ class StreamTitleBar(QWidget):
         self._title_label = QLabel(title)
         self._title_label.setStyleSheet(
             "color: #ffffff; font-size: 12px; font-weight: 600; "
-            "letter-spacing: 1px; background: transparent; padding-right: 8px;"
+            "background: transparent; padding-right: 8px;"
         )
+        self._title_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        # Never let the layout squeeze the name below the width its text needs.
+        self._title_label.setSizePolicy(
+            QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Preferred)
+        self._refresh_title_min_width()
         layout.addWidget(self._title_label)
 
         self._max_btn = QPushButton()
@@ -248,6 +254,14 @@ class StreamTitleBar(QWidget):
 
     def set_title(self, title: str):
         self._title_label.setText(title)
+        self._refresh_title_min_width()
+
+    def _refresh_title_min_width(self):
+        """Reserve enough width for the full title text so it is never clipped."""
+        fm = self._title_label.fontMetrics()
+        # +16 covers the 8px right padding plus a small safety margin.
+        width = fm.horizontalAdvance(self._title_label.text()) + 16
+        self._title_label.setMinimumWidth(width)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self._mdi_sub:
@@ -309,9 +323,6 @@ class StreamPageWidget(QWidget):
         root.setSpacing(0)
         self.setLayout(root)
 
-        # Header
-        self._create_header(root)
-
         # Body: left pane + MDI area
         body = QSplitter(Qt.Orientation.Horizontal)
         body.setHandleWidth(1)
@@ -350,21 +361,13 @@ class StreamPageWidget(QWidget):
         self.left_pane.strategy_deleted.connect(self._on_strategy_deleted)
         self.left_pane.indicator_toggled.connect(self._on_indicator_toggled)
 
-    def _create_header(self, parent_layout):
-        header = QWidget()
-        header.setFixedHeight(40)
-        header.setObjectName("streamHeader")
-        hl = QHBoxLayout()
-        hl.setContentsMargins(20, 0, 20, 0)
-        header.setLayout(hl)
-
-        title = QLabel(f"K2 QUANT - STREAM (Tab {self.tab_id})")
-        title.setFont(QFont("Arial", 14))
-        title.setStyleSheet("color: #999; letter-spacing: 1px;")
-        hl.addWidget(title)
-        hl.addStretch()
-
-        parent_layout.addWidget(header)
+        # Cross-page sync: pick up saves/deletes made on any other tab.
+        # Without these, this tab's STRATEGIES / SAVED MODELS list stays
+        # at the snapshot taken when the tab was first constructed.
+        strategy_service.strategies_changed.connect(
+            self.left_pane.refresh_strategies)
+        saved_models_manager.models_changed.connect(
+            self.left_pane.refresh_models)
 
     def _create_status_bar(self) -> QWidget:
         widget = QWidget()
@@ -426,10 +429,7 @@ class StreamPageWidget(QWidget):
         content = StreamWindowWidget(table_name)
         content.apply_styling()
 
-        display_name = table_name
-        parts = table_name.split('_')
-        if len(parts) > 1:
-            display_name = parts[1].upper()
+        display_name = self._display_name_for(table_name)
 
         # Wrap content in a container: custom title bar + stream window
         container = QWidget()
@@ -547,6 +547,25 @@ class StreamPageWidget(QWidget):
 
         self._update_status()
         k2_logger.info(f"Stream window closed: {table_name}", "STREAM")
+
+    def _display_name_for(self, table_name: str) -> str:
+        """Return the user-facing model name shown in the Saved Models list.
+
+        Falls back to the raw table name if metadata lookup fails.
+        """
+        try:
+            # Use the same list the Saved Models sidebar is built from so the
+            # title matches it exactly (e.g. "GOOG-1D-20Y-06/05").
+            for model in saved_models_manager.get_saved_models():
+                if model.get("table_name") == table_name:
+                    name = model.get("display_name")
+                    if name:
+                        return name
+                    break
+        except Exception as e:
+            k2_logger.warning(
+                f"Display name lookup failed for {table_name}: {e}", "STREAM")
+        return table_name
 
     def _table_name_for_sub(self, sub: Optional[QMdiSubWindow]) -> Optional[str]:
         if sub is None:
@@ -725,6 +744,21 @@ class StreamPageWidget(QWidget):
                     content.cleanup()
 
         self._windows.clear()
+
+        # Drop singleton -> deleted-widget references that would otherwise
+        # fire `refresh_*` on a Python object whose underlying QWidget
+        # has been destroyed (RuntimeError at next emit).
+        for sig, slot in (
+            (strategy_service.strategies_changed,
+             self.left_pane.refresh_strategies),
+            (saved_models_manager.models_changed,
+             self.left_pane.refresh_models),
+        ):
+            try:
+                sig.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+
         k2_logger.info(f"Stream page cleaned up (Tab ID: {self.tab_id})", "STREAM")
 
     def reset_after_database_cleared(self):
@@ -749,14 +783,6 @@ class StreamPageWidget(QWidget):
 
     def _setup_styling(self):
         self.setStyleSheet("""
-            #streamHeader {
-                background-color: #0f0f0f;
-                border-bottom: 1px solid #1a1a1a;
-            }
-            #streamHeader QLabel {
-                color: #999;
-                background: transparent;
-            }
             #streamStatusBar {
                 background-color: #0f0f0f;
                 border-top: 1px solid #1a1a1a;
