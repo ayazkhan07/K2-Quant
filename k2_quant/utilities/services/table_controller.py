@@ -115,12 +115,11 @@ MAX_AGENT_ITERATIONS = 15
 
 AI_MODELS = {
     "OpenAI o3": {"provider": "openai", "model": "o3"},
-    "OpenAI o4-mini": {"provider": "openai", "model": "o4-mini"},
     "GPT-4.1": {"provider": "openai", "model": "gpt-4.1"},
-    "GPT-4.1 Mini": {"provider": "openai", "model": "gpt-4.1-mini"},
+    "Claude Fable 5": {"provider": "anthropic", "model": "claude-fable-5"},
+    "Claude Opus 4.8": {"provider": "anthropic", "model": "claude-opus-4-8"},
+    "Claude Opus 4.7": {"provider": "anthropic", "model": "claude-opus-4-7"},
     "Claude Opus 4.6": {"provider": "anthropic", "model": "claude-opus-4-6"},
-    "Claude Sonnet 4.6": {"provider": "anthropic", "model": "claude-sonnet-4-6"},
-    "Claude Haiku 4.5": {"provider": "anthropic", "model": "claude-haiku-4-5-20251001"},
 }
 
 DEFAULT_MODEL = "OpenAI o3"
